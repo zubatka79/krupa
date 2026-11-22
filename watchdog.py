@@ -375,11 +375,20 @@ def main() -> None:
     parser.add_argument("--interval-sec", type=int, default=150, help="Check interval in seconds (default 150s = 2.5m)")
     parser.add_argument("--max-log-age-min", type=float, default=20.0, help="Max allowed log inactivity in minutes")
     parser.add_argument("--once", action="store_true", help="Run a single check and exit")
+    parser.add_argument(
+        "--startup-delay-sec",
+        type=int,
+        default=90,
+        help="Wait before the first check so bots started alongside can create their logs",
+    )
     args = parser.parse_args()
 
     setup_logging()
     mode = resolve_bybit_mode()
     logger.info("Watchdog started | Bybit Mode: %s | Interval: %ds | MaxLogAge: %.1fm", mode.upper(), args.interval_sec, args.max_log_age_min)
+
+    if not args.once and args.startup_delay_sec > 0:
+        time.sleep(args.startup_delay_sec)
 
     consecutive_failures = 0
     last_failure_alert = 0.0
