@@ -5,7 +5,9 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import logging.handlers
 import os
+import re
 import signal
 import sys
 import time
@@ -33,6 +35,10 @@ logging.basicConfig(
 logger = logging.getLogger("run_bot")
 
 
+def parse_id_list(raw: str) -> list[str]:
+    return [x.strip() for x in raw.split(",") if x.strip() and "your_" not in x.lower() and x.strip().lstrip("-").isdigit()]
+
+
 class TelegramNotifier:
     """Lightweight Telegram Bot API notifier (silently disabled if env vars are unset)."""
 
@@ -42,32 +48,70 @@ class TelegramNotifier:
     def _reload(self) -> None:
         load_dotenv(override=True)
         self.token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-        self.chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-        self.enabled = bool(
-            self.token
-            and self.chat_id
-            and "your_telegram" not in self.token.lower()
-            and "your_telegram" not in self.chat_id.lower()
+        self.chat_ids = parse_id_list(os.getenv("TELEGRAM_CHAT_ID", "")) or parse_id_list(
+            os.getenv("TELEGRAM_ALLOWED_USER_IDS", "")
         )
+        self.enabled = bool(self.token and self.chat_ids and "your_telegram" not in self.token.lower())
+
+    def _redact(self, text: str) -> str:
+        return text.replace(self.token, "***") if self.token else text
 
     def send(self, text: str) -> None:
         if not self.enabled:
             self._reload()
         if not self.enabled:
             return
-        try:
-            url = f"https://api.telegram.org/bot{self.token}/sendMessage"
-            requests.post(
-                url,
-                json={"chat_id": self.chat_id, "text": text, "disable_web_page_preview": True},
-                timeout=8,
-            )
-        except Exception as exc:
-            logger.warning("Telegram notification failed: %s", exc)
+        url = f"https://api.telegram.org/bot{self.token}/sendMessage"
+        for chat_id in self.chat_ids:
+            try:
+                resp = requests.post(
+                    url,
+                    json={"chat_id": chat_id, "text": text[:4000], "disable_web_page_preview": True},
+                    timeout=8,
+                )
+                if resp.status_code != 200:
+                    logger.warning("Telegram notification to %s failed: HTTP %s", chat_id, resp.status_code)
+            except Exception as exc:
+                logger.warning("Telegram notification failed: %s", self._redact(str(exc)))
+
+
+REQUIRED_CONFIG_KEYS = ("mode", "strategy", "whitelist", "leverage", "margin_pct_per_trade", "sl_pct", "entry_tf")
 
 
 def load_config(path: str | Path = "config.json") -> Dict[str, Any]:
-    return json.loads(Path(path).read_text(encoding="utf-8"))
+    cfg = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(cfg, dict):
+        raise ValueError("config root must be an object")
+    missing = [k for k in REQUIRED_CONFIG_KEYS if k not in cfg]
+    if missing:
+        raise ValueError(f"missing keys: {missing}")
+    lev = int(cfg["leverage"])
+    if not (1 <= lev <= int(cfg.get("max_leverage", lev)) and lev <= 25):
+        raise ValueError(f"leverage {lev} out of bounds")
+    if not (0 < float(cfg["margin_pct_per_trade"]) <= 50):
+        raise ValueError("margin_pct_per_trade must be in (0, 50]")
+    if not (0 < float(cfg["sl_pct"]) <= 10):
+        raise ValueError("sl_pct must be in (0, 10]")
+    if str(cfg["entry_tf"]) not in INTERVAL_TO_MS:
+        raise ValueError(f"unsupported entry_tf {cfg['entry_tf']}")
+    if str(cfg["mode"]).lower() not in ("demo", "testnet", "live", "mainnet"):
+        raise ValueError(f"unknown mode {cfg['mode']}")
+    return cfg
+
+
+class _RedactTokens(logging.Filter):
+    """Strip bot tokens and API keys that requests/urllib3 put into exception texts."""
+
+    _patterns = (re.compile(r"bot\d+:[A-Za-z0-9_-]{20,}"), re.compile(r"key=[A-Za-z0-9_-]{20,}"))
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        clean = msg
+        for pat in self._patterns:
+            clean = pat.sub("***", clean)
+        if clean != msg:
+            record.msg, record.args = clean, None
+        return True
 
 
 def main() -> None:
@@ -89,12 +133,14 @@ def main() -> None:
     Path(log_path).parent.mkdir(parents=True, exist_ok=True)
     root_logger = logging.getLogger()
     for h in list(root_logger.handlers):
-        if isinstance(h, logging.FileHandler):
+        if isinstance(h, (logging.FileHandler, logging.handlers.RotatingFileHandler)):
             root_logger.removeHandler(h)
             h.close()
-    fh = logging.FileHandler(log_path, encoding="utf-8")
+    fh = logging.handlers.RotatingFileHandler(log_path, maxBytes=20 * 1024 * 1024, backupCount=5, encoding="utf-8")
     fh.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(name)s: %(message)s"))
     root_logger.addHandler(fh)
+    for h in root_logger.handlers:
+        h.addFilter(_RedactTokens())
 
     notifier = TelegramNotifier()
 
@@ -223,16 +269,34 @@ def main() -> None:
     entry_ms = INTERVAL_TO_MS[entry_tf]
     last_scanned_bar_ts = -1
 
+    config_error: str | None = None
     while running:
         try:
-            # Hot-reload config.json without restarting
-            config = load_config(args.config)
-            scanner.update_config(config)
-            executor.update_config(config)
-            news_guard.config = config
+            # Hot-reload the config; a broken file keeps the last good one so positions stay managed
+            try:
+                new_config = load_config(args.config)
+                if str(new_config.get("mode", "")).lower() != mode:
+                    raise ValueError("mode cannot be changed without a restart")
+                config = new_config
+                scanner.update_config(config)
+                executor.update_config(config)
+                news_guard.config = config
+                if config_error is not None:
+                    logger.info("Config %s is valid again.", args.config)
+                    notifier.send(f"[CONFIG] {args.config} снова читается, применён.")
+                config_error = None
+            except Exception as exc:
+                if str(exc) != config_error:
+                    logger.error("Config reload failed (%s), keeping previous config.", exc)
+                    notifier.send(f"[CONFIG ERROR] {args.config}: {exc}. Работаю на прежнем конфиге, новые входы приостановлены.")
+                config_error = str(exc)
 
             # 1. Fail-CLOSED US Macro Shield update (auto-refreshes data/macro_events.json on schedule)
-            news_state = news_guard.update(force_refresh=(args.once or last_scanned_bar_ts == -1))
+            try:
+                news_state = news_guard.update(force_refresh=(args.once or last_scanned_bar_ts == -1))
+            except Exception as exc:
+                logger.exception("Macro shield update failed: %s", exc)
+                news_state = {"entry_allowed": False, "upcoming_core_events": []}
             if last_scanned_bar_ts == -1:
                 upcoming_core = news_state.get("upcoming_core_events", [])
                 logger.info(
@@ -256,6 +320,10 @@ def main() -> None:
             ms_since_close = now_ms - (latest_closed_open_ms + entry_ms)
 
             should_scan = args.once or (latest_closed_open_ms > last_scanned_bar_ts and ms_since_close >= 4000)
+            if should_scan and config_error is not None:
+                logger.warning("Scan skipped: config %s is invalid (%s).", args.config, config_error)
+                last_scanned_bar_ts = latest_closed_open_ms
+                should_scan = False
             if should_scan:
                 equity = executor.get_current_equity()
                 bar_utc = datetime.fromtimestamp(latest_closed_open_ms / 1000, tz=timezone.utc).strftime(
@@ -266,10 +334,14 @@ def main() -> None:
                 signals = scanner.scan_once(equity=equity)
                 logger.info("Scan complete: %d qualifying %s signal(s).", len(signals), config.get("strategy"))
 
-                for sig in signals:
-                    executor.open_position(sig, current_equity=equity)
-                    equity = executor.get_current_equity()
                 last_scanned_bar_ts = latest_closed_open_ms
+                for sig in signals:
+                    try:
+                        executor.open_position(sig, current_equity=equity)
+                    except Exception as exc:
+                        logger.exception("Entry failed for %s %s: %s", sig.symbol, sig.direction, exc)
+                        notifier.send(f"[ERROR] Не удалось выставить вход {sig.symbol} {sig.direction}: {exc}")
+                    equity = executor.get_current_equity()
 
             if args.once:
                 break

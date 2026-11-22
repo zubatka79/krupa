@@ -5,7 +5,7 @@ CRITICAL SAFETY RULE (ADVISOR MODE):
 - Autonomous scheduled tasks (News Scout, Market Strategist, Trade Auditor, Missed Fill, Liquidity Monitor,
   R&D Coin Scout) ONLY analyze and send recommendations/buttons to Telegram.
 - Pausing or unpausing a coin in data/blacklist.json happens STRICTLY on explicit user command or button click
-  from the authorized TELEGRAM_CHAT_ID.
+  from an authorized admin (TELEGRAM_ALLOWED_USER_IDS) or the configured TELEGRAM_CHAT_ID chats.
 """
 
 from __future__ import annotations
@@ -27,9 +27,13 @@ from dotenv import load_dotenv
 
 from bot.supervisor_tools import (
     BOT_CONFIGS,
+    BOT_SYMBOLS,
+    MAX_PAUSE_HOURS,
+    RedactingFilter,
     RND_LOCK_PATH,
     RND_RESULT_PATH,
     ROOT_DIR,
+    BlacklistError,
     audit_missed_fills,
     audit_trades_and_hidden_costs,
     check_liquidity_and_caps,
@@ -37,10 +41,16 @@ from bot.supervisor_tools import (
     create_bybit_client,
     fetch_coin_news_digest,
     get_active_pauses,
+    parse_id_list,
+    parse_pause_hours,
+    pid_alive,
+    read_rnd_lock,
+    redact_secrets,
     resolve_bybit_mode,
     set_coin_pause,
     utc_now,
     utc_now_iso,
+    write_rnd_lock,
 )
 
 logger = logging.getLogger("ai_supervisor")
@@ -56,6 +66,8 @@ def setup_logging() -> None:
         logging.StreamHandler(sys.stdout),
         logging.FileHandler(LOG_PATH, encoding="utf-8"),
     ]
+    for h in handlers:
+        h.addFilter(RedactingFilter())
     logging.basicConfig(level=logging.INFO, format=fmt, handlers=handlers, force=True)
 
 
@@ -236,13 +248,14 @@ class UniversalAIClient:
         # 2. Google Gemini Native API if GEMINI_API_KEY is set
         if self.gemini_key and "your_" not in self.gemini_key.lower():
             try:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.gemini_model}:generateContent?key={self.gemini_key}"
+                url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.gemini_model}:generateContent"
+                headers = {"x-goog-api-key": self.gemini_key, "Content-Type": "application/json"}
                 payload = {
                     "system_instruction": {"parts": [{"text": self.SYSTEM_PROMPT}]},
                     "contents": [{"role": "user", "parts": [{"text": full_user_text}]}],
                     "generationConfig": {"temperature": 0.2, "maxOutputTokens": max_tokens},
                 }
-                resp = requests.post(url, json=payload, timeout=(8, 15))
+                resp = requests.post(url, headers=headers, json=payload, timeout=(8, 15))
                 if resp.status_code == 200:
                     data = resp.json()
                     meta = data.get("usageMetadata", {})
@@ -257,9 +270,9 @@ class UniversalAIClient:
                         parts = cands[0].get("content", {}).get("parts", [])
                         if parts:
                             return str(parts[0].get("text", "")).strip()
-                logger.warning("Gemini API non-200 (%s): %s", resp.status_code, resp.text[:250])
+                logger.warning("Gemini API non-200 (%s): %s", resp.status_code, redact_secrets(resp.text[:250]))
             except Exception as exc:
-                logger.warning("Gemini API request failed: %s", exc)
+                logger.warning("Gemini API request failed: %s", redact_secrets(exc))
 
         # 3. Fallback / Alternative: OpenAI / OpenRouter / Custom Token endpoint
         if self.ai_key and "your_" not in self.ai_key.lower():
@@ -288,9 +301,9 @@ class UniversalAIClient:
                     choices = data.get("choices", [])
                     if choices:
                         return str(choices[0].get("message", {}).get("content", "")).strip()
-                logger.warning("AI_BASE_URL non-200 (%s): %s", resp.status_code, resp.text[:250])
+                logger.warning("AI_BASE_URL non-200 (%s): %s", resp.status_code, redact_secrets(resp.text[:250]))
             except Exception as exc:
-                logger.warning("AI_BASE_URL request failed: %s", exc)
+                logger.warning("AI_BASE_URL request failed: %s", redact_secrets(exc))
 
         return None
 
@@ -298,57 +311,108 @@ class UniversalAIClient:
 # ----------------------------------------------------------------------
 # Subprocess Launcher for Heavy R&D Coin Scout (with Lock Guard)
 # ----------------------------------------------------------------------
+_rnd_proc: Optional[subprocess.Popen] = None
+
+
+def _rnd_running(pid: Any) -> bool:
+    if _rnd_proc is not None and pid == _rnd_proc.pid:
+        # poll() also reaps the finished child, otherwise it stays a zombie and looks alive
+        return _rnd_proc.poll() is None
+    return pid_alive(pid)
+
+
 def trigger_rnd_scout_subprocess() -> Tuple[bool, str]:
     """Launch R&D Coin Scout in a separate background Python process with lock protection."""
-    if RND_LOCK_PATH.exists():
+    global _rnd_proc
+    lock_info = read_rnd_lock()
+    if lock_info is not None:
+        pid = lock_info.get("pid")
         try:
-            lock_info = json.loads(RND_LOCK_PATH.read_text(encoding="utf-8"))
-            age_min = (
-                utc_now() - datetime.fromisoformat(str(lock_info.get("started_at")).replace("Z", "+00:00"))
-            ).total_seconds() / 60.0
-            if age_min < 25.0:
-                return False, f"⏳ R&D Coin Scout уже выполняется в фоне (PID {lock_info.get('pid')}, запущен {age_min:.1f} мин назад)."
-        except Exception:
-            pass
+            started = datetime.fromisoformat(str(lock_info.get("started_at")).replace("Z", "+00:00"))
+            age_min = (utc_now() - started).total_seconds() / 60.0
+        except (TypeError, ValueError):
+            try:
+                age_min = (time.time() - RND_LOCK_PATH.stat().st_mtime) / 60.0
+            except OSError:
+                age_min = 0.0
+        if _rnd_running(pid):
+            return False, f"⏳ R&D Coin Scout уже выполняется в фоне (PID {pid}, запущен {age_min:.1f} мин назад)."
+        if not lock_info and age_min < 1.0:
+            # lock is being written right now
+            return False, "⏳ R&D Coin Scout уже запускается, подожди минуту."
         try:
             RND_LOCK_PATH.unlink(missing_ok=True)
         except OSError:
             pass
 
+    if not write_rnd_lock(os.getpid(), exclusive=True):
+        return False, "⏳ R&D Coin Scout уже запускается, подожди минуту."
+
     cmd = [sys.executable, "-m", "bot.supervisor_tools", "--rnd-scout", "--notify-telegram"]
     try:
-        subprocess.Popen(
+        _rnd_proc = subprocess.Popen(
             cmd,
             cwd=str(ROOT_DIR),
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
         )
-        return True, "🔬 Запустил R&D Coin Scout (SOL, XRP, SUI, AVAX, DOGE на 180д, 3 фолда + OOS) в отдельном фоновом процессе. Как закончится расчёт (~30–60 сек) — пришлю готовый отчёт сюда."
     except Exception as exc:
-        return False, f"⚠️ Не удалось запустить фоновый R&D Coin Scout: {exc}"
+        try:
+            RND_LOCK_PATH.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False, f"⚠️ Не удалось запустить фоновый R&D Coin Scout: {redact_secrets(exc)}"
+    try:
+        write_rnd_lock(_rnd_proc.pid)
+    except OSError as exc:
+        logger.warning("Could not update R&D lock with child pid: %s", exc)
+    return True, "🔬 Запустил R&D Coin Scout (SOL, XRP, SUI, AVAX, DOGE на 180д, 3 фолда + OOS) в отдельном фоновом процессе. Как закончится расчёт (~30-60 сек) - пришлю готовый отчёт сюда."
 
 
 # ----------------------------------------------------------------------
 # Telegram Supervisor Bot (Polling + Inline Advisor Buttons + Schedules)
 # ----------------------------------------------------------------------
 class TelegramSupervisor:
+    # Updates queued while the supervisor was down are dropped if older than this
+    STALE_UPDATE_SEC = 60
+
     def __init__(self) -> None:
         load_dotenv(ROOT_DIR / ".env", override=True)
         self.token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-        self.chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
+        self.allowed_user_ids = set(parse_id_list(os.getenv("TELEGRAM_ALLOWED_USER_IDS", "")))
+        self.chat_ids = parse_id_list(os.getenv("TELEGRAM_CHAT_ID", ""))
+        self.target_chats = self.chat_ids or sorted(self.allowed_user_ids)
         self.ai = UniversalAIClient(on_budget_alert=self.send_message)
         self.offset = 0
+        self.started_at = time.time()
+        self.backlog_drained = False
+        self._access_warned = False
 
     @property
     def telegram_ready(self) -> bool:
         return bool(self.token and "your_telegram" not in self.token.lower())
+
+    @property
+    def access_configured(self) -> bool:
+        return bool(self.chat_ids or self.allowed_user_ids)
+
+    def is_authorized(self, chat: Dict[str, Any], sender: Dict[str, Any]) -> bool:
+        chat_id = str(chat.get("id", ""))
+        user_id = str(sender.get("id", ""))
+        if self.allowed_user_ids:
+            if user_id not in self.allowed_user_ids:
+                return False
+            return chat.get("type") == "private" or chat_id in self.chat_ids
+        return bool(chat_id) and chat_id in self.chat_ids
 
     def _api(self, method: str, payload: Dict[str, Any], timeout: int = 15) -> Dict[str, Any]:
         if not self.telegram_ready:
             return {"ok": False}
         url = f"https://api.telegram.org/bot{self.token}/{method}"
         resp = requests.post(url, json=payload, timeout=(8, timeout))
-        return resp.json() if resp.status_code == 200 else {"ok": False, "status": resp.status_code, "text": resp.text}
+        if resp.status_code == 200:
+            return resp.json()
+        return {"ok": False, "status": resp.status_code, "text": redact_secrets(resp.text[:300])}
 
     def send_message(
         self,
@@ -356,21 +420,24 @@ class TelegramSupervisor:
         reply_markup: Optional[Dict[str, Any]] = None,
         chat_id: Optional[str] = None,
     ) -> None:
-        target = chat_id or self.chat_id
-        if not self.telegram_ready or not target or "your_telegram" in target.lower():
+        targets = [chat_id] if chat_id else self.target_chats
+        if not self.telegram_ready or not targets:
             logger.info("[TG DRY OUTPUT]\n%s", text)
             return
-        payload: Dict[str, Any] = {
-            "chat_id": target,
-            "text": text[:4000],
-            "disable_web_page_preview": True,
-        }
-        if reply_markup is not None:
-            payload["reply_markup"] = reply_markup
-        try:
-            self._api("sendMessage", payload, timeout=12)
-        except Exception as exc:
-            logger.warning("Telegram send_message failed: %s", exc)
+        for target in targets:
+            payload: Dict[str, Any] = {
+                "chat_id": target,
+                "text": text[:4000],
+                "disable_web_page_preview": True,
+            }
+            if reply_markup is not None:
+                payload["reply_markup"] = reply_markup
+            try:
+                res = self._api("sendMessage", payload, timeout=12)
+                if not res.get("ok"):
+                    logger.warning("Telegram send_message to %s failed: HTTP %s %s", target, res.get("status"), res.get("text", ""))
+            except Exception as exc:
+                logger.warning("Telegram send_message to %s failed: %s", target, redact_secrets(exc))
 
     @staticmethod
     def main_menu_keyboard() -> Dict[str, Any]:
@@ -426,6 +493,8 @@ class TelegramSupervisor:
             f"📊 Статус портфеля ({data['mode'].upper()})",
             f"💰 Баланс (Equity): ${w.get('equity', 0.0):,.2f} | Доступно: ${w.get('available', 0.0):,.2f}",
         ]
+        if data["pauses"].get("error"):
+            lines.append(f"⚠️ {data['pauses']['error']}")
         if pauses:
             p_str = ", ".join(f"{e['symbol']} (до {e.get('expires_at', '—')})" for e in pauses)
             lines.append(f"⏸ Активные паузы: {p_str}")
@@ -481,6 +550,16 @@ class TelegramSupervisor:
         reg = compute_market_regime()
         btc = reg["assets"].get("BTCUSDT", {})
         eth = reg["assets"].get("ETHUSDT", {})
+        if not reg.get("data_ok", True):
+            lines = [
+                f"🧭 Market Strategist - Режим рынка: {reg['regime']}",
+                "⚠️ Нет данных: свечи BTC 15m не получены или их меньше 200, режим рынка не определён.",
+                f"• BTCUSDT: ${btc.get('last_price', 0):,.1f} | 24h {btc.get('price_24h_pcnt', 0):+.2f}% | "
+                f"Funding {btc.get('funding_rate_pct', 0):+.4f}%",
+                f"• Совет по WLFI: {reg['wlfi_advisor_note']}",
+            ]
+            kb = self.advisor_pause_keyboard("WLFIUSDT") if reg["regime"] == "PANIC_FLUSH" else None
+            return "\n".join(lines), kb
         lines = [
             f"🧭 Market Strategist — Режим рынка: {reg['regime']}",
             f"• BTCUSDT: ${btc.get('last_price', 0):,.1f} | 1H {btc.get('ret_1h_pct', 0):+.2f}% | "
@@ -567,39 +646,10 @@ class TelegramSupervisor:
             )
             return
 
-        # 1. Explicit Pause command: "поставь WLFI на паузу на 12 часов"
-        if "пауз" in low and ("постав" in low or "включ" in low or "стоп" in low):
-            target_sym = None
-            for s in ("WLFI", "ADA", "LTC", "MNT"):
-                if s.lower() in low:
-                    target_sym = f"{s}USDT"
-                    break
-            if target_sym:
-                m = re.search(r"(\d+)\s*(ч|час|h)", low)
-                hours = float(m.group(1)) if m else 12.0
-                res = set_coin_pause(target_sym, hours=hours, reason=f"User command: {text[:60]}")
-                self.send_message(
-                    f"⏸ {res['symbol']} поставлен на паузу на {hours:.0f}ч (до {res['expires_at']}).\n"
-                    f"По истечении таймера бот автоматически вернётся в работу.",
-                    reply_markup=self.advisor_pause_keyboard(target_sym),
-                    chat_id=chat_id,
-                )
-                return
-
-        # 2. Explicit Unpause command: "сними паузу с WLFI" / "сними паузы"
-        if ("сними" in low or "убери" in low or "отмени" in low or "включи" in low) and "пауз" in low:
-            target_sym = None
-            for s in ("WLFI", "ADA", "LTC", "MNT"):
-                if s.lower() in low:
-                    target_sym = f"{s}USDT"
-                    break
-            if target_sym:
-                set_coin_pause(target_sym, hours=0)
-                self.send_message(f"▶️ Пауза с {target_sym} снята. Бот снова в работе.", chat_id=chat_id)
-            else:
-                for s in ("WLFIUSDT", "ADAUSDT", "LTCUSDT", "MNTUSDT"):
-                    set_coin_pause(s, hours=0)
-                self.send_message("▶️ Все паузы со всех 4 монет сняты.", chat_id=chat_id)
+        # 1. Pause / unpause commands. Unpause is checked first: "Включи ADA, сними паузу" must not pause ADA.
+        intent = parse_pause_intent(low)
+        if intent is not None:
+            self.handle_pause_command(intent, text, low, chat_id)
             return
 
         # 3. Positions & Balance
@@ -650,8 +700,8 @@ class TelegramSupervisor:
             )
             return
 
-        # 10. R&D 5th Coin Scout
-        if "5-й" in low or "5 монет" in low or "пятой" in low or "поиск" in low or "r&d" in low:
+        # 10. R&D 5th Coin Scout (heavy, so only an explicit command or the menu button)
+        if is_rnd_command(low):
             _, msg = trigger_rnd_scout_subprocess()
             self.send_message(msg, chat_id=chat_id)
             return
@@ -671,12 +721,98 @@ class TelegramSupervisor:
                 chat_id=chat_id,
             )
 
+    def handle_pause_command(self, intent: str, text: str, low: str, chat_id: str) -> None:
+        symbols, unknown, wants_all = extract_pause_symbols(low)
+        coins_hint = "Бот торгует только " + ", ".join(s.replace("USDT", "") for s in BOT_SYMBOLS) + "."
+        if unknown:
+            self.send_message(f"⚠️ Не знаю монету {', '.join(unknown)}. {coins_hint} Ничего не изменил.", chat_id=chat_id)
+            return
+
+        if intent == "unpause":
+            try:
+                if symbols:
+                    for sym in symbols:
+                        set_coin_pause(sym, hours=0)
+                    self.send_message(f"▶️ Пауза с {', '.join(symbols)} снята. Бот снова в работе.", chat_id=chat_id)
+                else:
+                    for sym in BOT_SYMBOLS:
+                        set_coin_pause(sym, hours=0)
+                    self.send_message("▶️ Все паузы со всех 4 монет сняты.", chat_id=chat_id)
+            except BlacklistError as exc:
+                self.send_message(f"⚠️ Паузы не изменены: {exc}", chat_id=chat_id)
+            return
+
+        if not symbols or wants_all:
+            self.send_message(f"⚠️ Укажи одну монету для паузы, например: «поставь WLFI на паузу на 12ч». {coins_hint}", chat_id=chat_id)
+            return
+        hours = 12.0
+        m = HOURS_RE.search(low)
+        if m:
+            per_unit = 1.0 if m.group(2) in ("ч", "час", "h") else 24.0
+            try:
+                raw_hours: Any = float(m.group(1).replace(",", ".")) * per_unit
+            except ValueError:
+                raw_hours = None
+            hours = parse_pause_hours(raw_hours)
+            if hours is None:
+                self.send_message(f"⚠️ Срок паузы должен быть больше 0 и не больше {MAX_PAUSE_HOURS:.0f}ч (7 дней).", chat_id=chat_id)
+                return
+        try:
+            for sym in symbols:
+                res = set_coin_pause(sym, hours=hours, reason=f"User command: {text[:60]}")
+                self.send_message(
+                    f"⏸ {res['symbol']} поставлен на паузу на {hours:g}ч (до {res['expires_at']}).\n"
+                    f"По истечении таймера бот автоматически вернётся в работу.",
+                    reply_markup=self.advisor_pause_keyboard(sym),
+                    chat_id=chat_id,
+                )
+        except BlacklistError as exc:
+            self.send_message(f"⚠️ Пауза не поставлена: {exc}", chat_id=chat_id)
+
+    def handle_pause_callback(self, data: str, chat_id: str) -> None:
+        parts = data.split(":")
+        if len(parts) != 3:
+            return
+        sym, hrs_str = parts[1], parts[2]
+        if sym != "ALL" and sym not in BOT_SYMBOLS:
+            logger.warning("Rejected pause callback with unknown symbol: %r", sym[:20])
+            self.send_message(f"⚠️ Неизвестная монета в кнопке: {sym[:20]}", chat_id=chat_id)
+            return
+        try:
+            if sym == "ALL":
+                for s in BOT_SYMBOLS:
+                    set_coin_pause(s, hours=0)
+                self.send_message("▶️ Все паузы со всех 4 монет сняты.", chat_id=chat_id)
+            elif hrs_str.strip() == "0":
+                set_coin_pause(sym, hours=0)
+                self.send_message(f"▶️ Пауза с {sym} снята. Бот снова в работе.", chat_id=chat_id)
+            else:
+                hrs = parse_pause_hours(hrs_str)
+                if hrs is None:
+                    logger.warning("Rejected pause callback with bad hours: %r", hrs_str[:20])
+                    self.send_message(f"⚠️ Некорректный срок паузы. Допустимо от 0 до {MAX_PAUSE_HOURS:.0f}ч.", chat_id=chat_id)
+                    return
+                res = set_coin_pause(sym, hours=hrs, reason=f"Telegram button pause {hrs:g}h")
+                self.send_message(
+                    f"⏸ {sym} поставлен на паузу на {hrs:g}ч (до {res['expires_at']}).",
+                    reply_markup=self.advisor_pause_keyboard(sym),
+                    chat_id=chat_id,
+                )
+        except BlacklistError as exc:
+            self.send_message(f"⚠️ Паузы не изменены: {exc}", chat_id=chat_id)
+
     def handle_callback(self, cb: Dict[str, Any]) -> None:
         cb_id = cb.get("id")
         data = str(cb.get("data", ""))
-        msg = cb.get("message", {})
-        chat_id = str(msg.get("chat", {}).get("id", ""))
-        if self.chat_id and "your_telegram" not in self.chat_id.lower() and chat_id != self.chat_id:
+        msg = cb.get("message") or {}
+        chat = msg.get("chat") or {}
+        chat_id = str(chat.get("id", ""))
+        if not self.is_authorized(chat, cb.get("from") or {}):
+            logger.warning(
+                "Rejected callback from user %s in chat %s",
+                (cb.get("from") or {}).get("id"),
+                chat_id or "?",
+            )
             return
 
         try:
@@ -685,24 +821,7 @@ class TelegramSupervisor:
             pass
 
         if data.startswith("pause:"):
-            parts = data.split(":")
-            if len(parts) == 3:
-                sym, hrs_str = parts[1], parts[2]
-                hrs = float(hrs_str)
-                if sym == "ALL":
-                    for s in ("WLFIUSDT", "ADAUSDT", "LTCUSDT", "MNTUSDT"):
-                        set_coin_pause(s, hours=0)
-                    self.send_message("▶️ Все паузы со всех 4 монет сняты.", chat_id=chat_id)
-                elif hrs <= 0:
-                    set_coin_pause(sym, hours=0)
-                    self.send_message(f"▶️ Пауза с {sym} снята. Бот снова в работе.", chat_id=chat_id)
-                else:
-                    res = set_coin_pause(sym, hours=hrs, reason=f"Telegram button pause {hrs:.0f}h")
-                    self.send_message(
-                        f"⏸ {sym} поставлен на паузу на {hrs:.0f}ч (до {res['expires_at']}).",
-                        reply_markup=self.advisor_pause_keyboard(sym),
-                        chat_id=chat_id,
-                    )
+            self.handle_pause_callback(data, chat_id)
             return
 
         if data == "cmd:positions":
@@ -725,39 +844,109 @@ class TelegramSupervisor:
             _, txt = trigger_rnd_scout_subprocess()
             self.send_message(txt, chat_id=chat_id)
 
-    def poll_telegram_once(self) -> None:
+    def poll_telegram_once(self) -> bool:
+        """One getUpdates round. Returns False when the caller should back off before the next one."""
         if not self.telegram_ready:
-            return
+            return False
+        if not self.access_configured:
+            if not self._access_warned:
+                logger.warning(
+                    "TELEGRAM_CHAT_ID and TELEGRAM_ALLOWED_USER_IDS are empty: Telegram commands are disabled. "
+                    "Set them in .env and restart the supervisor."
+                )
+                self._access_warned = True
+            return False
+
+        backlog = not self.backlog_drained
         try:
-            res = self._api("getUpdates", {"offset": self.offset, "timeout": 5}, timeout=12)
-            for upd in res.get("result", []):
-                self.offset = max(self.offset, int(upd["update_id"]) + 1)
-                if "callback_query" in upd:
-                    self.handle_callback(upd["callback_query"])
-                elif "message" in upd:
-                    m = upd["message"]
-                    cid = str(m.get("chat", {}).get("id", ""))
-                    txt = str(m.get("text", "")).strip()
-                    if not txt:
-                        continue
-                    if not self.chat_id or "your_telegram" in self.chat_id.lower():
-                        logger.info("Auto-registered first Telegram user message (saved TELEGRAM_CHAT_ID to .env)")
-                        self.chat_id = cid
-                        try:
-                            env_p = ROOT_DIR / ".env"
-                            if env_p.exists():
-                                etxt = env_p.read_text(encoding="utf-8")
-                                if "TELEGRAM_CHAT_ID=" in etxt:
-                                    etxt = re.sub(r"^TELEGRAM_CHAT_ID=.*$", f"TELEGRAM_CHAT_ID={cid}", etxt, flags=re.M)
-                                else:
-                                    etxt += f"\nTELEGRAM_CHAT_ID={cid}\n"
-                                env_p.write_text(etxt, encoding="utf-8")
-                        except Exception:
-                            pass
-                    if cid == self.chat_id:
-                        self.handle_user_text(txt, chat_id=cid)
+            res = self._api("getUpdates", {"offset": self.offset, "timeout": 0 if backlog else 5}, timeout=12)
         except Exception as exc:
-            logger.debug("Telegram poll note: %s", exc)
+            logger.warning("Telegram getUpdates failed: %s", redact_secrets(exc))
+            return False
+        if not res.get("ok"):
+            logger.warning("Telegram getUpdates not ok: HTTP %s %s", res.get("status"), res.get("text", ""))
+            return False
+
+        updates = res.get("result", [])
+        if backlog and not updates:
+            self.backlog_drained = True
+        for upd in updates:
+            self.offset = max(self.offset, int(upd["update_id"]) + 1)
+            try:
+                self.handle_update(upd, backlog=backlog)
+            except Exception as exc:
+                logger.exception("Telegram update %s failed: %s", upd.get("update_id"), redact_secrets(exc))
+        return True
+
+    def handle_update(self, upd: Dict[str, Any], backlog: bool = False) -> None:
+        if "callback_query" in upd:
+            if backlog:
+                # Button presses carry no own timestamp, so the ones queued during downtime are dropped
+                logger.info("Skipped queued callback %s from before startup", upd.get("update_id"))
+                return
+            self.handle_callback(upd["callback_query"])
+            return
+        m = upd.get("message")
+        if not m:
+            return
+        if backlog and int(m.get("date") or 0) < self.started_at - self.STALE_UPDATE_SEC:
+            logger.info("Skipped stale queued message %s", upd.get("update_id"))
+            return
+        chat = m.get("chat") or {}
+        cid = str(chat.get("id", ""))
+        txt = str(m.get("text", "")).strip()
+        if not txt:
+            return
+        if not self.is_authorized(chat, m.get("from") or {}):
+            logger.warning("Rejected message from user %s in chat %s", (m.get("from") or {}).get("id"), cid)
+            return
+        self.handle_user_text(txt, chat_id=cid)
+
+
+PAUSE_WORD = "пауз"
+UNPAUSE_VERBS = ("сними", "снять", "снимай", "убери", "убрать", "отмени", "отменить", "сбрось", "сбросить", "возобнов")
+PAUSE_VERBS = ("постав", "стоп", "останов", "приостан", "выключ", "включи паузу", "включить паузу", "на паузу")
+HOURS_RE = re.compile(r"(\d+(?:[.,]\d+)?)\s*(ч|час|h|дн|день|дня|сут|d\b)")
+_LATIN_WORD_RE = re.compile(r"[a-z][a-z0-9]*")
+_NOT_A_COIN = {"usdt", "all", "h", "tp", "sl", "ttl"}
+_ALL_WORDS = ("все", "всё", "всех", "all")
+
+
+def parse_pause_intent(low: str) -> Optional[str]:
+    """'unpause', 'pause' or None. Unpause wins when both kinds of words are present."""
+    if PAUSE_WORD not in low:
+        return None
+    if any(v in low for v in UNPAUSE_VERBS):
+        return "unpause"
+    if any(v in low for v in PAUSE_VERBS):
+        return "pause"
+    return None
+
+
+def extract_pause_symbols(low: str) -> Tuple[List[str], List[str], bool]:
+    """Bot symbols named in the text, unknown latin tickers, and whether 'все/all' was said."""
+    known = {s.replace("USDT", "").lower(): s for s in BOT_SYMBOLS}
+    found: List[str] = []
+    unknown: List[str] = []
+    for word in _LATIN_WORD_RE.findall(low):
+        base = word[:-4] if word.endswith("usdt") and len(word) > 4 else word
+        if base in _NOT_A_COIN:
+            continue
+        if base in known:
+            if known[base] not in found:
+                found.append(known[base])
+        elif len(base) >= 2 and base.upper() not in unknown:
+            unknown.append(base.upper())
+    words = re.findall(r"\w+", low)
+    wants_all = any(w in _ALL_WORDS for w in words)
+    return found, unknown, wants_all
+
+
+def is_rnd_command(low: str) -> bool:
+    low = low.strip()
+    if low in ("/rnd", "r&d", "/scout"):
+        return True
+    return any(k in low for k in ("5-й монет", "5-ой монет", "пятой монет", "пятую монет", "r&d scout", "запусти r&d"))
 
 
 def main() -> None:
@@ -782,13 +971,21 @@ def main() -> None:
         print(txt)
         return
 
+    if sup.telegram_ready and not sup.access_configured:
+        logger.warning("Telegram commands disabled: set TELEGRAM_CHAT_ID and/or TELEGRAM_ALLOWED_USER_IDS in .env")
+
     last_4h_bucket = -1
     last_daily_key = ""
     last_weekly_key = ""
+    poll_failures = 0
 
     while True:
         try:
-            sup.poll_telegram_once()
+            if sup.poll_telegram_once():
+                poll_failures = 0
+            else:
+                poll_failures += 1
+                time.sleep(min(60, 5 * 2 ** min(poll_failures - 1, 4)) if sup.telegram_ready and sup.access_configured else 5)
             now = utc_now()
 
             # 1. Every 4 hours: Market Strategist + News Scout (alert if PANIC_FLUSH or risk news)
@@ -799,6 +996,11 @@ def main() -> None:
                     if reg["regime"] == "PANIC_FLUSH":
                         txt, kb = sup.build_market_regime_report()
                         sup.send_message(f"⚠️ [MARKET STRATEGIST ALERT]\n{txt}", reply_markup=kb)
+                    elif reg["regime"] == "UNKNOWN":
+                        sup.send_message(
+                            "⚠️ [MARKET STRATEGIST] Нет данных по свечам BTC, режим рынка не определён. "
+                            "Проверка на пролив BTC за 4ч в этом цикле не выполнена."
+                        )
                     news_txt, news_kb = sup.build_news_report()
                     if news_kb is not None:
                         sup.send_message(f"⚠️ [NEWS SCOUT ALERT]\n{news_txt}", reply_markup=news_kb)
@@ -821,7 +1023,7 @@ def main() -> None:
                     trigger_rnd_scout_subprocess()
 
         except Exception as exc:
-            logger.exception("AI Supervisor loop error: %s", exc)
+            logger.exception("AI Supervisor loop error: %s", redact_secrets(exc))
             time.sleep(10)
 
 

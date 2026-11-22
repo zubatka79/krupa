@@ -25,6 +25,8 @@ def compute_rsi(close: pd.Series, period: int = 14) -> pd.Series:
     avg_loss = rma(loss, period)
     rs = avg_gain / avg_loss.replace(0.0, np.nan)
     rsi = 100.0 - (100.0 / (1.0 + rs))
+    only_gains = (avg_loss == 0.0) & (avg_gain > 0.0)
+    rsi = rsi.mask(only_gains, 100.0)
     return rsi.fillna(50.0)
 
 

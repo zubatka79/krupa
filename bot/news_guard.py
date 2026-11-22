@@ -2,7 +2,7 @@
 
 Enforces strict protection around high-impact US macro releases (FOMC, CPI, NFP, PPI, Fed Chair):
   1. Live Calendar + Local UTC Cache (`data/macro_events.json`):
-     Downloads ForexFactory free JSON calendars (`thisweek` + `nextweek`), normalizes all
+     Downloads the ForexFactory free JSON calendar (`thisweek`), normalizes all
      timestamps strictly to UTC, and refreshes automatically every `macro_refresh_hours` (12h).
   2. Hard Entry & Limit Block (`-30m .. +15m` UTC):
      Blocks all new limit entries and instructs executor to cancel any unfilled pending limits.
@@ -67,8 +67,31 @@ def parse_iso_utc(value: Optional[str]) -> Optional[datetime]:
         return None
 
 
-def is_core_us_macro_title(title: str) -> bool:
-    return any(pat.search(title) for pat in CORE_US_MACRO_PATTERNS)
+def is_core_us_macro_title(title: str, extra_patterns: Optional[List[str]] = None) -> bool:
+    if any(pat.search(title) for pat in CORE_US_MACRO_PATTERNS):
+        return True
+    for raw in extra_patterns or []:
+        try:
+            if re.search(str(raw), title, re.I):
+                return True
+        except re.error:
+            logger.warning("Invalid macro_extra_patterns entry ignored: %r", raw)
+    return False
+
+
+def _atomic_write_json(path: Path, payload: Dict[str, Any]) -> None:
+    tmp = path.with_name(f"{path.stem}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError as exc:
+        logger.error("Could not write %s: %s", path, exc)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:
+            pass
 
 
 def read_news_state(path: str | Path = "data/news_state.json") -> Dict[str, Any]:
@@ -166,6 +189,20 @@ class NewsGuard:
     def max_stale_hours(self) -> float:
         return float(self.config.get("macro_max_stale_hours", 36.0))
 
+    @property
+    def extra_patterns(self) -> List[str]:
+        raw = self.config.get("macro_extra_patterns", [])
+        return [str(x) for x in raw] if isinstance(raw, list) else []
+
+    @staticmethod
+    def _covers(payload: Dict[str, Any], now: datetime) -> bool:
+        """The weekly calendar must actually span `now`, not just be recently downloaded."""
+        start = parse_iso_utc(payload.get("coverage_from_utc"))
+        end = parse_iso_utc(payload.get("coverage_to_utc"))
+        if start is None or end is None:
+            return False
+        return start - timedelta(days=1) <= now <= end + timedelta(days=2)
+
     # ------------------------------------------------------------------
     # Live Economic Calendar Fetch + UTC Normalization + Atomic Cache
     # ------------------------------------------------------------------
@@ -175,6 +212,7 @@ class NewsGuard:
         try:
             data = json.loads(self.macro_events_path.read_text(encoding="utf-8"))
             if isinstance(data, dict) and isinstance(data.get("events"), list) and data.get("fetched_at_utc"):
+                data["events"] = [e for e in data["events"] if isinstance(e, dict)]
                 return data
         except Exception as exc:
             logger.error("US Macro Shield: corrupted calendar cache %s (%s).", self.macro_events_path, exc)
@@ -198,13 +236,17 @@ class NewsGuard:
 
         if not force and cached is not None:
             age_h = self._cache_age_hours(cached, cur_now)
-            if age_h < self.refresh_hours:
+            if age_h < self.refresh_hours and self._covers(cached, cur_now):
                 return cached, True, None
 
         # Throttle retry spam to once per 5 min when network is down (unless force=True)
         now_mono = time.time()
         if not force and (now_mono - self._last_fetch_attempt_mono) < 300.0:
-            if cached is not None and self._cache_age_hours(cached, cur_now) <= self.max_stale_hours:
+            if (
+                cached is not None
+                and self._cache_age_hours(cached, cur_now) <= self.max_stale_hours
+                and self._covers(cached, cur_now)
+            ):
                 return cached, True, None
             return cached, False, "Macro calendar stale/missing (awaiting retry cooldown)"
 
@@ -219,7 +261,7 @@ class NewsGuard:
                 resp.raise_for_status()
                 items = resp.json()
                 if isinstance(items, list):
-                    raw_all.extend(items)
+                    raw_all.extend(i for i in items if isinstance(i, dict))
                     fetched_sources.append(url)
                 else:
                     errors.append(f"{url}: unexpected JSON root")
@@ -231,6 +273,16 @@ class NewsGuard:
                     pass
                 self._session = requests.Session()
                 self._session.headers.update({"User-Agent": "Mozilla/5.0 (compatible; BybitMacroShield/2.0)"})
+
+        all_dates = [d for d in (parse_iso_utc(ev.get("date")) for ev in raw_all) if d is not None]
+        if fetched_sources and not all_dates:
+            errors.append("calendar has no dated events")
+            fetched_sources = []
+        elif fetched_sources:
+            cov = {"coverage_from_utc": to_iso_z(min(all_dates)), "coverage_to_utc": to_iso_z(max(all_dates))}
+            if not self._covers(cov, cur_now):
+                errors.append(f"calendar covers {cov['coverage_from_utc']}..{cov['coverage_to_utc']}, not the current date")
+                fetched_sources = []
 
         if fetched_sources:
             seen_keys = set()
@@ -252,7 +304,7 @@ class NewsGuard:
                     continue
                 seen_keys.add(dedup_key)
 
-                is_core = is_core_us_macro_title(title)
+                is_core = is_core_us_macro_title(title, self.extra_patterns)
                 rec = {
                     "title": title,
                     "country": "USD",
@@ -273,24 +325,15 @@ class NewsGuard:
                 "fetched_at_utc": to_iso_z(cur_now),
                 "source_urls": fetched_sources,
                 "status": "OK",
+                "coverage_from_utc": cov["coverage_from_utc"],
+                "coverage_to_utc": cov["coverage_to_utc"],
                 "core_count": len(core_events),
                 "usd_high_count": len(all_usd_high),
                 "events": core_events,
                 "all_usd_high_events": all_usd_high,
                 "last_error": "; ".join(errors) if errors else None,
             }
-            tmp = self.macro_events_path.with_name(f"{self.macro_events_path.stem}.{os.getpid()}.tmp")
-            try:
-                tmp.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
-                os.replace(tmp, self.macro_events_path)
-            except PermissionError:
-                pass
-            finally:
-                try:
-                    if tmp.exists():
-                        tmp.unlink()
-                except OSError:
-                    pass
+            _atomic_write_json(self.macro_events_path, payload)
             logger.info(
                 "US Macro Shield: refreshed %s (%d core FOMC/CPI/NFP/PPI events, %d total USD High).",
                 self.macro_events_path,
@@ -302,6 +345,10 @@ class NewsGuard:
         err_summary = "; ".join(errors) if errors else "unknown fetch failure"
         if cached is not None:
             age_h = self._cache_age_hours(cached, cur_now)
+            if not self._covers(cached, cur_now):
+                msg = f"Cached macro calendar does not cover the current date and refresh failed: {err_summary}"
+                logger.error("US Macro Shield FAIL-SAFE: %s", msg)
+                return cached, False, msg
             if age_h <= self.max_stale_hours:
                 logger.warning(
                     "US Macro Shield: live refresh failed (%s); using cached calendar (age %.1fh <= %.1fh).",
@@ -360,8 +407,8 @@ class NewsGuard:
                 is_fresh_ok, err_msg = False, "Local macro_events.json missing or corrupted"
             else:
                 age_h = self._cache_age_hours(payload, cur_now)
-                is_fresh_ok = age_h <= self.max_stale_hours
-                err_msg = None if is_fresh_ok else f"Local macro_events.json stale (age {age_h:.1f}h > {self.max_stale_hours:.1f}h)"
+                is_fresh_ok = age_h <= self.max_stale_hours and self._covers(payload, cur_now)
+                err_msg = None if is_fresh_ok else f"Local macro_events.json stale or not covering now (age {age_h:.1f}h)"
 
         if not is_fresh_ok or payload is None:
             reason = f"FAIL-SAFE BLOCK: {err_msg or 'macro calendar unavailable'}"
@@ -391,6 +438,8 @@ class NewsGuard:
         upcoming: List[Dict[str, Any]] = []
 
         for ev in events:
+            if not isinstance(ev, dict):
+                continue
             ev_dt = parse_iso_utc(ev.get("time_utc"))
             if ev_dt is None:
                 continue
@@ -411,7 +460,7 @@ class NewsGuard:
         in_window = len(active_events) > 0
         reason = None
         if in_window:
-            ev_desc = "; ".join(f"{e['title']} ({e['time_utc']})" for e in active_events)
+            ev_desc = "; ".join(f"{e.get('title')} ({e.get('time_utc')})" for e in active_events)
             reason = f"US Macro Shield (-{self.pre_window_min}m..+{self.post_window_min}m): {ev_desc}"
 
         return {
@@ -437,18 +486,7 @@ class NewsGuard:
         state = self.evaluate_macro_shield(now=now, allow_network_refresh=True, force_refresh=force_refresh)
         state["updated_at"] = state["checked_at_utc"]
 
-        tmp = self.state_path.with_name(f"{self.state_path.stem}.{os.getpid()}.tmp")
-        try:
-            tmp.write_text(json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8")
-            os.replace(tmp, self.state_path)
-        except PermissionError:
-            pass
-        finally:
-            try:
-                if tmp.exists():
-                    tmp.unlink()
-            except OSError:
-                pass
+        _atomic_write_json(self.state_path, state)
 
         if not state["entry_allowed"]:
             key = f"{state['layer']}:{state['pause_until_utc']}:{state['reason']}"
@@ -475,3 +513,19 @@ class NewsGuard:
             self._last_logged_key = None
 
         return state
+
+
+def minutes_to_next_event(state: Dict[str, Any], now: Optional[datetime] = None) -> Optional[float]:
+    """Minutes until the nearest core event that has not started yet, from an evaluated shield state."""
+    cur_now = now or utc_now()
+    best: Optional[float] = None
+    for ev in state.get("upcoming_core_events") or []:
+        if not isinstance(ev, dict):
+            continue
+        ev_dt = parse_iso_utc(ev.get("time_utc"))
+        if ev_dt is None or ev_dt < cur_now:
+            continue
+        mins = (ev_dt - cur_now).total_seconds() / 60.0
+        if best is None or mins < best:
+            best = mins
+    return best

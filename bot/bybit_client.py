@@ -466,11 +466,10 @@ class BybitClient:
                     frames.append(older)
                     updated = True
 
-            # Fetch missing newer candles
-            if req_end > cached_max + interval_ms:
-                newer = self._fetch_kline_range(
-                    symbol, interval_str, cached_max + interval_ms, req_end
-                )
+            # Fetch missing newer candles; the last cached bar is re-fetched in case
+            # it was stored right at its close, before the exchange finalized it
+            if req_end >= cached_max + interval_ms:
+                newer = self._fetch_kline_range(symbol, interval_str, cached_max, req_end)
                 if not newer.empty:
                     frames.append(newer)
                     updated = True
@@ -480,7 +479,7 @@ class BybitClient:
 
         merged = (
             pd.concat(frames, ignore_index=True)
-            .drop_duplicates(subset=["timestamp"])
+            .drop_duplicates(subset=["timestamp"], keep="last")
             .sort_values("timestamp")
             .reset_index(drop=True)
         )
@@ -673,7 +672,7 @@ class BybitClient:
         price: float,
         stop_loss: float,
     ) -> Dict[str, Any]:
-        """Place a PostOnly Limit Maker entry order with atomic server-side Stop-Loss attached."""
+        """Place a GTC Limit entry order with atomic server-side Stop-Loss attached."""
         client = self._require_private()
         resp = client.place_order(
             category="linear",
@@ -684,7 +683,7 @@ class BybitClient:
             price=str(price),
             stopLoss=str(stop_loss),
             slTriggerBy="MarkPrice",
-            timeInForce="PostOnly",
+            timeInForce="GTC",
         )
         if resp.get("retCode") != 0:
             raise RuntimeError(f"place_limit_entry_with_sl error: {resp}")
@@ -720,7 +719,7 @@ class BybitClient:
         qty: float,
         price: float,
     ) -> Dict[str, Any]:
-        """Place a reduce-only PostOnly limit take-profit order (Maker fee)."""
+        """Place a reduce-only GTC limit take-profit order."""
         client = self._require_private()
         resp = client.place_order(
             category="linear",
@@ -730,7 +729,7 @@ class BybitClient:
             qty=str(qty),
             price=str(price),
             reduceOnly=True,
-            timeInForce="PostOnly",
+            timeInForce="GTC",
         )
         if resp.get("retCode") != 0:
             raise RuntimeError(f"place_limit_tp_order error: {resp}")
@@ -800,6 +799,13 @@ class BybitClient:
                 if items:
                     return items[0]
         return None
+
+    def get_closed_pnl(self, symbol: str, start_ms: int, limit: int = 50) -> List[Dict[str, Any]]:
+        client = self._require_private()
+        resp = client.get_closed_pnl(category="linear", symbol=symbol, startTime=int(start_ms), limit=limit)
+        if resp.get("retCode") != 0:
+            raise RuntimeError(f"get_closed_pnl error: {resp}")
+        return resp["result"].get("list", [])
 
     def cancel_order(self, symbol: str, order_id: str) -> None:
         client = self._require_private()

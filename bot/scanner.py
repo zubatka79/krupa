@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -49,6 +51,27 @@ class TradeSignal:
     be2_offset_pct: Optional[float] = None
 
 
+# Strategies served by the generic scoring path (score_closed_bar) or fibo_trend_v2
+KNOWN_MULTI_COIN_STRATEGIES = ("fibo_trend_v2", "generic_score")
+
+
+def _finite(value: Any, default: float = 0.0) -> float:
+    try:
+        v = float(value)
+    except (TypeError, ValueError):
+        return default
+    return v if math.isfinite(v) else default
+
+
+def _flag(value: Any) -> bool:
+    try:
+        if pd.isna(value):
+            return False
+    except (TypeError, ValueError):
+        pass
+    return bool(value)
+
+
 def load_blacklist(path: str | Path = "data/blacklist.json") -> Tuple[Set[str], Optional[str]]:
     """Load active (non-expired) blacklisted symbols and optional macro pause reason."""
     p = Path(path)
@@ -56,9 +79,12 @@ def load_blacklist(path: str | Path = "data/blacklist.json") -> Tuple[Set[str], 
         return set(), None
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("root is not an object")
     except Exception as exc:
-        logger.warning("Failed to parse blacklist %s: %s", p, exc)
-        return set(), None
+        # An unreadable file may hide a manual or macro pause, so treat it as a pause
+        logger.error("Failed to parse blacklist %s: %s", p, exc)
+        return set(), f"blacklist unreadable: {exc}"
 
     now = datetime.now(timezone.utc)
     active: Set[str] = set()
@@ -66,6 +92,8 @@ def load_blacklist(path: str | Path = "data/blacklist.json") -> Tuple[Set[str], 
     entries = data.get("entries", [])
     if isinstance(entries, list) and entries:
         for entry in entries:
+            if not isinstance(entry, dict):
+                continue
             sym = str(entry.get("symbol", "")).upper().strip()
             if not sym:
                 continue
@@ -73,9 +101,11 @@ def load_blacklist(path: str | Path = "data/blacklist.json") -> Tuple[Set[str], 
             if exp:
                 try:
                     exp_dt = datetime.fromisoformat(str(exp).replace("Z", "+00:00"))
+                    if exp_dt.tzinfo is None:
+                        exp_dt = exp_dt.replace(tzinfo=timezone.utc)
                     if exp_dt <= now:
                         continue
-                except ValueError:
+                except (TypeError, ValueError):
                     pass
             active.add(sym)
     else:
@@ -400,7 +430,10 @@ class MarketScanner:
             return ["LONG"]
         if mode == "only_short":
             return ["SHORT"]
-        return ["LONG", "SHORT"]
+        if mode in ("long_short", "both"):
+            return ["LONG", "SHORT"]
+        logger.error("Unknown allowed_directions=%r, scanning paused until config is fixed.", mode)
+        return []
 
     def _eval_fibo_trend_v2_latest(
         self,
@@ -477,8 +510,8 @@ class MarketScanner:
 
         h1_adx_min = float(self.config.get("h1_adx_min", 30.0))
         h4_adx_min = float(self.config.get("h4_adx_min", 20.0))
-        cur_h1_adx = float(df["h1_adx"].iloc[-1] or 0.0)
-        cur_h4_adx = float(df["h4_adx"].iloc[-1] or 0.0)
+        cur_h1_adx = _finite(df["h1_adx"].iloc[-1])
+        cur_h4_adx = _finite(df["h4_adx"].iloc[-1])
         if cur_h1_adx < h1_adx_min or cur_h4_adx < h4_adx_min:
             return None
 
@@ -666,12 +699,12 @@ class MarketScanner:
         }).sort_values("close_ts")
 
         df = pd.merge_asof(df, h1_out, on="close_ts", direction="backward")
-        cur_h1_adx = float(df["h1_adx"].iloc[-1] or 0.0)
+        cur_h1_adx = _finite(df["h1_adx"].iloc[-1])
         if cur_h1_adx < h1_adx_min:
             return None
 
-        h1_bull = bool(df["h1_bull"].iloc[-1])
-        h1_bear = bool(df["h1_bear"].iloc[-1])
+        h1_bull = _flag(df["h1_bull"].iloc[-1])
+        h1_bear = _flag(df["h1_bear"].iloc[-1])
         if not h1_bull and not h1_bear:
             return None
 
@@ -823,7 +856,7 @@ class MarketScanner:
             "h1_adx": h1_adx.fillna(0.0).values,
         }).sort_values("close_ts")
         df = pd.merge_asof(df, h1_out, on="close_ts", direction="backward")
-        cur_h1_adx = float(df["h1_adx"].iloc[-1] or 0.0)
+        cur_h1_adx = _finite(df["h1_adx"].iloc[-1])
         if cur_h1_adx > h1_adx_max:
             return None
 
@@ -974,12 +1007,12 @@ class MarketScanner:
         }).sort_values("close_ts")
 
         df = pd.merge_asof(df, h1_out, on="close_ts", direction="backward")
-        cur_h1_adx = float(df["h1_adx"].iloc[-1] or 0.0)
+        cur_h1_adx = _finite(df["h1_adx"].iloc[-1])
         if cur_h1_adx < h1_adx_min:
             return None
 
-        h1_bull = bool(df["h1_bull"].iloc[-1])
-        h1_bear = bool(df["h1_bear"].iloc[-1])
+        h1_bull = _flag(df["h1_bull"].iloc[-1])
+        h1_bear = _flag(df["h1_bear"].iloc[-1])
         if not h1_bull and not h1_bear:
             return None
 
@@ -1117,13 +1150,13 @@ class MarketScanner:
         }).sort_values("close_ts")
 
         df = pd.merge_asof(df, h1_out, on="close_ts", direction="backward")
-        cur_h1_adx = float(df["h1_adx"].iloc[-1] or 0.0)
-        cur_h1_slope = float(df["h1_slope"].iloc[-1] or 0.0)
+        cur_h1_adx = _finite(df["h1_adx"].iloc[-1])
+        cur_h1_slope = _finite(df["h1_slope"].iloc[-1])
         if cur_h1_adx < h1_adx_min:
             return None
 
-        h1_bull = bool(df["h1_bull"].iloc[-1])
-        h1_bear = bool(df["h1_bear"].iloc[-1])
+        h1_bull = _flag(df["h1_bull"].iloc[-1])
+        h1_bear = _flag(df["h1_bear"].iloc[-1])
         if not h1_bull and not h1_bear:
             return None
 
@@ -1230,15 +1263,26 @@ class MarketScanner:
         entry_tf = str(self.config.get("entry_tf", "15"))
         context_tf = str(self.config.get("context_tf", "60"))
         trend_tf = str(self.config.get("trend_tf", "240"))
-        strategy_name = str(self.config.get("strategy", "ada_fibo50_15x")).lower()
+        strategy_name = str(self.config.get("strategy", "")).strip().lower()
+        single_coin_strats = ("ada_fibo50_15x", "wlfi_meanrev_15x_v2a", "ltc_trend_bb_10x", "mnt_breakout_don_10x")
+        if strategy_name not in single_coin_strats + KNOWN_MULTI_COIN_STRATEGIES:
+            logger.error("Unknown strategy %r in config, scanning skipped.", strategy_name)
+            return []
+
+        entry_ms = INTERVAL_TO_MS[entry_tf]
+        expected_last_ts = (int(time.time() * 1000) // entry_ms - 1) * entry_ms
 
         # Fetch BTC reference data first
         df_btc = self.client.get_klines("BTCUSDT", interval=entry_tf, days=4, use_cache=True, closed_only=True)
         if df_btc.empty or len(df_btc) < 30:
             logger.warning("Insufficient BTCUSDT candles for scan.")
             return []
-
-        single_coin_strats = ("ada_fibo50_15x", "wlfi_meanrev_15x_v2a", "ltc_trend_bb_10x", "mnt_breakout_don_10x")
+        if int(df_btc["timestamp"].iloc[-1]) != expected_last_ts:
+            logger.warning(
+                "BTCUSDT last closed bar %s is not the expected %s, skipping scan.",
+                int(df_btc["timestamp"].iloc[-1]), expected_last_ts,
+            )
+            return []
         if strategy_name not in single_coin_strats:
             last_btc = df_btc.iloc[-1]
             btc_move = abs(float(last_btc["close"]) - float(last_btc["open"])) / float(last_btc["open"]) * 100.0
@@ -1258,6 +1302,12 @@ class MarketScanner:
                 days_needed = 7 if strategy_name in single_coin_strats else 16
                 df_15m = self.client.get_klines(spec.symbol, interval=entry_tf, days=days_needed, use_cache=True, closed_only=True)
                 if len(df_15m) < 120:
+                    continue
+                if int(df_15m["timestamp"].iloc[-1]) != expected_last_ts:
+                    logger.warning(
+                        "%s last closed bar %s is not the expected %s, skipping.",
+                        spec.symbol, int(df_15m["timestamp"].iloc[-1]), expected_last_ts,
+                    )
                     continue
 
                 if strategy_name == "ada_fibo50_15x":
