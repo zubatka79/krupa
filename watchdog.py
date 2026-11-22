@@ -143,7 +143,10 @@ def check_once(max_log_age_min: float = 20.0, alert_cooldown_min: float = 30.0) 
     # ------------------------------------------------------------------
     # 1. Process liveness & 15M log freshness across all 4 bots
     # ------------------------------------------------------------------
-    cmdlines = get_running_command_lines()
+    # In Docker every bot runs in its own container, so /proc here only shows the watchdog.
+    # Liveness then relies on log freshness and the container restart policy.
+    skip_proc = os.getenv("WATCHDOG_SKIP_PROCESS_CHECK", "").strip().lower() in ("1", "true", "yes")
+    cmdlines = [] if skip_proc else get_running_command_lines()
     for b in BOT_CONFIGS:
         cfg_name = b["config_file"]
         sym = b["symbol"]
