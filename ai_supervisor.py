@@ -212,7 +212,6 @@ class UniversalAIClient:
                 payload = {
                     "model": self.anthropic_model,
                     "max_tokens": max_tokens,
-                    "temperature": 0.2,
                     "system": self.SYSTEM_PROMPT,
                     "messages": [{"role": "user", "content": full_user_text}],
                 }
