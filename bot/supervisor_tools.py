@@ -84,18 +84,29 @@ BOT_CONFIGS: List[Dict[str, Any]] = [
         "db_path": "data/trades_mnt.db",
         "log_path": "logs/bot_mnt.log",
         "max_notional_usdt": 20000.0,
-        "bench_wr": 85.5,
+        "bench_wr": 85.4,
         "bench_pf": 2.21,
+    },
+    {
+        "key": "crv",
+        "symbol": "CRVUSDT",
+        "strategy": "crv_stoch_10x",
+        "config_file": "config_crv.json",
+        "db_path": "data/trades_crv.db",
+        "log_path": "logs/bot_crv.log",
+        "max_notional_usdt": 10000.0,
+        "bench_wr": 83.3,
+        "bench_pf": 2.02,
     },
 ]
 
 PORTFOLIO_BENCHMARK = {
     "package": "NEW",
-    "win_rate_pct": 84.0,
-    "oos_win_rate_pct": 80.7,
-    "profit_factor": 1.92,
-    "max_dd_pct": 11.0,
-    "mc_p95_dd_pct": 17.0,
+    "win_rate_pct": 83.9,
+    "oos_win_rate_pct": 82.3,
+    "profit_factor": 1.94,
+    "max_dd_pct": 13.0,
+    "mc_p95_dd_pct": 17.4,
 }
 
 
@@ -425,10 +436,10 @@ def _set_coin_pause_locked(p: Path, sym: str, hours: float, reason: str) -> Dict
 
 
 # ----------------------------------------------------------------------
-# 1. News Scout (Crypto News & Exchange Announcements for ADA/WLFI/LTC/MNT)
+# 1. News Scout (Crypto News & Exchange Announcements for Portfolio Coins)
 # ----------------------------------------------------------------------
 def fetch_coin_news_digest(timeout: int = 10) -> Dict[str, Any]:
-    """Fetch latest crypto headlines and filter for ADA, WLFI, LTC, MNT, Bybit, unlocks, hacks, SEC."""
+    """Fetch latest crypto headlines and filter for portfolio coins, Bybit, unlocks, hacks, SEC."""
     feeds = [
         ("CoinDesk", "https://www.coindesk.com/arc/outboundfeeds/rss/"),
         ("CoinTelegraph", "https://cointelegraph.com/rss"),
@@ -438,6 +449,7 @@ def fetch_coin_news_digest(timeout: int = 10) -> Dict[str, Any]:
         "WLFIUSDT": ("wlfi", "world liberty"),
         "LTCUSDT": ("ltc", "litecoin"),
         "MNTUSDT": ("mnt", "mantle"),
+        "CRVUSDT": ("crv", "curve"),
         "RISK": ("hack", "exploit", "delist", "unlock", "sec ", "lawsuit", "bybit", "halt", "insolvenc"),
     }
     matched: List[Dict[str, str]] = []
@@ -482,7 +494,7 @@ def compute_market_regime(client: Optional[BybitClient] = None) -> Dict[str, Any
     tickers = cl.get_tickers()
     assets: Dict[str, Any] = {}
 
-    for sym in ("BTCUSDT", "ETHUSDT", "ADAUSDT", "WLFIUSDT", "LTCUSDT", "MNTUSDT"):
+    for sym in ("BTCUSDT", "ETHUSDT") + BOT_SYMBOLS:
         tk = tickers.get(sym, {})
         assets[sym] = {
             "last_price": tk.get("last_price", 0.0),

@@ -1,7 +1,7 @@
-"""24/7 Pure-Python Technical Watchdog for the 4 Bybit Trading Bots (ADA, WLFI, LTC, MNT).
+"""24/7 Pure-Python Technical Watchdog for the 5 Bybit Trading Bots (ADA, WLFI, LTC, MNT, CRV).
 
 Strictly pure Python (ZERO LLM / AI dependencies). Runs every 2-3 minutes on Windows 11 or Ubuntu VPS:
-1. Verifies all 4 bot processes (config_ada/wlfi/ltc/mnt.json) are alive and logs are fresh (<= 20 min).
+1. Verifies all 5 bot processes (config_ada/wlfi/ltc/mnt/crv.json) are alive and logs are fresh (<= 20 min).
 2. Verifies via Bybit v5 API (respecting BYBIT_MODE from .env) that every open position has:
    - a server-side Stop-Loss (pos.stopLoss > 0), AND
    - a server-side Take-Profit (either pos.takeProfit > 0 OR an active reduceOnly TP order in open orders,

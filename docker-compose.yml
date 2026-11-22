@@ -31,6 +31,10 @@ services:
     <<: *krupa
     command: ["python", "run_bot.py", "--config", "config_mnt.json"]
 
+  bot-crv:
+    <<: *krupa
+    command: ["python", "run_bot.py", "--config", "config_crv.json"]
+
   watchdog:
     <<: *krupa
     command: ["python", "watchdog.py", "--interval-sec", "150"]

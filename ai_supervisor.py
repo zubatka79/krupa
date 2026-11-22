@@ -78,13 +78,14 @@ class UniversalAIClient:
     """Supports both Google Gemini API (GEMINI_API_KEY) and OpenAI/OpenRouter/Proxy tokens (AI_API_KEY)."""
 
     SYSTEM_PROMPT = (
-        "Ты — ИИ-супервайзер и риск-менеджер портфеля из 4 алгоритмических ботов на Bybit USDT Perpetual "
-        "(Вариант Б / пакет NEW, 10x Isolated, 15% маржи на сделку): "
+        "Ты — ИИ-супервайзер и риск-менеджер портфеля из 5 алгоритмических ботов на Bybit USDT Perpetual "
+        "(Вариант Б / пакет NEW, 10x Isolated, 15% маржи на сделку, до 5 позиций / 78% маржи): "
         "1) ADAUSDT (Trend Fibo 0.50 + фильтр EMA200 < 5%), "
         "2) WLFIUSDT (Counter-Trend Keltner 3.2xATR + RSI 40/60), "
         "3) LTCUSDT (Trend Bollinger 1.4xSD + BTC Veto 0.7%, TTL 2), "
-        "4) MNTUSDT (Donchian-10 Breakout + H1 EMA50 slope > 0 + BTC Veto 0.5% + ранний БУ). "
-        "Эталон портфеля NEW: Win Rate 84.0% (OOS 80.7%), Profit Factor 1.92, Max DD 11.0%. "
+        "4) MNTUSDT (Donchian-10 Breakout + H1 EMA50 slope > 0 + BTC Veto 0.5% + ранний БУ), "
+        "5) CRVUSDT (1H Trend + Stochastic(14) Pullback EMA20 - 0.70*ATR + фильтр EMA200 < 5%, лимит $10k). "
+        "Эталон портфеля NEW: Win Rate 83.9% (OOS 82.3%), Profit Factor 1.94, Max DD 13.0%. "
         "ПРАВИЛО БЕЗОПАСНОСТИ: ты работаешь строго в режиме СОВЕТНИКА (Advisor Mode). "
         "Отвечай кратко, чётко, по делу на русском языке, с цифрами из переданных данных. "
         "Если видишь угрозу (безоткатный обвал BTC или опасная новость по монете), порекомендуй пользователю "
@@ -452,7 +453,7 @@ class TelegramSupervisor:
                     {"text": "🧭 Режим рынка (BTC/ETH)", "callback_data": "cmd:regime"},
                 ],
                 [
-                    {"text": "📰 Новости по 4 монетам", "callback_data": "cmd:news"},
+                    {"text": "📰 Новости по 5 монетам", "callback_data": "cmd:news"},
                     {"text": "🎯 Упущенные лимитки", "callback_data": "cmd:missed"},
                 ],
                 [
@@ -499,7 +500,7 @@ class TelegramSupervisor:
             p_str = ", ".join(f"{e['symbol']} (до {e.get('expires_at', '—')})" for e in pauses)
             lines.append(f"⏸ Активные паузы: {p_str}")
         else:
-            lines.append("▶️ Все 4 бота активны (пауз нет)")
+            lines.append("▶️ Все 5 ботов активны (пауз нет)")
 
         if not active:
             lines.append("\nОткрытых позиций и висящих лимиток сейчас нет.")
@@ -582,22 +583,22 @@ class TelegramSupervisor:
     def build_news_report(self) -> Tuple[str, Optional[Dict[str, Any]]]:
         digest = fetch_coin_news_digest()
         items = digest.get("coin_and_risk_headlines", [])
-        lines = ["📰 News Scout — Крипто-новости по портфелю (ADA, WLFI, LTC, MNT):"]
+        lines = ["📰 News Scout — Крипто-новости по портфелю (ADA, WLFI, LTC, MNT, CRV):"]
         if not items:
-            lines.append("• Экстренных новостей, делистингов, взломов или крупных разлоков по нашим 4 монетам не обнаружено.")
+            lines.append("• Экстренных новостей, делистингов, взломов или крупных разлоков по нашим 5 монетам не обнаружено.")
         else:
             for it in items[:6]:
                 lines.append(f"• [{it['tags']}] {it['title']} ({it['source']})")
 
         ai_note = self.ai.ask(
-            "Проверь заголовки новостей. Есть ли прямая угроза для ADAUSDT, WLFIUSDT, LTCUSDT или MNTUSDT (делистинг, взлом, разлок, суд)? Ответь в 2 предложениях.",
+            "Проверь заголовки новостей. Есть ли прямая угроза для ADAUSDT, WLFIUSDT, LTCUSDT, MNTUSDT или CRVUSDT (делистинг, взлом, разлок, суд)? Ответь в 2 предложениях.",
             context_data=digest,
         )
         if ai_note:
             lines.append(f"\n🤖 Оценка ИИ-разведчика:\n{ai_note}")
 
         kb = None
-        for sym in ("WLFIUSDT", "ADAUSDT", "LTCUSDT", "MNTUSDT"):
+        for sym in ("WLFIUSDT", "ADAUSDT", "LTCUSDT", "MNTUSDT", "CRVUSDT"):
             if any(sym in it.get("tags", "") and "RISK" in it.get("tags", "") for it in items):
                 kb = self.advisor_pause_keyboard(sym)
                 break
@@ -639,7 +640,7 @@ class TelegramSupervisor:
 
         if low in ("/start", "/menu", "меню", "помощь", "/help"):
             self.send_message(
-                "🤖 ИИ-супервайзер портфеля (ADA, WLFI, LTC, MNT) в режиме СОВЕТНИКА.\n"
+                "🤖 ИИ-супервайзер портфеля (ADA, WLFI, LTC, MNT, CRV) в режиме СОВЕТНИКА.\n"
                 "Выбери действие кнопкой ниже или напиши команду обычным текстом:",
                 reply_markup=self.main_menu_keyboard(),
                 chat_id=chat_id,
@@ -737,7 +738,7 @@ class TelegramSupervisor:
                 else:
                     for sym in BOT_SYMBOLS:
                         set_coin_pause(sym, hours=0)
-                    self.send_message("▶️ Все паузы со всех 4 монет сняты.", chat_id=chat_id)
+                    self.send_message("▶️ Все паузы со всех 5 монет сняты.", chat_id=chat_id)
             except BlacklistError as exc:
                 self.send_message(f"⚠️ Паузы не изменены: {exc}", chat_id=chat_id)
             return

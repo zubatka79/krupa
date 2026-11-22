@@ -64,8 +64,8 @@ class TestMonitoringAndSecurity(unittest.TestCase):
         self.assertEqual(ai_supervisor.parse_pause_intent("поставь wlfi на паузу на 12 часов"), "pause")
         self.assertIsNone(ai_supervisor.parse_pause_intent("покажи баланс"))
 
-        syms, unknown, all_flag = ai_supervisor.extract_pause_symbols("поставь wlfi и doge на паузу")
-        self.assertEqual(syms, ["WLFIUSDT"])
+        syms, unknown, all_flag = ai_supervisor.extract_pause_symbols("поставь wlfi, crv и doge на паузу")
+        self.assertEqual(syms, ["WLFIUSDT", "CRVUSDT"])
         self.assertEqual(unknown, ["DOGE"])
         self.assertFalse(all_flag)
 
@@ -94,9 +94,11 @@ class TestMonitoringAndSecurity(unittest.TestCase):
 
     def test_run_bot_load_config_validates_live_and_rejects_bad(self):
         root = Path(__file__).resolve().parent.parent
-        for fname in ("config_ada.json", "config_wlfi.json", "config_ltc.json", "config_mnt.json"):
+        for fname in ("config_ada.json", "config_wlfi.json", "config_ltc.json", "config_mnt.json", "config_crv.json"):
             cfg = run_bot.load_config(root / fname)
             self.assertIn(cfg["mode"], ("demo", "testnet", "live", "mainnet"))
+            self.assertEqual(cfg["max_portfolio_open_positions"], 5)
+            self.assertEqual(cfg["max_portfolio_margin_pct"], 78.0)
 
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "bad.json"

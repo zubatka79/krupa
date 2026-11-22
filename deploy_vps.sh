@@ -74,8 +74,8 @@ fi
 chown "${APP_USER}:${APP_GROUP}" "${APP_DIR}/.env"
 chmod 600 "${APP_DIR}/.env"
 
-echo "=== [3/4] Registering systemd services (4 Trading Bots + Watchdog + AI Supervisor) ==="
-for COIN in ada wlfi ltc mnt; do
+echo "=== [3/4] Registering systemd services (5 Trading Bots + Watchdog + AI Supervisor) ==="
+for COIN in ada wlfi ltc mnt crv; do
     cat >/etc/systemd/system/krupa-bot-${COIN}.service <<EOF
 [Unit]
 Description=Krupa Bybit Trading Bot (${COIN^^}USDT)
@@ -144,13 +144,13 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable krupa-bot-ada krupa-bot-wlfi krupa-bot-ltc krupa-bot-mnt krupa-watchdog krupa-ai-supervisor
+systemctl enable krupa-bot-ada krupa-bot-wlfi krupa-bot-ltc krupa-bot-mnt krupa-bot-crv krupa-watchdog krupa-ai-supervisor
 
 echo "=== [4/4] Deployment complete! ==="
 echo "1. Edit ${APP_DIR}/.env and insert your Bybit, Telegram, and AI keys."
 echo "   TELEGRAM_CHAT_ID (and optionally TELEGRAM_ALLOWED_USER_IDS) must be set explicitly:"
 echo "   the supervisor no longer registers the first user who writes to the bot and ignores all commands until they are set."
 echo "2. Start all services:"
-echo "   sudo systemctl start krupa-bot-ada krupa-bot-wlfi krupa-bot-ltc krupa-bot-mnt krupa-watchdog krupa-ai-supervisor"
+echo "   sudo systemctl start krupa-bot-ada krupa-bot-wlfi krupa-bot-ltc krupa-bot-mnt krupa-bot-crv krupa-watchdog krupa-ai-supervisor"
 echo "3. Check status:"
 echo "   sudo systemctl status krupa-bot-* krupa-watchdog krupa-ai-supervisor"

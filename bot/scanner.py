@@ -1234,6 +1234,169 @@ class MarketScanner:
             be2_offset_pct=be2_off,
         )
 
+    def _eval_crv_stoch_10x_latest(
+        self,
+        spec: InstrumentSpec,
+        df_15m: pd.DataFrame,
+        df_btc: pd.DataFrame,
+        directions: List[str],
+    ) -> Optional[TradeSignal]:
+        """Evaluate System 5 (CRVUSDT 1H Trend + 15M Stochastic(14) Pullback to EMA20 - 0.70*ATR) on latest closed 15M bar."""
+        entry_tf = str(self.config.get("entry_tf", "15"))
+        context_tf = str(self.config.get("context_tf", "60"))
+        entry_ms = INTERVAL_TO_MS[entry_tf]
+        h1_ms = INTERVAL_TO_MS[context_tf]
+
+        ema_period = int(self.config.get("crv_ema_period", 20))
+        stoch_period = int(self.config.get("crv_stoch_period", 14))
+        stoch_long_max = float(self.config.get("crv_stoch_long_max", 20.0))
+        stoch_short_min = float(self.config.get("crv_stoch_short_min", 80.0))
+        pb_atr_k = float(self.config.get("crv_pullback_atr", 0.70))
+        abn_mult = float(self.config.get("abn_spike_atr_mult", 3.2))
+        min_atr_pct = float(self.config.get("min_atr_pct", 0.10))
+        max_atr_pct = float(self.config.get("max_atr_pct", 1.80))
+        ef = int(self.config.get("h1_ema_fast", 20))
+        es = int(self.config.get("h1_ema_slow", 50))
+        h1_adx_min = float(self.config.get("h1_adx_min", 14.0))
+        max_dist_ema200_pct = float(self.config.get("max_dist_ema200_pct", 5.0))
+        btc_1h_veto = float(self.config.get("btc_1h_veto_pct", 1.0))
+        min_dist_frac = float(self.config.get("fib_min_dist_pct", 0.08)) / 100.0
+        tp_pct = float(self.config.get("tp_pct", 1.50))
+        sl_pct = float(self.config.get("sl_pct", 2.50))
+        be1_tr = float(self.config.get("smart_be1_trigger_pct", round(tp_pct * 0.55, 4)))
+        be1_off = float(self.config.get("smart_be1_offset_pct", round(tp_pct * 0.18, 4)))
+        be2_tr = float(self.config.get("smart_be2_trigger_pct", round(tp_pct * 0.78, 4)))
+        be2_off = float(self.config.get("smart_be2_offset_pct", round(tp_pct * 0.38, 4)))
+
+        if len(df_15m) < 220:
+            return None
+
+        df = df_15m.copy().sort_values("timestamp").reset_index(drop=True)
+        df["close_ts"] = (df["timestamp"] + entry_ms).astype("int64")
+        df["atr"] = compute_atr(df["high"], df["low"], df["close"], 14)
+        df["atr_pct"] = (df["atr"] / df["close"].replace(0.0, np.nan)) * 100.0
+        df["e20"] = ema(df["close"], ema_period)
+        df["e200"] = ema(df["close"], 200)
+        lo_st = df["low"].rolling(stoch_period, min_periods=stoch_period).min()
+        hi_st = df["high"].rolling(stoch_period, min_periods=stoch_period).max()
+        df["stoch_k"] = ((df["close"] - lo_st) / (hi_st - lo_st).replace(0.0, np.nan) * 100.0).fillna(50.0)
+
+        bar_r = df["high"] - df["low"]
+        is_abn = (bar_r > abn_mult * df["atr"]).fillna(False)
+        vol_cd = is_abn | is_abn.shift(1, fill_value=False)
+        if bool(vol_cd.iloc[-1]):
+            return None
+
+        cur_atr = float(df["atr"].iloc[-1])
+        cur_atr_pct = float(df["atr_pct"].iloc[-1])
+        cur_e20 = float(df["e20"].iloc[-1])
+        cur_e200 = float(df["e200"].iloc[-1])
+        cur_stoch_k = float(df["stoch_k"].iloc[-1])
+        close_p = float(df["close"].iloc[-1])
+
+        if not np.isfinite(cur_atr) or cur_atr <= 0 or not np.isfinite(cur_atr_pct) or not np.isfinite(cur_e20):
+            return None
+        if cur_atr_pct < min_atr_pct or cur_atr_pct > max_atr_pct:
+            return None
+
+        df_1h = BybitClient.resample_klines(df, context_tf)
+        if len(df_1h) < es + 10:
+            return None
+        h1_e20 = ema(df_1h["close"], ef)
+        h1_e50 = ema(df_1h["close"], es)
+        h1_adx, _, _ = compute_adx(df_1h["high"], df_1h["low"], df_1h["close"], 14)
+        h1_out = pd.DataFrame({
+            "close_ts": (df_1h["timestamp"] + h1_ms).astype("int64"),
+            "h1_bull": (df_1h["close"] > h1_e50) & (h1_e20 > h1_e50),
+            "h1_bear": (df_1h["close"] < h1_e50) & (h1_e20 < h1_e50),
+            "h1_adx": h1_adx.fillna(0.0).values,
+        }).sort_values("close_ts")
+
+        df = pd.merge_asof(df, h1_out, on="close_ts", direction="backward")
+        cur_h1_adx = _finite(df["h1_adx"].iloc[-1])
+        if cur_h1_adx < h1_adx_min:
+            return None
+
+        h1_bull = _flag(df["h1_bull"].iloc[-1])
+        h1_bear = _flag(df["h1_bear"].iloc[-1])
+        if not h1_bull and not h1_bear:
+            return None
+
+        btc_r1h = 0.0
+        if len(df_btc) >= 5:
+            b_prev = float(df_btc["close"].iloc[-5])
+            b_now = float(df_btc["close"].iloc[-1])
+            if b_prev > 0:
+                btc_r1h = (b_now - b_prev) / b_prev * 100.0
+
+        dist_ema200_pct = ((close_p / cur_e200 - 1.0) * 100.0) if (np.isfinite(cur_e200) and cur_e200 > 0) else 0.0
+        signal_dir: Optional[str] = None
+        limit_p: float = 0.0
+
+        if "LONG" in directions and h1_bull and cur_stoch_k <= stoch_long_max:
+            if max_dist_ema200_pct > 0 and dist_ema200_pct >= max_dist_ema200_pct:
+                logger.info(
+                    "Trend exhaustion filter blocked %s LONG (dist_ema200=%+.2f%% >= +%.1f%%).",
+                    spec.symbol, dist_ema200_pct, max_dist_ema200_pct,
+                )
+                return None
+            if btc_1h_veto > 0 and btc_r1h <= -btc_1h_veto:
+                logger.info("BTC 1H Veto blocked %s LONG (BTC 1H=%.2f%% <= -%.1f%%).", spec.symbol, btc_r1h, btc_1h_veto)
+                return None
+            cand_lp = cur_e20 - pb_atr_k * cur_atr
+            if 0.0 < cand_lp < close_p * (1.0 - min_dist_frac):
+                signal_dir = "LONG"
+                limit_p = cand_lp
+        elif "SHORT" in directions and h1_bear and cur_stoch_k >= stoch_short_min:
+            if max_dist_ema200_pct > 0 and (-dist_ema200_pct) >= max_dist_ema200_pct:
+                logger.info(
+                    "Trend exhaustion filter blocked %s SHORT (dist_ema200=%+.2f%% <= -%.1f%%).",
+                    spec.symbol, dist_ema200_pct, max_dist_ema200_pct,
+                )
+                return None
+            if btc_1h_veto > 0 and btc_r1h >= btc_1h_veto:
+                logger.info("BTC 1H Veto blocked %s SHORT (BTC 1H=%+.2f%% >= +%.1f%%).", spec.symbol, btc_r1h, btc_1h_veto)
+                return None
+            cand_lp = cur_e20 + pb_atr_k * cur_atr
+            if cand_lp > close_p * (1.0 + min_dist_frac):
+                signal_dir = "SHORT"
+                limit_p = cand_lp
+
+        if signal_dir is None:
+            return None
+
+        if spec.tick_size > 0:
+            limit_p = round_tick(limit_p, spec.tick_size)
+
+        return TradeSignal(
+            symbol=spec.symbol,
+            direction=signal_dir,
+            timestamp=int(df["timestamp"].iloc[-1]),
+            entry_price=limit_p,
+            sl_pct=sl_pct,
+            score=round(cur_h1_adx + 25.0, 2),
+            breakdown={
+                "strategy": "crv_stoch_10x",
+                "stoch_k14": round(cur_stoch_k, 2),
+                "ema20": round(cur_e20, 5),
+                "pb_atr_k": pb_atr_k,
+                "h1_adx": round(cur_h1_adx, 2),
+                "dist_ema200_pct": round(dist_ema200_pct, 2),
+                "btc_r1h_pct": round(btc_r1h, 2),
+                "close_price": close_p,
+                "maker_limit_price": limit_p,
+            },
+            atr_pct=cur_atr_pct,
+            rvol=0.0,
+            body_ratio=0.0,
+            spec=spec,
+            tp_pct=tp_pct,
+            be1_trigger_pct=be1_tr,
+            be1_offset_pct=be1_off,
+            be2_trigger_pct=be2_tr,
+            be2_offset_pct=be2_off,
+        )
+
     def scan_once(self, equity: float, top_n: Optional[int] = None) -> List[TradeSignal]:
         """Scan eligible symbols on the latest closed 15M bar and return signals sorted by quality/score desc."""
         self.last_scan_incomplete = False
@@ -1265,7 +1428,13 @@ class MarketScanner:
         context_tf = str(self.config.get("context_tf", "60"))
         trend_tf = str(self.config.get("trend_tf", "240"))
         strategy_name = str(self.config.get("strategy", "")).strip().lower()
-        single_coin_strats = ("ada_fibo50_15x", "wlfi_meanrev_15x_v2a", "ltc_trend_bb_10x", "mnt_breakout_don_10x")
+        single_coin_strats = (
+            "ada_fibo50_15x",
+            "wlfi_meanrev_15x_v2a",
+            "ltc_trend_bb_10x",
+            "mnt_breakout_don_10x",
+            "crv_stoch_10x",
+        )
         if strategy_name not in single_coin_strats + KNOWN_MULTI_COIN_STRATEGIES:
             logger.error("Unknown strategy %r in config, scanning skipped.", strategy_name)
             return []
@@ -1334,6 +1503,12 @@ class MarketScanner:
 
                 if strategy_name == "mnt_breakout_don_10x":
                     sig = self._eval_mnt_breakout_don_10x_latest(spec, df_15m, df_btc, directions)
+                    if sig is not None:
+                        signals.append(sig)
+                    continue
+
+                if strategy_name == "crv_stoch_10x":
+                    sig = self._eval_crv_stoch_10x_latest(spec, df_15m, df_btc, directions)
                     if sig is not None:
                         signals.append(sig)
                     continue
