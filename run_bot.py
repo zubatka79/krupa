@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 
 from bot.bybit_client import BybitClient, INTERVAL_TO_MS, round_step_down, round_tick
 from bot.executor import TradeExecutor
+from bot.journal import SignalJournal
 from bot.news_guard import NewsGuard
 from bot.risk_manager import RiskManager
 from bot.scanner import MarketScanner
@@ -173,6 +174,7 @@ def main() -> None:
         trend_provider=scanner.get_latest_1h_trend,
         news_state_path=news_state_path,
     )
+    journal = SignalJournal(db_path, strategy=str(config.get("strategy", "")))
 
     def _on_news_pause(layer: str, pause_until_utc: str, reason: str) -> None:
         executor.log_news_pause(layer, pause_until_utc, reason)
@@ -338,12 +340,32 @@ def main() -> None:
                     logger.info("Latest closed candle not yet finalized on Bybit; will retry within 2m window.")
                 else:
                     last_scanned_bar_ts = latest_closed_open_ms
+                for ev in getattr(scanner, "journal_events", []):
+                    journal.record(**ev)
                 for sig in signals:
+                    trade_id = None
+                    outcome, reason = "REJECTED", ""
                     try:
-                        executor.open_position(sig, current_equity=equity)
+                        trade_id = executor.open_position(sig, current_equity=equity)
+                        if trade_id:
+                            outcome = "OPENED"
+                        else:
+                            reason = executor.last_reject_reason or "unknown"
                     except Exception as exc:
+                        outcome, reason = "ERROR", f"{type(exc).__name__}: {exc}"[:300]
                         logger.exception("Entry failed for %s %s: %s", sig.symbol, sig.direction, exc)
                         notifier.send(f"[ERROR] Не удалось выставить вход {sig.symbol} {sig.direction}: {exc}")
+                    journal.record(
+                        bar_ts_ms=sig.timestamp,
+                        symbol=sig.symbol,
+                        direction=sig.direction,
+                        outcome=outcome,
+                        reason=reason,
+                        entry_price=sig.entry_price,
+                        score=sig.score,
+                        trade_id=trade_id,
+                        details=sig.breakdown,
+                    )
                     equity = executor.get_current_equity()
 
             if args.once:

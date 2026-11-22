@@ -67,6 +67,7 @@ class TradeExecutor:
         self.trend_provider = trend_provider
         self.news_state_path = Path(news_state_path)
         self._finalize_attempts: Dict[int, int] = {}
+        self.last_reject_reason: Optional[str] = None
         self._init_db()
 
     def update_config(self, config: Dict[str, Any]) -> None:
@@ -287,6 +288,7 @@ class TradeExecutor:
         allow_network_refresh: bool = True,
     ) -> Optional[int]:
         cur_now = now or utc_now()
+        self.last_reject_reason = None
 
         # HARD CORE GATE: US Macro Shield (-30m..+15m UTC OR fail-safe stale calendar)
         shield = self._get_macro_shield(now=cur_now, allow_network_refresh=allow_network_refresh)
@@ -297,6 +299,7 @@ class TradeExecutor:
                 "HARD BLOCKED %s %s in TradeExecutor.open_position: %s",
                 signal.symbol, signal.direction, shield.get("reason"),
             )
+            self.last_reject_reason = "macro_shield"
             return None
 
         ttl_min_gate = int(self.config.get("maker_ttl_bars", 4)) * 15
@@ -307,6 +310,7 @@ class TradeExecutor:
                 "Blocked %s %s: core macro event in %.0f min, limit TTL (%d min) would overlap the pre-news window.",
                 signal.symbol, signal.direction, mins_to_event, ttl_min_gate,
             )
+            self.last_reject_reason = "macro_event_soon"
             return None
 
         daily = self.ensure_daily_stats(current_equity, now=cur_now)
@@ -315,27 +319,33 @@ class TradeExecutor:
         max_daily_stops = int(self.config.get("max_daily_stops", 3))
         if int(daily.get("sl_count", 0)) >= max_daily_stops or int(daily.get("is_halted", 0)) == 1:
             logger.warning("Blocked %s: daily stop limit reached (%d/%d SLs).", signal.symbol, daily.get("sl_count", 0), max_daily_stops)
+            self.last_reject_reason = "daily_stop_limit"
             return None
 
         halted_dd, dd_pct = self.risk_manager.is_daily_loss_halted(float(daily["start_equity"]), current_equity)
         if halted_dd:
             logger.warning("Blocked %s: daily equity drawdown limit reached (%.2f%%).", signal.symbol, dd_pct)
+            self.last_reject_reason = "daily_drawdown_limit"
             return None
 
         if self.is_symbol_in_cooldown(signal.symbol, now=cur_now):
             logger.info("Blocked %s: post-trade cooldown active.", signal.symbol)
+            self.last_reject_reason = "cooldown"
             return None
 
         max_open = int(self.config.get("max_open_positions", 1))
         max_same = int(self.config.get("max_same_direction", 1))
         if len(active) >= max_open:
             logger.info("Blocked %s: max active positions reached (%d/%d).", signal.symbol, len(active), max_open)
+            self.last_reject_reason = "max_open_positions"
             return None
         if any(t["symbol"] == signal.symbol for t in active):
             logger.info("Blocked %s: position/order already active.", signal.symbol)
+            self.last_reject_reason = "already_active"
             return None
         if sum(1 for t in active if t["direction"] == signal.direction) >= max_same:
             logger.info("Blocked %s %s: max same-direction limit reached (%d).", signal.symbol, signal.direction, max_same)
+            self.last_reject_reason = "max_same_direction"
             return None
 
         leverage = int(self.config.get("leverage", 15))
@@ -356,6 +366,7 @@ class TradeExecutor:
                 live_orders = self.client.get_open_orders()
             except Exception as exc:
                 logger.warning("Blocked %s: could not verify global portfolio on Bybit (%s).", signal.symbol, exc)
+                self.last_reject_reason = "portfolio_check_failed"
                 return None
             other_open = [p for p in live_pos if str(p.get("symbol", "")).upper() != signal.symbol]
             if len(other_open) >= max_portfolio_pos:
@@ -366,6 +377,7 @@ class TradeExecutor:
                     max_portfolio_pos,
                     [p.get("symbol") for p in other_open],
                 )
+                self.last_reject_reason = "portfolio_positions_limit"
                 return None
             used_im = sum(float(p.get("positionIM") or 0.0) for p in other_open)
             for o in live_orders:
@@ -380,11 +392,13 @@ class TradeExecutor:
                     "Blocked %s: account margin %.2f + %.2f USDT would exceed %.1f%% of equity.",
                     signal.symbol, used_im, margin_usdt, max_portfolio_margin_pct,
                 )
+                self.last_reject_reason = "portfolio_margin_limit"
                 return None
 
         used_margin = sum(float(t["margin_usdt"]) for t in active)
         if used_margin + margin_usdt > current_equity * 0.95:
             logger.info("Blocked %s: insufficient free isolated margin.", signal.symbol)
+            self.last_reject_reason = "insufficient_margin"
             return None
 
         entry_price = float(signal.entry_price)
@@ -393,6 +407,7 @@ class TradeExecutor:
             qty = round_step_down(notional / entry_price, spec.qty_step)
             if qty < spec.min_order_qty or (qty * entry_price) < max(spec.min_notional, 5.0):
                 logger.info("Rejected %s: qty %.6f below Bybit minimums.", signal.symbol, qty)
+                self.last_reject_reason = "qty_below_minimum"
                 return None
             notional = qty * entry_price
             margin_usdt = notional / leverage

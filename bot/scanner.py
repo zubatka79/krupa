@@ -363,10 +363,29 @@ class MarketScanner:
         self.news_state_path = Path(news_state_path)
         self.universe_cache_path = Path(universe_cache_path)
         self.news_guard = news_guard
+        # Filtered setups of the last scan_once call, for the signal journal
+        self.journal_events: List[Dict[str, Any]] = []
+        self._journal_bar_ts = 0
 
     def update_config(self, config: Dict[str, Any]) -> None:
         self.config = config
         self.risk_manager.update_config(config)
+
+    def _note(self, outcome: str, reason: str, symbol: str = "*", direction: str = "", details: Optional[Dict[str, Any]] = None) -> None:
+        self.journal_events.append(
+            {
+                "bar_ts_ms": self._journal_bar_ts,
+                "symbol": symbol,
+                "direction": direction,
+                "outcome": outcome,
+                "reason": reason,
+                "details": details or {},
+            }
+        )
+
+    def _blocked(self, reason: str, spec: InstrumentSpec, direction: str, msg: str, *args: Any) -> None:
+        logger.info(msg, *args)
+        self._note("FILTERED", reason, spec.symbol, direction, {"message": msg % args})
 
     def get_universe(self, top_n: Optional[int] = None, crypto_only: bool = True) -> List[InstrumentSpec]:
         """
@@ -735,13 +754,13 @@ class MarketScanner:
 
         if "LONG" in directions and h1_bull and ih > il:
             if max_dist_ema200_pct > 0 and dist_ema200_pct >= max_dist_ema200_pct:
-                logger.info(
+                self._blocked("trend_exhaustion", spec, "LONG",
                     "Trend exhaustion filter blocked %s LONG (dist_ema200=%+.2f%% >= +%.1f%%).",
                     spec.symbol, dist_ema200_pct, max_dist_ema200_pct,
                 )
                 return None
             if btc_1h_veto > 0 and btc_r1h <= -btc_1h_veto:
-                logger.info("BTC 1H Veto blocked %s LONG (BTC 1H=%.2f%% <= -%.1f%%).", spec.symbol, btc_r1h, btc_1h_veto)
+                self._blocked("btc_1h_veto", spec, "LONG","BTC 1H Veto blocked %s LONG (BTC 1H=%.2f%% <= -%.1f%%).", spec.symbol, btc_r1h, btc_1h_veto)
                 return None
             cand_lp = whi - fib_entry * rng
             if cand_lp < close_p * (1.0 - min_dist_frac):
@@ -749,13 +768,13 @@ class MarketScanner:
                 limit_p = cand_lp
         elif "SHORT" in directions and h1_bear and il > ih:
             if max_dist_ema200_pct > 0 and (-dist_ema200_pct) >= max_dist_ema200_pct:
-                logger.info(
+                self._blocked("trend_exhaustion", spec, "SHORT",
                     "Trend exhaustion filter blocked %s SHORT (dist_ema200=%+.2f%% <= -%.1f%%).",
                     spec.symbol, dist_ema200_pct, max_dist_ema200_pct,
                 )
                 return None
             if btc_1h_veto > 0 and btc_r1h >= btc_1h_veto:
-                logger.info("BTC 1H Veto blocked %s SHORT (BTC 1H=%+.2f%% >= +%.1f%%).", spec.symbol, btc_r1h, btc_1h_veto)
+                self._blocked("btc_1h_veto", spec, "SHORT","BTC 1H Veto blocked %s SHORT (BTC 1H=%+.2f%% >= +%.1f%%).", spec.symbol, btc_r1h, btc_1h_veto)
                 return None
             cand_lp = wlo + fib_entry * rng
             if cand_lp > close_p * (1.0 + min_dist_frac):
@@ -872,7 +891,7 @@ class MarketScanner:
 
         if "LONG" in directions and close_p < cur_ema and cur_rsi <= rsi_long_max:
             if btc_1h_veto > 0 and btc_r1h <= -btc_1h_veto:
-                logger.info("BTC 1H Veto blocked %s LONG (BTC 1H=%.2f%% <= -%.1f%%).", spec.symbol, btc_r1h, btc_1h_veto)
+                self._blocked("btc_1h_veto", spec, "LONG","BTC 1H Veto blocked %s LONG (BTC 1H=%.2f%% <= -%.1f%%).", spec.symbol, btc_r1h, btc_1h_veto)
                 return None
             cand_lp = cur_ema - k_band * cur_atr
             if 0.0 < cand_lp < close_p * (1.0 - min_dist_frac):
@@ -880,7 +899,7 @@ class MarketScanner:
                 limit_p = cand_lp
         elif "SHORT" in directions and close_p > cur_ema and cur_rsi >= rsi_short_min:
             if btc_1h_veto > 0 and btc_r1h >= btc_1h_veto:
-                logger.info("BTC 1H Veto blocked %s SHORT (BTC 1H=%+.2f%% >= +%.1f%%).", spec.symbol, btc_r1h, btc_1h_veto)
+                self._blocked("btc_1h_veto", spec, "SHORT","BTC 1H Veto blocked %s SHORT (BTC 1H=%+.2f%% >= +%.1f%%).", spec.symbol, btc_r1h, btc_1h_veto)
                 return None
             cand_lp = cur_ema + k_band * cur_atr
             if cand_lp > close_p * (1.0 + min_dist_frac):
@@ -1028,7 +1047,7 @@ class MarketScanner:
 
         if "LONG" in directions and h1_bull and close_p < cur_ema:
             if btc_1h_veto > 0 and btc_r1h <= -btc_1h_veto:
-                logger.info("BTC 1H Veto blocked %s LONG (BTC 1H=%.2f%% <= -%.1f%%).", spec.symbol, btc_r1h, btc_1h_veto)
+                self._blocked("btc_1h_veto", spec, "LONG","BTC 1H Veto blocked %s LONG (BTC 1H=%.2f%% <= -%.1f%%).", spec.symbol, btc_r1h, btc_1h_veto)
                 return None
             cand_lp = cur_ema - bb_k_sd * cur_sd
             if 0.0 < cand_lp < close_p * (1.0 - min_dist_frac):
@@ -1036,7 +1055,7 @@ class MarketScanner:
                 limit_p = cand_lp
         elif "SHORT" in directions and h1_bear and close_p > cur_ema:
             if btc_1h_veto > 0 and btc_r1h >= btc_1h_veto:
-                logger.info("BTC 1H Veto blocked %s SHORT (BTC 1H=%+.2f%% >= +%.1f%%).", spec.symbol, btc_r1h, btc_1h_veto)
+                self._blocked("btc_1h_veto", spec, "SHORT","BTC 1H Veto blocked %s SHORT (BTC 1H=%+.2f%% >= +%.1f%%).", spec.symbol, btc_r1h, btc_1h_veto)
                 return None
             cand_lp = cur_ema + bb_k_sd * cur_sd
             if cand_lp > close_p * (1.0 + min_dist_frac):
@@ -1172,13 +1191,13 @@ class MarketScanner:
 
         if "LONG" in directions and h1_bull and close_p > cur_don_hi:
             if cur_h1_slope <= h1_slope_min:
-                logger.info(
+                self._blocked("h1_slope", spec, "LONG",
                     "1H EMA50 slope filter blocked %s LONG (slope=%+.4f%% <= %+.4f%%).",
                     spec.symbol, cur_h1_slope, h1_slope_min,
                 )
                 return None
             if btc_1h_veto > 0 and btc_r1h <= -btc_1h_veto:
-                logger.info("BTC 1H Veto blocked %s LONG (BTC 1H=%.2f%% <= -%.1f%%).", spec.symbol, btc_r1h, btc_1h_veto)
+                self._blocked("btc_1h_veto", spec, "LONG","BTC 1H Veto blocked %s LONG (BTC 1H=%.2f%% <= -%.1f%%).", spec.symbol, btc_r1h, btc_1h_veto)
                 return None
             cand_lp = close_p - pb_atr_k * cur_atr
             if 0.0 < cand_lp < close_p * (1.0 - min_dist_frac):
@@ -1186,13 +1205,13 @@ class MarketScanner:
                 limit_p = cand_lp
         elif "SHORT" in directions and h1_bear and close_p < cur_don_lo:
             if cur_h1_slope >= -h1_slope_min:
-                logger.info(
+                self._blocked("h1_slope", spec, "SHORT",
                     "1H EMA50 slope filter blocked %s SHORT (slope=%+.4f%% >= %+.4f%%).",
                     spec.symbol, cur_h1_slope, -h1_slope_min,
                 )
                 return None
             if btc_1h_veto > 0 and btc_r1h >= btc_1h_veto:
-                logger.info("BTC 1H Veto blocked %s SHORT (BTC 1H=%+.2f%% >= +%.1f%%).", spec.symbol, btc_r1h, btc_1h_veto)
+                self._blocked("btc_1h_veto", spec, "SHORT","BTC 1H Veto blocked %s SHORT (BTC 1H=%+.2f%% >= +%.1f%%).", spec.symbol, btc_r1h, btc_1h_veto)
                 return None
             cand_lp = close_p + pb_atr_k * cur_atr
             if cand_lp > close_p * (1.0 + min_dist_frac):
@@ -1335,13 +1354,13 @@ class MarketScanner:
 
         if "LONG" in directions and h1_bull and cur_stoch_k <= stoch_long_max:
             if max_dist_ema200_pct > 0 and dist_ema200_pct >= max_dist_ema200_pct:
-                logger.info(
+                self._blocked("trend_exhaustion", spec, "LONG",
                     "Trend exhaustion filter blocked %s LONG (dist_ema200=%+.2f%% >= +%.1f%%).",
                     spec.symbol, dist_ema200_pct, max_dist_ema200_pct,
                 )
                 return None
             if btc_1h_veto > 0 and btc_r1h <= -btc_1h_veto:
-                logger.info("BTC 1H Veto blocked %s LONG (BTC 1H=%.2f%% <= -%.1f%%).", spec.symbol, btc_r1h, btc_1h_veto)
+                self._blocked("btc_1h_veto", spec, "LONG","BTC 1H Veto blocked %s LONG (BTC 1H=%.2f%% <= -%.1f%%).", spec.symbol, btc_r1h, btc_1h_veto)
                 return None
             cand_lp = cur_e20 - pb_atr_k * cur_atr
             if 0.0 < cand_lp < close_p * (1.0 - min_dist_frac):
@@ -1349,13 +1368,13 @@ class MarketScanner:
                 limit_p = cand_lp
         elif "SHORT" in directions and h1_bear and cur_stoch_k >= stoch_short_min:
             if max_dist_ema200_pct > 0 and (-dist_ema200_pct) >= max_dist_ema200_pct:
-                logger.info(
+                self._blocked("trend_exhaustion", spec, "SHORT",
                     "Trend exhaustion filter blocked %s SHORT (dist_ema200=%+.2f%% <= -%.1f%%).",
                     spec.symbol, dist_ema200_pct, max_dist_ema200_pct,
                 )
                 return None
             if btc_1h_veto > 0 and btc_r1h >= btc_1h_veto:
-                logger.info("BTC 1H Veto blocked %s SHORT (BTC 1H=%+.2f%% >= +%.1f%%).", spec.symbol, btc_r1h, btc_1h_veto)
+                self._blocked("btc_1h_veto", spec, "SHORT","BTC 1H Veto blocked %s SHORT (BTC 1H=%+.2f%% >= +%.1f%%).", spec.symbol, btc_r1h, btc_1h_veto)
                 return None
             cand_lp = cur_e20 + pb_atr_k * cur_atr
             if cand_lp > close_p * (1.0 + min_dist_frac):
@@ -1400,9 +1419,13 @@ class MarketScanner:
     def scan_once(self, equity: float, top_n: Optional[int] = None) -> List[TradeSignal]:
         """Scan eligible symbols on the latest closed 15M bar and return signals sorted by quality/score desc."""
         self.last_scan_incomplete = False
+        self.journal_events = []
+        entry_ms_cfg = INTERVAL_TO_MS.get(str(self.config.get("entry_tf", "15")), 15 * 60_000)
+        self._journal_bar_ts = (int(time.time() * 1000) // entry_ms_cfg - 1) * entry_ms_cfg
         directions = self.allowed_direction_list()
         if not directions:
             logger.info("Scanner skipped: allowed_directions is 'paused'.")
+            self._note("SCAN_BLOCKED", "directions_paused")
             return []
 
         # HARD US Macro Shield check (blocks new entries during -30m..+15m UTC OR fail-safe stale calendar)
@@ -1417,11 +1440,14 @@ class MarketScanner:
                 news_state.get("pause_until_utc"),
                 news_state.get("reason"),
             )
+            reason = "macro_fail_safe" if news_state.get("fail_safe_active") else "macro_shield"
+            self._note("SCAN_BLOCKED", reason, details={"reason": str(news_state.get("reason", ""))})
             return []
 
         blacklist, macro_pause = load_blacklist(self.blacklist_path)
         if macro_pause:
             logger.info("Scanner paused due to blacklist macro flag: %s", macro_pause)
+            self._note("SCAN_BLOCKED", "blacklist_pause", details={"reason": str(macro_pause)})
             return []
 
         entry_tf = str(self.config.get("entry_tf", "15"))
@@ -1461,13 +1487,17 @@ class MarketScanner:
             btc_shock = float(self.config.get("btc_shock_pause_pct", 0.8))
             if btc_move > btc_shock:
                 logger.warning("BTC 15M shock filter triggered (%.2f%% > %.2f%%). Skipping scan.", btc_move, btc_shock)
+                self._note("SCAN_BLOCKED", "btc_shock", details={"btc_move_pct": round(btc_move, 3)})
                 return []
 
         universe = self.get_universe(top_n=top_n)
         signals: List[TradeSignal] = []
 
         for spec in universe:
-            if spec.symbol in blacklist or spec.symbol == "BTCUSDT":
+            if spec.symbol == "BTCUSDT":
+                continue
+            if spec.symbol in blacklist:
+                self._note("FILTERED", "blacklisted", spec.symbol)
                 continue
 
             try:
