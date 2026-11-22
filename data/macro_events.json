@@ -1,19 +1,20 @@
 {
-  "fetched_at_utc": "2026-11-22T11:26:25Z",
+  "fetched_at_utc": "2026-11-22T13:51:54Z",
   "source_urls": [
     "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
   ],
   "status": "OK",
-  "core_count": 0,
+  "coverage_from_utc": "2026-11-22T21:45:00Z",
+  "coverage_to_utc": "2026-11-27T13:30:00Z",
+  "core_count": 2,
   "usd_high_count": 2,
-  "events": [],
-  "all_usd_high_events": [
+  "events": [
     {
       "title": "Core PCE Price Index m/m",
       "country": "USD",
       "impact": "High",
       "time_utc": "2026-11-25T13:30:00Z",
-      "is_core_us_macro": false,
+      "is_core_us_macro": true,
       "forecast": "0.3%",
       "previous": "0.3%"
     },
@@ -22,7 +23,27 @@
       "country": "USD",
       "impact": "High",
       "time_utc": "2026-11-25T13:30:00Z",
-      "is_core_us_macro": false,
+      "is_core_us_macro": true,
+      "forecast": "3.5%",
+      "previous": "3.4%"
+    }
+  ],
+  "all_usd_high_events": [
+    {
+      "title": "Core PCE Price Index m/m",
+      "country": "USD",
+      "impact": "High",
+      "time_utc": "2026-11-25T13:30:00Z",
+      "is_core_us_macro": true,
+      "forecast": "0.3%",
+      "previous": "0.3%"
+    },
+    {
+      "title": "Prelim GDP q/q",
+      "country": "USD",
+      "impact": "High",
+      "time_utc": "2026-11-25T13:30:00Z",
+      "is_core_us_macro": true,
       "forecast": "3.5%",
       "previous": "3.4%"
     }

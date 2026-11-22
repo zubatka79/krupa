@@ -34,12 +34,15 @@ FF_CALENDAR_URLS = (
     "https://nfs.faireconomy.media/ff_calendar_thisweek.json",
 )
 
-# Core US Macro Shield keywords (FOMC, CPI, NFP, PPI, Fed Chair/Chairman / Rates)
+# Core US Macro Shield keywords (FOMC, CPI, NFP, PPI, PCE, GDP, Fed Chair/Chairman / Rates)
 CORE_US_MACRO_PATTERNS = (
     re.compile(r"\bfomc\b", re.I),
     re.compile(r"\bfederal\s+funds\s+rate\b", re.I),
     re.compile(r"\b(core\s+)?cpi\b", re.I),
     re.compile(r"\bconsumer\s+price\s+index\b", re.I),
+    re.compile(r"\b(core\s+)?pce\b", re.I),
+    re.compile(r"\bpersonal\s+consumption\s+expenditures\b", re.I),
+    re.compile(r"\b(advance|prelim|final)\s+gdp\b|\bgross\s+domestic\s+product\b", re.I),
     re.compile(r"\bnon[-\s]?farm\b|\bnfp\b|\bemployment\s+change\b", re.I),
     re.compile(r"\b(core\s+)?ppi\b", re.I),
     re.compile(r"\bproducer\s+price\s+index\b", re.I),
