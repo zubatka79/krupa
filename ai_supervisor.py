@@ -241,9 +241,9 @@ class UniversalAIClient:
                     texts = [str(b.get("text", "")) for b in blocks if b.get("type") == "text"]
                     if texts:
                         return "\n".join(texts).strip()
-                logger.warning("Anthropic API non-200 (%s): %s", resp.status_code, resp.text[:250])
+                logger.warning("Anthropic API non-200 (%s): %s", resp.status_code, redact_secrets(resp.text[:250]))
             except Exception as exc:
-                logger.warning("Anthropic API request failed: %s", exc)
+                logger.warning("Anthropic API request failed: %s", redact_secrets(exc))
 
         # 2. Google Gemini Native API if GEMINI_API_KEY is set
         if self.gemini_key and "your_" not in self.gemini_key.lower():

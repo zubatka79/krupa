@@ -334,7 +334,10 @@ def main() -> None:
                 signals = scanner.scan_once(equity=equity)
                 logger.info("Scan complete: %d qualifying %s signal(s).", len(signals), config.get("strategy"))
 
-                last_scanned_bar_ts = latest_closed_open_ms
+                if getattr(scanner, "last_scan_incomplete", False) and not args.once and ms_since_close < 120_000:
+                    logger.info("Latest closed candle not yet finalized on Bybit; will retry within 2m window.")
+                else:
+                    last_scanned_bar_ts = latest_closed_open_ms
                 for sig in signals:
                     try:
                         executor.open_position(sig, current_equity=equity)

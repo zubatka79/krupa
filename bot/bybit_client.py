@@ -292,6 +292,7 @@ class BybitClient:
                 continue
             tickers[sym] = {
                 "last_price": float(item.get("lastPrice") or 0.0),
+                "price_24h_pcnt": float(item.get("price24hPcnt") or 0.0),
                 "turnover_24h": float(item.get("turnover24h") or 0.0),
                 "volume_24h": float(item.get("volume24h") or 0.0),
                 "funding_rate": float(item.get("fundingRate") or 0.0),

@@ -1236,6 +1236,7 @@ class MarketScanner:
 
     def scan_once(self, equity: float, top_n: Optional[int] = None) -> List[TradeSignal]:
         """Scan eligible symbols on the latest closed 15M bar and return signals sorted by quality/score desc."""
+        self.last_scan_incomplete = False
         directions = self.allowed_direction_list()
         if not directions:
             logger.info("Scanner skipped: allowed_directions is 'paused'.")
@@ -1276,12 +1277,14 @@ class MarketScanner:
         df_btc = self.client.get_klines("BTCUSDT", interval=entry_tf, days=4, use_cache=True, closed_only=True)
         if df_btc.empty or len(df_btc) < 30:
             logger.warning("Insufficient BTCUSDT candles for scan.")
+            self.last_scan_incomplete = True
             return []
         if int(df_btc["timestamp"].iloc[-1]) != expected_last_ts:
             logger.warning(
                 "BTCUSDT last closed bar %s is not the expected %s, skipping scan.",
                 int(df_btc["timestamp"].iloc[-1]), expected_last_ts,
             )
+            self.last_scan_incomplete = True
             return []
         if strategy_name not in single_coin_strats:
             last_btc = df_btc.iloc[-1]
@@ -1308,6 +1311,7 @@ class MarketScanner:
                         "%s last closed bar %s is not the expected %s, skipping.",
                         spec.symbol, int(df_15m["timestamp"].iloc[-1]), expected_last_ts,
                     )
+                    self.last_scan_incomplete = True
                     continue
 
                 if strategy_name == "ada_fibo50_15x":

@@ -569,15 +569,26 @@ class TradeExecutor:
                     self._on_maker_filled(trade, pos_size)
                     continue
 
+                if pos_size > 0 and ord_status not in ("Filled", "Cancelled", "Rejected", "Deactivated", "PartiallyFilledCanceled"):
+                    if trade["entry_order_id"]:
+                        self.client.cancel_order(sym, trade["entry_order_id"])
+                    filled_now = self._live_position_size(sym)
+                    if filled_now is None:
+                        continue
+                    self._on_maker_filled(trade, filled_now if filled_now > 0 else pos_size)
+                    continue
+
                 exp_dt = datetime.fromisoformat(str(trade["expires_at_utc"]).replace("Z", "+00:00")) if trade.get("expires_at_utc") else None
                 expired = exp_dt is not None and cur_now >= exp_dt
                 if not (cancel_limits_macro or expired):
-                    # Partially filled orders keep working until filled, expired or blocked by the shield
                     continue
 
                 if trade["entry_order_id"]:
                     self.client.cancel_order(sym, trade["entry_order_id"])
                 filled_now = self._live_position_size(sym)
+                if filled_now is None:
+                    logger.warning("Skipping cancel finalization for %s: live position check failed; will retry.", sym)
+                    continue
                 if filled_now > 0:
                     self._on_maker_filled(trade, filled_now)
                     continue
@@ -684,20 +695,23 @@ class TradeExecutor:
                 logger.error("Failed placing 100%% PostOnly Limit TP for %s: %s", sym, exc)
                 tp_order_id = ""
 
-        entry_fee = self.risk_manager.fee_usdt(fill_qty * float(trade["entry_price"]), is_maker=True)
+        ep_val = float(trade.get("entry_price") or 0.0)
+        lev = max(1, int(trade.get("leverage") or self.config.get("leverage", 10)))
+        notional_val = fill_qty * ep_val
+        margin_val = notional_val / lev
+        entry_fee = self.risk_manager.fee_usdt(notional_val, is_maker=True)
         with self._connect() as conn:
             conn.execute(
                 "UPDATE trades SET status = 'OPEN', qty = ?, tp1_qty = ?, remaining_qty = ?, "
-                "tp1_order_id = ?, fees_usdt = ? WHERE id = ?",
-                (fill_qty, fill_qty, fill_qty, tp_order_id, entry_fee, trade["id"]),
+                "notional_usdt = ?, margin_usdt = ?, tp1_order_id = ?, fees_usdt = ? WHERE id = ?",
+                (fill_qty, fill_qty, fill_qty, notional_val, margin_val, tp_order_id, entry_fee, trade["id"]),
             )
             conn.commit()
+        trade["notional_usdt"] = notional_val
+        trade["margin_usdt"] = margin_val
 
         is_long = str(trade.get("direction", "")).upper() == "LONG"
         dir_badge = "🟢 LONG" if is_long else "🔴 SHORT"
-        lev = int(trade.get("leverage") or self.config.get("leverage", 10))
-        margin_val = float(trade.get("margin_usdt") or 0.0)
-        ep_val = float(trade.get("entry_price") or 0.0)
         tp_pct_val = (abs(tp_price - ep_val) / ep_val * 100.0) if ep_val > 0 else float(self.config.get("tp_pct", 1.2))
         cur_eq = self.get_current_equity()
         tp_note = "" if tp_order_id else " (не выставлен, повторю на следующей синхронизации)"
@@ -747,14 +761,15 @@ class TradeExecutor:
             conn.commit()
         logger.info("Pending Maker trade #%d cancelled: %s", trade_id, reason)
 
-    def _live_position_size(self, symbol: str) -> float:
+    def _live_position_size(self, symbol: str) -> Optional[float]:
         try:
             for p in self.client.get_positions(symbol=symbol):
                 if p.get("symbol") == symbol:
                     return float(p.get("size") or 0.0)
+            return 0.0
         except Exception as exc:
             logger.warning("Position size check failed for %s: %s", symbol, exc)
-        return 0.0
+            return None
 
     def _ensure_tp_order(self, trade: Dict[str, Any], pos_size: float, price: float, now: Optional[datetime] = None) -> bool:
         """Keep a reduce-only TP for the full live size. Returns True if the position was closed instead."""
