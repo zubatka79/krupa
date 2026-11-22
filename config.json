@@ -5,9 +5,9 @@
   "whitelist": [
     "ADAUSDT"
   ],
-  "db_path": "data/trades_ada.db",
-  "log_path": "logs/bot_ada.log",
-  "news_state_path": "data/news_state_ada.json",
+  "db_path": "data/trades_default.db",
+  "log_path": "logs/bot_default.log",
+  "news_state_path": "data/news_state_default.json",
   "top_n_liquid": 1,
   "universe_refresh_days": 30,
   "margin_mode": "ISOLATED",

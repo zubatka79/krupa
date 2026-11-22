@@ -466,11 +466,10 @@ class BybitClient:
                     frames.append(older)
                     updated = True
 
-            # Fetch missing newer candles
-            if req_end > cached_max + interval_ms:
-                newer = self._fetch_kline_range(
-                    symbol, interval_str, cached_max + interval_ms, req_end
-                )
+            # Fetch missing newer candles; the last cached bar is re-fetched in case
+            # it was stored right at its close, before the exchange finalized it
+            if req_end >= cached_max + interval_ms:
+                newer = self._fetch_kline_range(symbol, interval_str, cached_max, req_end)
                 if not newer.empty:
                     frames.append(newer)
                     updated = True
@@ -480,7 +479,7 @@ class BybitClient:
 
         merged = (
             pd.concat(frames, ignore_index=True)
-            .drop_duplicates(subset=["timestamp"])
+            .drop_duplicates(subset=["timestamp"], keep="last")
             .sort_values("timestamp")
             .reset_index(drop=True)
         )
@@ -800,6 +799,13 @@ class BybitClient:
                 if items:
                     return items[0]
         return None
+
+    def get_closed_pnl(self, symbol: str, start_ms: int, limit: int = 50) -> List[Dict[str, Any]]:
+        client = self._require_private()
+        resp = client.get_closed_pnl(category="linear", symbol=symbol, startTime=int(start_ms), limit=limit)
+        if resp.get("retCode") != 0:
+            raise RuntimeError(f"get_closed_pnl error: {resp}")
+        return resp["result"].get("list", [])
 
     def cancel_order(self, symbol: str, order_id: str) -> None:
         client = self._require_private()

@@ -14,7 +14,9 @@ import argparse
 import gzip
 import json
 import logging
+import math
 import os
+import re
 import sqlite3
 import sys
 import time
@@ -30,6 +32,11 @@ from dotenv import load_dotenv
 
 from bot.bybit_client import BybitClient, INTERVAL_TO_MS
 from bot.indicators import compute_adx, compute_atr, compute_rsi, ema
+
+try:
+    import fcntl
+except ImportError:  # Windows
+    fcntl = None  # type: ignore[assignment]
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +99,107 @@ PORTFOLIO_BENCHMARK = {
 }
 
 
+BOT_SYMBOLS: Tuple[str, ...] = tuple(b["symbol"] for b in BOT_CONFIGS)
+MAX_PAUSE_HOURS = 168.0
+
+_SECRET_ENV_KEYS = (
+    "TELEGRAM_BOT_TOKEN",
+    "GEMINI_API_KEY",
+    "AI_API_KEY",
+    "BYBIT_API_KEY",
+    "BYBIT_API_SECRET",
+    "BYBIT_DEMO_API_KEY",
+    "BYBIT_DEMO_API_SECRET",
+    "BYBIT_READONLY_API_KEY",
+    "BYBIT_READONLY_API_SECRET",
+)
+_TG_TOKEN_RE = re.compile(r"bot\d+:[A-Za-z0-9_-]+")
+
+
+def redact_secrets(text: Any) -> str:
+    """Strip bot tokens and API keys from text before it goes to logs or chats."""
+    out = _TG_TOKEN_RE.sub("bot***", str(text))
+    for key in _SECRET_ENV_KEYS:
+        val = os.getenv(key, "").strip()
+        if len(val) >= 6:
+            out = out.replace(val, "***")
+    return out
+
+
+class RedactingFilter(logging.Filter):
+    """Handler filter that redacts secrets in messages and tracebacks (requests puts URLs into errors)."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            record.msg = redact_secrets(record.getMessage())
+            record.args = None
+            if record.exc_info:
+                record.exc_text = redact_secrets(logging.Formatter().formatException(record.exc_info))
+                record.exc_info = None
+        except Exception:
+            pass
+        return True
+
+
+def parse_id_list(raw: Optional[str]) -> List[str]:
+    """Split a comma-separated id list from .env, skipping empty and placeholder values."""
+    ids: List[str] = []
+    for part in str(raw or "").split(","):
+        item = part.strip()
+        if not item or "your_" in item.lower():
+            continue
+        if item not in ids:
+            ids.append(item)
+    return ids
+
+
+def telegram_allowed_user_ids() -> List[str]:
+    return parse_id_list(os.getenv("TELEGRAM_ALLOWED_USER_IDS", ""))
+
+
+def telegram_target_chats() -> List[str]:
+    """Chats for outgoing notifications: TELEGRAM_CHAT_ID, or the admin ids when it is empty."""
+    return parse_id_list(os.getenv("TELEGRAM_CHAT_ID", "")) or telegram_allowed_user_ids()
+
+
+def telegram_token() -> str:
+    token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+    return "" if not token or "your_telegram" in token.lower() else token
+
+
+def send_telegram_to_all(text: str, parse_mode: Optional[str] = None, timeout: int = 12) -> bool:
+    """Send text to every configured chat. True if at least one chat got it."""
+    token = telegram_token()
+    chats = telegram_target_chats()
+    if not token or not chats:
+        return False
+    delivered = False
+    for chat_id in chats:
+        payload: Dict[str, Any] = {"chat_id": chat_id, "text": text[:4000], "disable_web_page_preview": True}
+        if parse_mode:
+            payload["parse_mode"] = parse_mode
+        try:
+            resp = requests.post(f"https://api.telegram.org/bot{token}/sendMessage", json=payload, timeout=(8, timeout))
+            if resp.status_code == 200:
+                delivered = True
+            else:
+                logger.warning("Telegram sendMessage to %s failed: HTTP %s %s", chat_id, resp.status_code, redact_secrets(resp.text[:200]))
+        except Exception as exc:
+            logger.warning("Telegram sendMessage to %s failed: %s", chat_id, redact_secrets(exc))
+    return delivered
+
+
+def parse_pause_hours(raw: Any) -> Optional[float]:
+    """Pause length in hours, or None if it is not a finite number in (0, MAX_PAUSE_HOURS]."""
+    try:
+        hours = float(str(raw).replace(",", "."))
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(hours) or hours <= 0 or hours > MAX_PAUSE_HOURS:
+        return None
+    return hours
+
+
 def utc_now() -> datetime:
     return datetime.now(timezone.utc)
 
@@ -120,8 +228,21 @@ def resolve_bybit_mode(default: str = "demo") -> str:
 
 
 def create_bybit_client(mode: Optional[str] = None, timeout: int = 12) -> BybitClient:
+    """Client for monitoring and reports. Uses BYBIT_READONLY_API_KEY/SECRET when both are set."""
     resolved = mode or resolve_bybit_mode()
-    return BybitClient(mode=resolved, cache_dir=ROOT_DIR / "data" / "cache", timeout=timeout, public_mainnet=True)
+    load_dotenv(ROOT_DIR / ".env")
+    ro_key = os.getenv("BYBIT_READONLY_API_KEY", "").strip()
+    ro_secret = os.getenv("BYBIT_READONLY_API_SECRET", "").strip()
+    creds: Dict[str, str] = {}
+    if ro_key and ro_secret and "your_" not in ro_key.lower() and "your_" not in ro_secret.lower():
+        creds = {"api_key": ro_key, "api_secret": ro_secret}
+    return BybitClient(
+        mode=resolved,
+        cache_dir=ROOT_DIR / "data" / "cache",
+        timeout=timeout,
+        public_mainnet=True,
+        **creds,
+    )
 
 
 # ----------------------------------------------------------------------
@@ -170,28 +291,43 @@ def get_active_pauses(blacklist_path: str | Path = "data/blacklist.json") -> Dic
         return {"macro_pause_reason": None, "active_entries": []}
     try:
         data = json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return {"macro_pause_reason": None, "active_entries": []}
+        if not isinstance(data, dict):
+            raise ValueError("root is not an object")
+    except Exception as exc:
+        logger.error("Cannot parse %s: %s", p, exc)
+        return {"macro_pause_reason": None, "active_entries": [], "error": f"{p.name} не читается: {exc}"}
 
     now = utc_now()
     active_entries: List[Dict[str, Any]] = []
     for entry in data.get("entries", []):
+        if not isinstance(entry, dict):
+            continue
         sym = str(entry.get("symbol", "")).upper().strip()
         if not sym:
             continue
-        exp = entry.get("expires_at")
-        if exp:
-            try:
-                exp_dt = datetime.fromisoformat(str(exp).replace("Z", "+00:00"))
-                if exp_dt <= now:
-                    continue
-            except ValueError:
-                pass
+        if _is_expired(entry.get("expires_at"), now):
+            continue
         active_entries.append(entry)
     return {
         "macro_pause_reason": data.get("macro_pause_reason"),
         "active_entries": active_entries,
     }
+
+
+class BlacklistError(RuntimeError):
+    """blacklist.json exists but cannot be parsed, so it must not be overwritten."""
+
+
+def _is_expired(exp: Any, now: datetime) -> bool:
+    if not exp:
+        return False
+    try:
+        exp_dt = datetime.fromisoformat(str(exp).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return False
+    if exp_dt.tzinfo is None:
+        exp_dt = exp_dt.replace(tzinfo=timezone.utc)
+    return exp_dt <= now
 
 
 def set_coin_pause(
@@ -200,36 +336,53 @@ def set_coin_pause(
     reason: str = "Paused by user via Telegram",
     blacklist_path: str | Path = "data/blacklist.json",
 ) -> Dict[str, Any]:
-    """Atomically pause a coin in data/blacklist.json until now + hours (or remove pause if hours <= 0)."""
+    """Pause a coin in data/blacklist.json until now + hours (or remove pause if hours <= 0).
+
+    Raises BlacklistError if the existing file is corrupted: rewriting it would drop
+    macro_pause_reason and manual entries.
+    """
     sym = symbol.upper().strip()
     if not sym.endswith("USDT"):
         sym = f"{sym}USDT"
 
     p = ROOT_DIR / blacklist_path if not Path(blacklist_path).is_absolute() else Path(blacklist_path)
     p.parent.mkdir(parents=True, exist_ok=True)
-    now = utc_now()
 
+    lock_f = open(p.with_name(p.name + ".lock"), "a+")
+    try:
+        if fcntl is not None:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+        return _set_coin_pause_locked(p, sym, hours, reason)
+    finally:
+        if fcntl is not None:
+            try:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+        lock_f.close()
+
+
+def _set_coin_pause_locked(p: Path, sym: str, hours: float, reason: str) -> Dict[str, Any]:
+    now = utc_now()
     data: Dict[str, Any] = {"updated_at": utc_now_iso(now), "macro_pause_reason": None, "symbols": [], "entries": []}
     if p.exists():
         try:
             loaded = json.loads(p.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                data.update(loaded)
-        except Exception:
-            pass
+        except Exception as exc:
+            raise BlacklistError(f"{p.name} повреждён ({exc}), файл не изменён") from exc
+        if not isinstance(loaded, dict) or not isinstance(loaded.get("entries", []), list):
+            raise BlacklistError(f"{p.name} имеет неожиданный формат, файл не изменён")
+        data.update(loaded)
 
     kept_entries: List[Dict[str, Any]] = []
     for entry in data.get("entries", []):
+        if not isinstance(entry, dict):
+            continue
         esym = str(entry.get("symbol", "")).upper().strip()
         if not esym or esym == sym:
             continue
-        exp = entry.get("expires_at")
-        if exp:
-            try:
-                if datetime.fromisoformat(str(exp).replace("Z", "+00:00")) <= now:
-                    continue
-            except ValueError:
-                pass
+        if _is_expired(entry.get("expires_at"), now):
+            continue
         kept_entries.append(entry)
 
     expires_iso: Optional[str] = None
@@ -246,10 +399,13 @@ def set_coin_pause(
 
     data["updated_at"] = utc_now_iso(now)
     data["entries"] = kept_entries
-    data["symbols"] = sorted({e["symbol"] for e in kept_entries})
+    data["symbols"] = sorted({str(e["symbol"]).upper() for e in kept_entries})
 
     tmp = p.with_name(f"{p.stem}.{os.getpid()}.tmp")
-    tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(json.dumps(data, indent=2, ensure_ascii=False))
+        fh.flush()
+        os.fsync(fh.fileno())
     for attempt in range(3):
         try:
             os.replace(tmp, p)
@@ -335,8 +491,13 @@ def compute_market_regime(client: Optional[BybitClient] = None) -> Dict[str, Any
         }
 
     for sym in ("BTCUSDT", "ETHUSDT"):
-        df_15m = cl.get_klines(sym, interval="15", days=35, use_cache=True, closed_only=True)
+        try:
+            df_15m = cl.get_klines(sym, interval="15", days=35, use_cache=True, closed_only=True)
+        except Exception as exc:
+            logger.warning("Market regime: klines fetch failed for %s: %s", sym, redact_secrets(exc))
+            continue
         if len(df_15m) < 200:
+            logger.warning("Market regime: only %d 15m candles for %s, need 200", len(df_15m), sym)
             continue
         r1h = (float(df_15m["close"].iloc[-1]) / float(df_15m["close"].iloc[-5]) - 1.0) * 100.0 if len(df_15m) >= 5 else 0.0
         r4h = (float(df_15m["close"].iloc[-1]) / float(df_15m["close"].iloc[-17]) - 1.0) * 100.0 if len(df_15m) >= 17 else 0.0
@@ -367,6 +528,7 @@ def compute_market_regime(client: Optional[BybitClient] = None) -> Dict[str, Any
         )
 
     btc = assets.get("BTCUSDT", {})
+    btc_klines_ok = "adx_4h" in btc
     btc_r4h = float(btc.get("ret_4h_pct", 0.0))
     btc_24h = float(btc.get("price_24h_pcnt", 0.0))
     btc_adx = float(btc.get("adx_4h", 0.0))
@@ -374,7 +536,10 @@ def compute_market_regime(client: Optional[BybitClient] = None) -> Dict[str, Any
 
     if btc_r4h <= -3.0 or btc_24h <= -6.0:
         regime = "PANIC_FLUSH"
-        wlfi_advice = "PAUSE_RECOMMENDED (безоткатный пролив BTC — риск для контртрендовых лонгов WLFI)"
+        wlfi_advice = "PAUSE_RECOMMENDED (безоткатный пролив BTC - риск для контртрендовых лонгов WLFI)"
+    elif not btc_klines_ok:
+        regime = "UNKNOWN"
+        wlfi_advice = "НЕТ ДАННЫХ (свечи BTC 15m недоступны, режим рынка не определён)"
     elif btc_adx < 18.0:
         regime = "CHOP_RANGE"
         wlfi_advice = "FAVORABLE (боковик благоприятен для возврата к среднему WLFI)"
@@ -385,6 +550,7 @@ def compute_market_regime(client: Optional[BybitClient] = None) -> Dict[str, Any
     return {
         "checked_at_utc": utc_now_iso(),
         "regime": regime,
+        "data_ok": btc_klines_ok,
         "wlfi_advisor_note": wlfi_advice,
         "assets": assets,
         "pauses": get_active_pauses(),
@@ -408,7 +574,7 @@ def audit_trades_and_hidden_costs(days: int = 7, client: Optional[BybitClient] =
         sym = b["symbol"]
         closed = query_sqlite_ro(
             b["db_path"],
-            "SELECT * FROM trades WHERE status = 'CLOSED' AND (exit_time IS NULL OR exit_time >= ?) ORDER BY id DESC",
+            "SELECT * FROM trades WHERE status = 'CLOSED' AND COALESCE(exit_time, entry_time) >= ? ORDER BY id DESC",
             (cutoff_iso,),
         )
         active = query_sqlite_ro(
@@ -825,6 +991,59 @@ def run_rnd_coin_scout_blocking(candidates: Tuple[str, ...] = ("SOLUSDT", "XRPUS
     return payload
 
 
+def pid_alive(pid: Any) -> bool:
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if os.name == "nt":
+        # os.kill(pid, 0) terminates the process on Windows
+        try:
+            import subprocess
+
+            out = subprocess.check_output(["tasklist", "/FI", f"PID eq {pid}", "/NH"], text=True, timeout=10)
+            return str(pid) in out
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def read_rnd_lock() -> Optional[Dict[str, Any]]:
+    try:
+        info = json.loads(RND_LOCK_PATH.read_text(encoding="utf-8"))
+        return info if isinstance(info, dict) else {}
+    except FileNotFoundError:
+        return None
+    except Exception:
+        return {}
+
+
+def write_rnd_lock(pid: int, started_at: Optional[str] = None, exclusive: bool = False) -> bool:
+    """Write the R&D lock. With exclusive=True fail (return False) if it already exists."""
+    RND_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+    body = json.dumps({"pid": pid, "started_at": started_at or utc_now_iso()})
+    if exclusive:
+        try:
+            fd = os.open(RND_LOCK_PATH, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+        except FileExistsError:
+            return False
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        return True
+    tmp = RND_LOCK_PATH.with_name(f"{RND_LOCK_PATH.name}.{os.getpid()}.tmp")
+    tmp.write_text(body, encoding="utf-8")
+    os.replace(tmp, RND_LOCK_PATH)
+    return True
+
+
 def _cli_main() -> None:
     parser = argparse.ArgumentParser(description="Supervisor tools CLI worker")
     parser.add_argument("--rnd-scout", action="store_true", help="Run heavy R&D Coin Scout in background subprocess")
@@ -833,31 +1052,34 @@ def _cli_main() -> None:
 
     if args.rnd_scout:
         load_dotenv(ROOT_DIR / ".env")
+        # The supervisor creates the lock before spawning us (with our pid or its own pid).
+        owners = {os.getpid(), os.getppid()}
+        lock = read_rnd_lock()
+        if lock is None:
+            write_rnd_lock(os.getpid(), exclusive=True)
+        elif lock.get("pid") not in owners and pid_alive(lock.get("pid")):
+            logger.warning("R&D Coin Scout already running (pid %s), exiting", lock.get("pid"))
+            return
+        else:
+            write_rnd_lock(os.getpid(), started_at=lock.get("started_at"))
         try:
-            RND_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
-            RND_LOCK_PATH.write_text(json.dumps({"pid": os.getpid(), "started_at": utc_now_iso()}), encoding="utf-8")
             res = run_rnd_coin_scout_blocking()
             if args.notify_telegram:
-                token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-                chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-                if token and chat_id and "your_telegram" not in token.lower():
-                    lines = ["🔬 *R&D Coin Scout (180д, 3 фолда + OOS, фикс. лот $3,000):*"]
-                    for c in res.get("top_candidates", [])[:5]:
-                        lines.append(
-                            f"• `{c['symbol']}` ({c['template']}): Net *+${c['net_usdt_fixed3k']:.0f}* "
-                            f"(OOS *+${c['oos_net_usdt']:.0f}*), WR `{c['win_rate_pct']}%`, PF `{c['profit_factor']}`, "
-                            f"SL `{c['sl_count']}`, Фолды `{c['positive_folds']}/3`, Corr(ADA)=`{c['corr_vs_ada']}`"
-                        )
-                    requests.post(
-                        f"https://api.telegram.org/bot{token}/sendMessage",
-                        json={"chat_id": chat_id, "text": "\n".join(lines), "parse_mode": "Markdown"},
-                        timeout=10,
+                lines = ["🔬 *R&D Coin Scout (180д, 3 фолда + OOS, фикс. лот $3,000):*"]
+                for c in res.get("top_candidates", [])[:5]:
+                    lines.append(
+                        f"• `{c['symbol']}` ({c['template']}): Net *+${c['net_usdt_fixed3k']:.0f}* "
+                        f"(OOS *+${c['oos_net_usdt']:.0f}*), WR `{c['win_rate_pct']}%`, PF `{c['profit_factor']}`, "
+                        f"SL `{c['sl_count']}`, Фолды `{c['positive_folds']}/3`, Corr(ADA)=`{c['corr_vs_ada']}`"
                     )
+                send_telegram_to_all("\n".join(lines), parse_mode="Markdown", timeout=10)
         finally:
-            try:
-                RND_LOCK_PATH.unlink(missing_ok=True)
-            except OSError:
-                pass
+            lock = read_rnd_lock()
+            if lock is not None and lock.get("pid") in owners:
+                try:
+                    RND_LOCK_PATH.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
 
 if __name__ == "__main__":

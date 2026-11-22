@@ -1,5 +1,7 @@
 # Secrets
 .env
+.env.*
+!.env.example
 
 # Runtime data & caches
 data/cache/
@@ -17,6 +19,7 @@ data/news_state.json
 data/universe_cache.json
 data/watchdog_state.json
 data/rnd_scout.lock
+data/blacklist.json.lock
 data/rnd_scout_latest.json
 logs/
 
