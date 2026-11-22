@@ -53,6 +53,8 @@ class TestSignalJournal(unittest.TestCase):
             journal = SignalJournal(ex.db_path, strategy="ada_fibo50_15x")
             journal.record(bar_ts_ms=1_700_000_000_000, symbol="ADAUSDT", direction="LONG", outcome="OPENED", trade_id=tid)
             journal.record(bar_ts_ms=1_700_000_900_000, symbol="ADAUSDT", direction="SHORT", outcome="FILTERED", reason="btc_1h_veto")
+            self.assertTrue(journal.entry_exists(1_700_000_000_000, "ADAUSDT"))
+            self.assertFalse(journal.entry_exists(1_700_000_900_000, "ADAUSDT"))
 
             with sqlite3.connect(ex.db_path) as conn:
                 conn.execute(

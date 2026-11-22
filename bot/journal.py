@@ -52,6 +52,20 @@ class SignalJournal:
             conn.execute(SCHEMA)
             conn.execute("CREATE INDEX IF NOT EXISTS idx_signals_bar ON signals(bar_time_utc)")
 
+    def entry_exists(self, bar_ts_ms: int, symbol: str) -> bool:
+        """True if an entry was already placed for this symbol on this bar (e.g. before a restart)."""
+        try:
+            bar_time = _iso(datetime.fromtimestamp(int(bar_ts_ms) / 1000, tz=timezone.utc))
+            with sqlite3.connect(self.db_path, timeout=15) as conn:
+                row = conn.execute(
+                    "SELECT 1 FROM signals WHERE bar_time_utc = ? AND symbol = ? AND outcome = 'OPENED' LIMIT 1",
+                    (bar_time, symbol),
+                ).fetchone()
+            return row is not None
+        except Exception as exc:
+            logger.warning("Signal journal read failed (%s): %s", symbol, exc)
+            return False
+
     def record(
         self,
         *,

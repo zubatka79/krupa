@@ -343,6 +343,9 @@ def main() -> None:
                 for ev in getattr(scanner, "journal_events", []):
                     journal.record(**ev)
                 for sig in signals:
+                    if journal.entry_exists(sig.timestamp, sig.symbol):
+                        logger.info("Skip %s %s: entry for this bar was already placed before restart.", sig.symbol, sig.direction)
+                        continue
                     trade_id = None
                     outcome, reason = "REJECTED", ""
                     try:
