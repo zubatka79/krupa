@@ -1,0 +1,29 @@
+# Secrets
+.env
+
+# Runtime data & caches
+data/cache/
+data/trades.db
+data/trades.db-journal
+data/trades.db-wal
+data/trades.db-shm
+data/trades_*.db*
+data/news_state_*.json
+data/backtest_results.json
+data/time_machine_results.json
+data/*_results.json
+data/research_v2_whitelist.json
+data/news_state.json
+data/universe_cache.json
+data/watchdog_state.json
+data/rnd_scout.lock
+data/rnd_scout_latest.json
+logs/
+
+# Python environment & bytecode
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
