@@ -45,6 +45,8 @@ from bot.supervisor_tools import (
 
 logger = logging.getLogger("ai_supervisor")
 LOG_PATH = ROOT_DIR / "logs" / "ai_supervisor.log"
+USAGE_PATH = ROOT_DIR / "data" / "ai_usage.json"
+ALERT_THRESHOLDS_USD = (30.0, 40.0, 45.0, 50.0)
 
 
 def setup_logging() -> None:
@@ -77,26 +79,120 @@ class UniversalAIClient:
         "нажать кнопку паузы в Telegram."
     )
 
-    def __init__(self) -> None:
+    def __init__(self, on_budget_alert: Optional[Any] = None) -> None:
+        self.on_budget_alert = on_budget_alert
         self.reload_env()
 
     def reload_env(self) -> None:
         load_dotenv(ROOT_DIR / ".env", override=True)
+        self.anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+        self.anthropic_model = os.getenv("ANTHROPIC_MODEL", "claude-opus-5-5").strip() or "claude-opus-5-5"
         self.gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
         self.gemini_model = os.getenv("GEMINI_MODEL", "gemini-2.5-flash").strip() or "gemini-2.5-flash"
         self.ai_key = os.getenv("AI_API_KEY", "").strip()
         self.ai_base_url = os.getenv("AI_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/")
         self.ai_model = os.getenv("AI_MODEL", "gpt-4o-mini").strip() or "gpt-4o-mini"
+        try:
+            self.monthly_limit_usd = max(1.0, float(os.getenv("AI_MONTHLY_LIMIT_USD", "50.0").strip()))
+        except ValueError:
+            self.monthly_limit_usd = 50.0
 
     @property
     def is_configured(self) -> bool:
+        has_ant = bool(self.anthropic_key and "your_" not in self.anthropic_key.lower())
         has_g = bool(self.gemini_key and "your_" not in self.gemini_key.lower())
         has_a = bool(self.ai_key and "your_" not in self.ai_key.lower())
-        return has_g or has_a
+        return has_ant or has_g or has_a
+
+    def _load_usage(self) -> Dict[str, Any]:
+        month_key = utc_now().strftime("%Y-%m")
+        default = {
+            "month": month_key,
+            "spent_usd": 0.0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "requests": 0,
+            "alerted_thresholds": [],
+        }
+        if not USAGE_PATH.exists():
+            return default
+        try:
+            data = json.loads(USAGE_PATH.read_text(encoding="utf-8"))
+            if data.get("month") != month_key:
+                return default
+            return data
+        except Exception:
+            return default
+
+    def _save_usage(self, usage: Dict[str, Any]) -> None:
+        USAGE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = USAGE_PATH.with_name(f"{USAGE_PATH.stem}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(usage, indent=2, ensure_ascii=False), encoding="utf-8")
+        try:
+            os.replace(tmp, USAGE_PATH)
+        except OSError:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def get_budget_status(self) -> Dict[str, Any]:
+        self.reload_env()
+        u = self._load_usage()
+        spent = float(u.get("spent_usd", 0.0))
+        return {
+            "month": u.get("month"),
+            "spent_usd": round(spent, 4),
+            "limit_usd": self.monthly_limit_usd,
+            "remaining_usd": round(max(0.0, self.monthly_limit_usd - spent), 4),
+            "requests": int(u.get("requests", 0)),
+            "input_tokens": int(u.get("input_tokens", 0)),
+            "output_tokens": int(u.get("output_tokens", 0)),
+            "halted": spent >= self.monthly_limit_usd,
+        }
+
+    def _record_usage(self, in_tok: int, out_tok: int, in_rate_per_m: float, out_rate_per_m: float) -> None:
+        usage = self._load_usage()
+        cost = (in_tok / 1_000_000.0) * in_rate_per_m + (out_tok / 1_000_000.0) * out_rate_per_m
+        usage["input_tokens"] = int(usage.get("input_tokens", 0)) + in_tok
+        usage["output_tokens"] = int(usage.get("output_tokens", 0)) + out_tok
+        usage["requests"] = int(usage.get("requests", 0)) + 1
+        usage["spent_usd"] = round(float(usage.get("spent_usd", 0.0)) + cost, 6)
+        spent = float(usage["spent_usd"])
+        alerted = list(usage.get("alerted_thresholds", []))
+
+        for th in ALERT_THRESHOLDS_USD:
+            if th <= self.monthly_limit_usd and spent >= th and th not in alerted:
+                alerted.append(th)
+                if th >= self.monthly_limit_usd:
+                    msg = (
+                        f"🛑 [AI BUDGET LIMIT REACHED] Расход Claude API за {usage['month']} достиг "
+                        f"${spent:.2f} (лимит ${self.monthly_limit_usd:.2f}). Запросы к ИИ отключены до 1-го числа; "
+                        f"4 торговых бота, Watchdog и кнопки Telegram продолжают работать."
+                    )
+                else:
+                    msg = (
+                        f"⚠️ [AI BUDGET ALERT] Расход ИИ за {usage['month']} превысил ${th:.0f} "
+                        f"(текущий расход: ${spent:.2f} из ${self.monthly_limit_usd:.2f})."
+                    )
+                logger.warning(msg)
+                if self.on_budget_alert is not None:
+                    try:
+                        self.on_budget_alert(msg)
+                    except Exception:
+                        pass
+
+        usage["alerted_thresholds"] = alerted
+        self._save_usage(usage)
 
     def ask(self, prompt: str, context_data: Optional[Dict[str, Any]] = None, max_tokens: int = 700) -> Optional[str]:
         self.reload_env()
         if not self.is_configured:
+            return None
+
+        usage = self._load_usage()
+        if float(usage.get("spent_usd", 0.0)) >= self.monthly_limit_usd:
+            logger.warning("AI call skipped: monthly budget cap $%.2f reached.", self.monthly_limit_usd)
             return None
 
         full_user_text = prompt
@@ -104,7 +200,41 @@ class UniversalAIClient:
             compact_json = json.dumps(context_data, ensure_ascii=False, default=str)
             full_user_text = f"{prompt}\n\nДАННЫЕ (JSON):\n{compact_json}"
 
-        # 1. Prefer Google Gemini Native API if GEMINI_API_KEY is set
+        # 1. Prefer Anthropic Claude Native API if ANTHROPIC_API_KEY is set
+        if self.anthropic_key and "your_" not in self.anthropic_key.lower():
+            try:
+                url = "https://api.anthropic.com/v1/messages"
+                headers = {
+                    "x-api-key": self.anthropic_key,
+                    "anthropic-version": "2023-06-01",
+                    "content-type": "application/json",
+                }
+                payload = {
+                    "model": self.anthropic_model,
+                    "max_tokens": max_tokens,
+                    "temperature": 0.2,
+                    "system": self.SYSTEM_PROMPT,
+                    "messages": [{"role": "user", "content": full_user_text}],
+                }
+                resp = requests.post(url, headers=headers, json=payload, timeout=(8, 15))
+                if resp.status_code == 200:
+                    data = resp.json()
+                    u = data.get("usage", {})
+                    self._record_usage(
+                        int(u.get("input_tokens", 0)),
+                        int(u.get("output_tokens", 0)),
+                        in_rate_per_m=4.0,
+                        out_rate_per_m=20.0,
+                    )
+                    blocks = data.get("content", [])
+                    texts = [str(b.get("text", "")) for b in blocks if b.get("type") == "text"]
+                    if texts:
+                        return "\n".join(texts).strip()
+                logger.warning("Anthropic API non-200 (%s): %s", resp.status_code, resp.text[:250])
+            except Exception as exc:
+                logger.warning("Anthropic API request failed: %s", exc)
+
+        # 2. Google Gemini Native API if GEMINI_API_KEY is set
         if self.gemini_key and "your_" not in self.gemini_key.lower():
             try:
                 url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.gemini_model}:generateContent?key={self.gemini_key}"
@@ -116,6 +246,13 @@ class UniversalAIClient:
                 resp = requests.post(url, json=payload, timeout=(8, 15))
                 if resp.status_code == 200:
                     data = resp.json()
+                    meta = data.get("usageMetadata", {})
+                    self._record_usage(
+                        int(meta.get("promptTokenCount", 0)),
+                        int(meta.get("candidatesTokenCount", 0)),
+                        in_rate_per_m=0.3,
+                        out_rate_per_m=2.5,
+                    )
                     cands = data.get("candidates", [])
                     if cands:
                         parts = cands[0].get("content", {}).get("parts", [])
@@ -125,7 +262,7 @@ class UniversalAIClient:
             except Exception as exc:
                 logger.warning("Gemini API request failed: %s", exc)
 
-        # 2. Fallback / Alternative: OpenAI / OpenRouter / Custom Token endpoint
+        # 3. Fallback / Alternative: OpenAI / OpenRouter / Custom Token endpoint
         if self.ai_key and "your_" not in self.ai_key.lower():
             try:
                 url = f"{self.ai_base_url}/chat/completions"
@@ -142,6 +279,13 @@ class UniversalAIClient:
                 resp = requests.post(url, headers=headers, json=payload, timeout=(8, 15))
                 if resp.status_code == 200:
                     data = resp.json()
+                    u = data.get("usage", {})
+                    self._record_usage(
+                        int(u.get("prompt_tokens", 0)),
+                        int(u.get("completion_tokens", 0)),
+                        in_rate_per_m=4.0,
+                        out_rate_per_m=20.0,
+                    )
                     choices = data.get("choices", [])
                     if choices:
                         return str(choices[0].get("message", {}).get("content", "")).strip()
@@ -193,7 +337,7 @@ class TelegramSupervisor:
         load_dotenv(ROOT_DIR / ".env", override=True)
         self.token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         self.chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-        self.ai = UniversalAIClient()
+        self.ai = UniversalAIClient(on_budget_alert=self.send_message)
         self.offset = 0
 
     @property
@@ -494,7 +638,20 @@ class TelegramSupervisor:
             self.send_message(msg, reply_markup=kb, chat_id=chat_id)
             return
 
-        # 9. R&D 5th Coin Scout
+        # 9. AI Budget Status
+        if any(w in low for w in ("бюджет", "расход", "лимит", "токен")):
+            b = self.ai.get_budget_status()
+            st = "🛑 ЛИМИТ ИСЧЕРПАН (ИИ отключён)" if b["halted"] else "✅ Активен"
+            self.send_message(
+                f"💳 Бюджет ИИ ({b['month']}): {st}\n"
+                f"• Потрачено: ${b['spent_usd']:.2f} из ${b['limit_usd']:.2f} (осталось ${b['remaining_usd']:.2f})\n"
+                f"• Запросов: {b['requests']} | Токенов: {b['input_tokens']:,} in / {b['output_tokens']:,} out\n"
+                f"• Оповещения настроены на: $30, $40, $45 и стоп на $50.",
+                chat_id=chat_id,
+            )
+            return
+
+        # 10. R&D 5th Coin Scout
         if "5-й" in low or "5 монет" in low or "пятой" in low or "поиск" in low or "r&d" in low:
             _, msg = trigger_rnd_scout_subprocess()
             self.send_message(msg, chat_id=chat_id)

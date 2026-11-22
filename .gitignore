@@ -16,6 +16,7 @@ data/research_v2_whitelist.json
 data/news_state.json
 data/universe_cache.json
 data/watchdog_state.json
+data/ai_usage.json
 data/rnd_scout.lock
 data/rnd_scout_latest.json
 logs/
