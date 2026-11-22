@@ -37,7 +37,10 @@ class TelegramNotifier:
     """Lightweight Telegram Bot API notifier (silently disabled if env vars are unset)."""
 
     def __init__(self) -> None:
-        load_dotenv()
+        self._reload()
+
+    def _reload(self) -> None:
+        load_dotenv(override=True)
         self.token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         self.chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
         self.enabled = bool(
@@ -48,6 +51,8 @@ class TelegramNotifier:
         )
 
     def send(self, text: str) -> None:
+        if not self.enabled:
+            self._reload()
         if not self.enabled:
             return
         try:

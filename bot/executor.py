@@ -466,10 +466,14 @@ class TradeExecutor:
             trade_id = int(cur.lastrowid)
             conn.commit()
 
+        dir_badge = "🟢 LONG" if is_long else "🔴 SHORT"
         self._notify(
-            f"[MAKER PENDING {exec_mode.upper()}] {signal.symbol} {signal.direction} Isolated {leverage}x | "
-            f"Limit={entry_price} (TTL {ttl_bars} bars/{ttl_min}m) | Server SL={sl_price} (-{sl_frac*100:.2f}%) | "
-            f"TP={tp_price} (+{tp_frac*100:.2f}%) | BE1 @ {be1_trigger}->{be1_price}, BE2 @ {be2_trigger}->{be2_price} | Margin=${margin_usdt:.2f}"
+            f"⏳ ВЫСТАВЛЕН ЛИМИТНЫЙ ОРДЕР ({exec_mode.upper()}) | {signal.symbol} {dir_badge}\n"
+            f"Плечо: {leverage}x Isolated | Маржа: ${margin_usdt:.2f}\n"
+            f"Цена входа (Limit): {entry_price} (TTL {ttl_bars} св. / {ttl_min} мин)\n"
+            f"Тейк (TP): {tp_price} (+{tp_frac*100:.2f}%) | Стоп (SL): {sl_price} (-{sl_frac*100:.2f}%)\n"
+            f"БУ1: {be1_trigger} -> {be1_price} | БУ2: {be2_trigger} -> {be2_price}\n"
+            f"💰 Баланс: ${current_equity:,.2f}"
         )
         return trade_id
 
@@ -646,9 +650,19 @@ class TradeExecutor:
             )
             conn.commit()
 
+        is_long = str(trade.get("direction", "")).upper() == "LONG"
+        dir_badge = "🟢 LONG" if is_long else "🔴 SHORT"
+        lev = int(trade.get("leverage") or self.config.get("leverage", 10))
+        margin_val = float(trade.get("margin_usdt") or 0.0)
+        ep_val = float(trade.get("entry_price") or 0.0)
+        tp_pct_val = (abs(tp_price - ep_val) / ep_val * 100.0) if ep_val > 0 else float(self.config.get("tp_pct", 1.2))
+        cur_eq = self.get_current_equity()
         self._notify(
-            f"[FILLED MAKER] {sym} {trade['direction']} @ {trade['entry_price']} | "
-            f"100% Maker TP placed @ {tp_price} (+{self.config.get('tp_pct', 1.2)}%) | Server SL @ {trade['sl_price']}"
+            f"🚀 СДЕЛКА НАЧАЛАСЬ | {sym} {dir_badge}\n"
+            f"Плечо: {lev}x Isolated | Маржа: ${margin_val:.2f}\n"
+            f"Цена входа: {trade['entry_price']}\n"
+            f"Тейк (TP): {tp_price} (+{tp_pct_val:.2f}%) | Стоп (SL): {trade['sl_price']}\n"
+            f"💰 Баланс: ${cur_eq:,.2f}"
         )
 
     def _activate_smart_be_step(self, trade: Dict[str, Any], step: int) -> bool:
@@ -671,7 +685,13 @@ class TradeExecutor:
         with self._connect() as conn:
             conn.execute("UPDATE trades SET status = ?, sl_price = ? WHERE id = ?", (new_status, target_sl, trade["id"]))
             conn.commit()
-        self._notify(f"[SMART {label}] {sym} {trade['direction']} -> Server SL moved to {target_sl}")
+        is_long = str(trade.get("direction", "")).upper() == "LONG"
+        dir_badge = "🟢 LONG" if is_long else "🔴 SHORT"
+        lev = int(trade.get("leverage") or self.config.get("leverage", 10))
+        self._notify(
+            f"🛡 БЕЗУБЫТОК {label} | {sym} {dir_badge}\n"
+            f"Плечо: {lev}x Isolated | Стоп переведён на: {target_sl}"
+        )
         return True
 
     def _mark_cancelled(self, trade_id: int, reason: str, now: Optional[datetime] = None) -> None:
@@ -809,7 +829,13 @@ class TradeExecutor:
         halted = halted_dd or ((int(daily.get("sl_count", 0)) + (1 if is_sl else 0)) >= max_stops)
         self._record_daily_close(net_pnl, is_sl=is_sl, halted=halted, now=now)
 
+        is_long = str(trade.get("direction", "")).upper() == "LONG"
+        dir_badge = "🟢 LONG" if is_long else "🔴 SHORT"
+        lev = int(trade.get("leverage") or self.config.get("leverage", 10))
+        res_icon = "✅" if net_pnl >= 0 else "❌"
         self._notify(
-            f"[CLOSED {reason}] {trade['symbol']} {trade['direction']} | "
-            f"Net PnL: {net_pnl:+.2f} USDT (Fees: {total_fees:.2f}) | Equity: ${equity:.2f}"
+            f"{res_icon} СДЕЛКА ЗАКРЫТА ({reason}) | {trade['symbol']} {dir_badge}\n"
+            f"Плечо: {lev}x Isolated | Вход: {trade['entry_price']}\n"
+            f"Результат: {net_pnl:+.2f} USDT ({net_pct_margin:+.2f}% к марже) | Комиссия: ${total_fees:.2f}\n"
+            f"💰 Баланс: ${equity:,.2f}"
         )

@@ -294,9 +294,11 @@ class TelegramSupervisor:
         else:
             lines.append(f"\nАктивные позиции / лимитные ордера ({len(active)}):")
             for t in active:
+                d_badge = "🟢 LONG" if str(t.get("direction", "")).upper() == "LONG" else "🔴 SHORT"
+                st_label = "⏳ Лимитка" if t["status"] == "PENDING" else f"🚀 В сделке ({t['status']})"
                 lines.append(
-                    f"• {t['symbol']} {t['direction']} [{t['status']}] | Вход: {t['entry_price']} | "
-                    f"SL: {t['sl_price']} | TP: {t['tp1_price']} | Маржа: ${float(t.get('margin_usdt') or 0):.2f}"
+                    f"• {t['symbol']} {d_badge} | 10x Isolated | {st_label}\n"
+                    f"  Вход: {t['entry_price']} | TP: {t['tp1_price']} | SL: {t['sl_price']} | Маржа: ${float(t.get('margin_usdt') or 0):.2f}"
                 )
         return "\n".join(lines)
 
