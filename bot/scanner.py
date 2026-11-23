@@ -1416,6 +1416,234 @@ class MarketScanner:
             be2_offset_pct=be2_off,
         )
 
+    def _eval_hbar_macd_stoch_10x_latest(
+        self,
+        spec: InstrumentSpec,
+        df_15m: pd.DataFrame,
+        df_btc: pd.DataFrame,
+        directions: List[str],
+    ) -> Optional[TradeSignal]:
+        """Evaluate System 6 (HBARUSDT 1H Trend + MACD Hist zero-cross + 15M Stoch(14) Pullback) on latest closed 15M bar."""
+        entry_tf = str(self.config.get("entry_tf", "15"))
+        context_tf = str(self.config.get("context_tf", "60"))
+        entry_ms = INTERVAL_TO_MS[entry_tf]
+        h1_ms = INTERVAL_TO_MS[context_tf]
+
+        ema_period = int(self.config.get("hbar_ema_period", 20))
+        stoch_period = int(self.config.get("hbar_stoch_period", 14))
+        stoch_smooth = int(self.config.get("hbar_stoch_smooth", 3))
+        stoch_long_max = float(self.config.get("hbar_stoch_long_max", 28.0))
+        stoch_short_min = float(self.config.get("hbar_stoch_short_min", 72.0))
+        pb_atr_k = float(self.config.get("hbar_pullback_atr", 0.55))
+        abn_mult = float(self.config.get("abn_spike_atr_mult", 3.2))
+        min_atr_pct = float(self.config.get("min_atr_pct", 0.10))
+        max_atr_pct = float(self.config.get("max_atr_pct", 1.90))
+        ef = int(self.config.get("h1_ema_fast", 20))
+        es = int(self.config.get("h1_ema_slow", 50))
+        h1_adx_min = float(self.config.get("h1_adx_min", 14.0))
+        btc_1h_veto = float(self.config.get("btc_1h_veto_pct", 0.9))
+        min_dist_frac = float(self.config.get("fib_min_dist_pct", 0.08)) / 100.0
+        tp_pct = float(self.config.get("tp_pct", 1.40))
+        sl_pct = float(self.config.get("sl_pct", 2.50))
+        be1_tr = float(self.config.get("smart_be1_trigger_pct", round(tp_pct * 0.55, 4)))
+        be1_off = float(self.config.get("smart_be1_offset_pct", round(tp_pct * 0.20, 4)))
+        be2_tr = float(self.config.get("smart_be2_trigger_pct", round(tp_pct * 0.78, 4)))
+        be2_off = float(self.config.get("smart_be2_offset_pct", round(tp_pct * 0.40, 4)))
+
+        if len(df_15m) < 220:
+            return None
+
+        df = df_15m.copy().sort_values("timestamp").reset_index(drop=True)
+        df["close_ts"] = (df["timestamp"] + entry_ms).astype("int64")
+        df["atr"] = compute_atr(df["high"], df["low"], df["close"], 14)
+        df["atr_pct"] = (df["atr"] / df["close"].replace(0.0, np.nan)) * 100.0
+        df["e20"] = ema(df["close"], ema_period)
+        e12 = ema(df["close"], 12)
+        e26 = ema(df["close"], 26)
+        macd = e12 - e26
+        df["macd_hist"] = macd - ema(macd, 9)
+        lo_st = df["low"].rolling(stoch_period, min_periods=stoch_period).min()
+        hi_st = df["high"].rolling(stoch_period, min_periods=stoch_period).max()
+        stoch_k = ((df["close"] - lo_st) / (hi_st - lo_st).replace(0.0, np.nan) * 100.0).fillna(50.0)
+        df["sk_s"] = stoch_k.rolling(stoch_smooth, min_periods=1).mean()
+
+        bar_r = df["high"] - df["low"]
+        is_abn = (bar_r > abn_mult * df["atr"]).fillna(False)
+        vol_cd = is_abn | is_abn.shift(1, fill_value=False)
+        if bool(vol_cd.iloc[-1]):
+            return None
+
+        cur_atr = float(df["atr"].iloc[-1])
+        cur_atr_pct = float(df["atr_pct"].iloc[-1])
+        cur_e20 = float(df["e20"].iloc[-1])
+        cur_mh = float(df["macd_hist"].iloc[-1])
+        prev_mh = float(df["macd_hist"].iloc[-2])
+        cur_sk_s = float(df["sk_s"].iloc[-1])
+        close_p = float(df["close"].iloc[-1])
+
+        if (
+            not np.isfinite(cur_atr)
+            or cur_atr <= 0
+            or not np.isfinite(cur_atr_pct)
+            or not np.isfinite(cur_e20)
+            or not np.isfinite(cur_mh)
+            or not np.isfinite(prev_mh)
+        ):
+            return None
+        if cur_atr_pct < min_atr_pct or cur_atr_pct > max_atr_pct:
+            return None
+
+        df_1h = BybitClient.resample_klines(df, context_tf)
+        if len(df_1h) < es + 10:
+            return None
+        h1_e20 = ema(df_1h["close"], ef)
+        h1_e50 = ema(df_1h["close"], es)
+        h1_adx, _, _ = compute_adx(df_1h["high"], df_1h["low"], df_1h["close"], 14)
+        h1_out = pd.DataFrame({
+            "close_ts": (df_1h["timestamp"] + h1_ms).astype("int64"),
+            "h1_bull": (df_1h["close"] > h1_e50) & (h1_e20 > h1_e50),
+            "h1_bear": (df_1h["close"] < h1_e50) & (h1_e20 < h1_e50),
+            "h1_adx": h1_adx.fillna(0.0).values,
+        }).sort_values("close_ts")
+
+        df = pd.merge_asof(df, h1_out, on="close_ts", direction="backward")
+        cur_h1_adx = _finite(df["h1_adx"].iloc[-1])
+        if cur_h1_adx < h1_adx_min:
+            return None
+
+        h1_bull = _flag(df["h1_bull"].iloc[-1])
+        h1_bear = _flag(df["h1_bear"].iloc[-1])
+        if not h1_bull and not h1_bear:
+            return None
+
+        btc_r1h = 0.0
+        if len(df_btc) >= 5:
+            b_prev = float(df_btc["close"].iloc[-5])
+            b_now = float(df_btc["close"].iloc[-1])
+            if b_prev > 0:
+                btc_r1h = (b_now - b_prev) / b_prev * 100.0
+
+        signal_dir: Optional[str] = None
+        limit_p: float = 0.0
+
+        if "LONG" in directions and h1_bull and cur_mh > prev_mh and prev_mh <= 0.0 and cur_sk_s <= stoch_long_max:
+            if btc_1h_veto > 0 and btc_r1h <= -btc_1h_veto:
+                logger.info("BTC 1H Veto blocked %s LONG (BTC 1H=%.2f%% <= -%.1f%%).", spec.symbol, btc_r1h, btc_1h_veto)
+                return None
+            cand_lp = cur_e20 - pb_atr_k * cur_atr
+            if 0.0 < cand_lp < close_p * (1.0 - min_dist_frac):
+                signal_dir = "LONG"
+                limit_p = cand_lp
+        elif "SHORT" in directions and h1_bear and cur_mh < prev_mh and prev_mh >= 0.0 and cur_sk_s >= stoch_short_min:
+            if btc_1h_veto > 0 and btc_r1h >= btc_1h_veto:
+                logger.info("BTC 1H Veto blocked %s SHORT (BTC 1H=%+.2f%% >= +%.1f%%).", spec.symbol, btc_r1h, btc_1h_veto)
+                return None
+            cand_lp = cur_e20 + pb_atr_k * cur_atr
+            if cand_lp > close_p * (1.0 + min_dist_frac):
+                signal_dir = "SHORT"
+                limit_p = cand_lp
+
+        if signal_dir is None:
+            return None
+
+        if spec.tick_size > 0:
+            limit_p = round_tick(limit_p, spec.tick_size)
+
+        return TradeSignal(
+            symbol=spec.symbol,
+            direction=signal_dir,
+            timestamp=int(df["timestamp"].iloc[-1]),
+            entry_price=limit_p,
+            sl_pct=sl_pct,
+            score=round(cur_h1_adx + 25.0, 2),
+            breakdown={
+                "strategy": "hbar_macd_stoch_10x",
+                "macd_hist": round(cur_mh, 6),
+                "stoch_k14_s": round(cur_sk_s, 2),
+                "ema20": round(cur_e20, 5),
+                "pb_atr_k": pb_atr_k,
+                "h1_adx": round(cur_h1_adx, 2),
+                "btc_r1h_pct": round(btc_r1h, 2),
+                "close_price": close_p,
+                "maker_limit_price": limit_p,
+            },
+            atr_pct=cur_atr_pct,
+            rvol=0.0,
+            body_ratio=0.0,
+            spec=spec,
+            tp_pct=tp_pct,
+            be1_trigger_pct=be1_tr,
+            be1_offset_pct=be1_off,
+            be2_trigger_pct=be2_tr,
+            be2_offset_pct=be2_off,
+        )
+
+    def _eval_btc_4h_e4_filter(self, trend_tf: str = "240") -> Dict[str, Any]:
+        """Evaluate closed-candle BTC 4H E4 filter: block LONG when BTC 4H close < EMA50 and EMA20 < EMA50."""
+        enabled = bool(self.config.get("btc_4h_bear_block_long", False))
+        if not enabled:
+            return {"enabled": False, "block_long": False, "reason": "disabled"}
+
+        trend_ms = INTERVAL_TO_MS.get(str(trend_tf), INTERVAL_TO_MS["240"])
+        now_ms = int(time.time() * 1000)
+        try:
+            df_btc_4h = self.client.get_klines(
+                "BTCUSDT",
+                interval=str(trend_tf),
+                days=35,
+                use_cache=True,
+                closed_only=True,
+            )
+            if df_btc_4h is None or df_btc_4h.empty:
+                logger.warning("[BTC 4H E4] Empty BTCUSDT %sM klines — fail-closed: blocking LONG, allowing SHORT.", trend_tf)
+                return {"enabled": True, "block_long": True, "error": "empty_klines"}
+
+            df_btc_4h = df_btc_4h.copy().sort_values("timestamp").reset_index(drop=True)
+            df_btc_4h = df_btc_4h[df_btc_4h["timestamp"].astype("int64") + trend_ms <= now_ms].reset_index(drop=True)
+
+            if len(df_btc_4h) < 60:
+                logger.warning(
+                    "[BTC 4H E4] Insufficient closed BTCUSDT 4H bars (%d < 60) — fail-closed: blocking LONG, allowing SHORT.",
+                    len(df_btc_4h),
+                )
+                return {"enabled": True, "block_long": True, "error": "insufficient_bars"}
+
+            ema20_s = ema(df_btc_4h["close"].astype(float), 20)
+            ema50_s = ema(df_btc_4h["close"].astype(float), 50)
+            last_row = df_btc_4h.iloc[-1]
+            bar_ts = int(last_row["timestamp"])
+            close_p = float(last_row["close"])
+            cur_ema20 = float(ema20_s.iloc[-1])
+            cur_ema50 = float(ema50_s.iloc[-1])
+
+            if not (np.isfinite(close_p) and np.isfinite(cur_ema20) and np.isfinite(cur_ema50) and cur_ema50 > 0):
+                logger.warning("[BTC 4H E4] Non-finite BTC 4H values — fail-closed: blocking LONG, allowing SHORT.")
+                return {"enabled": True, "block_long": True, "error": "non_finite"}
+
+            is_bear = (close_p < cur_ema50) and (cur_ema20 < cur_ema50)
+            bar_dt = pd.to_datetime(bar_ts, unit="ms", utc=True).strftime("%Y-%m-%d %H:%M UTC")
+            logger.info(
+                "[BTC 4H E4] closed_bar=%s (%d) | close=%.2f | EMA20=%.2f | EMA50=%.2f | block_long=%s",
+                bar_dt,
+                bar_ts,
+                close_p,
+                cur_ema20,
+                cur_ema50,
+                is_bear,
+            )
+            return {
+                "enabled": True,
+                "block_long": is_bear,
+                "bar_ts": bar_ts,
+                "bar_utc": bar_dt,
+                "close": close_p,
+                "ema20": cur_ema20,
+                "ema50": cur_ema50,
+            }
+        except Exception as exc:
+            logger.warning("[BTC 4H E4] API/eval error (%s) — fail-closed: blocking LONG, allowing SHORT.", exc)
+            return {"enabled": True, "block_long": True, "error": str(exc)}
+
     def scan_once(self, equity: float, top_n: Optional[int] = None) -> List[TradeSignal]:
         """Scan eligible symbols on the latest closed 15M bar and return signals sorted by quality/score desc."""
         self.last_scan_incomplete = False
@@ -1460,10 +1688,19 @@ class MarketScanner:
             "ltc_trend_bb_10x",
             "mnt_breakout_don_10x",
             "crv_stoch_10x",
+            "hbar_macd_stoch_10x",
         )
         if strategy_name not in single_coin_strats + KNOWN_MULTI_COIN_STRATEGIES:
             logger.error("Unknown strategy %r in config, scanning skipped.", strategy_name)
             return []
+
+        # BTC 4H E4 filter (blocks LONG only when BTC 4H closed bar has close < EMA50 and EMA20 < EMA50)
+        e4_state = self._eval_btc_4h_e4_filter(trend_tf=trend_tf)
+        if e4_state.get("block_long", False) and "LONG" in directions:
+            directions = [d for d in directions if d != "LONG"]
+            if not directions:
+                logger.info("Scanner skipped: LONG blocked by BTC 4H E4 filter and SHORT not allowed.")
+                return []
 
         entry_ms = INTERVAL_TO_MS[entry_tf]
         expected_last_ts = (int(time.time() * 1000) // entry_ms - 1) * entry_ms
@@ -1539,6 +1776,12 @@ class MarketScanner:
 
                 if strategy_name == "crv_stoch_10x":
                     sig = self._eval_crv_stoch_10x_latest(spec, df_15m, df_btc, directions)
+                    if sig is not None:
+                        signals.append(sig)
+                    continue
+
+                if strategy_name == "hbar_macd_stoch_10x":
+                    sig = self._eval_hbar_macd_stoch_10x_latest(spec, df_15m, df_btc, directions)
                     if sig is not None:
                         signals.append(sig)
                     continue

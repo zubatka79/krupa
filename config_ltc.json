@@ -25,6 +25,7 @@
   "entry_tf": "15",
   "context_tf": "60",
   "trend_tf": "240",
+  "btc_4h_bear_block_long": true,
   "bb_period": 20,
   "bb_k_sd": 1.4,
   "fib_min_dist_pct": 0.08,

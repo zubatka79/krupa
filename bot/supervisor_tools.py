@@ -98,6 +98,17 @@ BOT_CONFIGS: List[Dict[str, Any]] = [
         "bench_wr": 83.3,
         "bench_pf": 2.02,
     },
+    {
+        "key": "hbar",
+        "symbol": "HBARUSDT",
+        "strategy": "hbar_macd_stoch_10x",
+        "config_file": "config_hbar.json",
+        "db_path": "data/trades_hbar.db",
+        "log_path": "logs/bot_hbar.log",
+        "max_notional_usdt": 25000.0,
+        "bench_wr": 84.5,
+        "bench_pf": 1.60,
+    },
 ]
 
 PORTFOLIO_BENCHMARK = {
@@ -450,6 +461,7 @@ def fetch_coin_news_digest(timeout: int = 10) -> Dict[str, Any]:
         "LTCUSDT": ("ltc", "litecoin"),
         "MNTUSDT": ("mnt", "mantle"),
         "CRVUSDT": ("crv", "curve"),
+        "HBARUSDT": ("hbar", "hedera"),
         "RISK": ("hack", "exploit", "delist", "unlock", "sec ", "lawsuit", "bybit", "halt", "insolvenc"),
     }
     matched: List[Dict[str, str]] = []

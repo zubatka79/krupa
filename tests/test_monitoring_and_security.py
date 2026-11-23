@@ -94,11 +94,23 @@ class TestMonitoringAndSecurity(unittest.TestCase):
 
     def test_run_bot_load_config_validates_live_and_rejects_bad(self):
         root = Path(__file__).resolve().parent.parent
-        for fname in ("config_ada.json", "config_wlfi.json", "config_ltc.json", "config_mnt.json", "config_crv.json"):
+        expected_caps = {
+            "config_ada.json": (40000.0, True),
+            "config_wlfi.json": (8000.0, False),
+            "config_ltc.json": (50000.0, True),
+            "config_mnt.json": (20000.0, True),
+            "config_crv.json": (10000.0, True),
+            "config_hbar.json": (25000.0, True),
+        }
+        for fname, (exp_cap, exp_e4) in expected_caps.items():
             cfg = run_bot.load_config(root / fname)
             self.assertIn(cfg["mode"], ("demo", "testnet", "live", "mainnet"))
             self.assertEqual(cfg["max_portfolio_open_positions"], 5)
             self.assertEqual(cfg["max_portfolio_margin_pct"], 78.0)
+            self.assertEqual(cfg["margin_pct_per_trade"], 15.0)
+            self.assertEqual(cfg["leverage"], 10)
+            self.assertEqual(cfg["max_notional_usdt"], exp_cap)
+            self.assertEqual(cfg["btc_4h_bear_block_long"], exp_e4)
 
         with tempfile.TemporaryDirectory() as tmp:
             p = Path(tmp) / "bad.json"

@@ -272,6 +272,35 @@ class TestExecutor(unittest.TestCase):
             self.assertAlmostEqual(row["net_pnl_usdt"], 31.25, places=2)
             self.assertAlmostEqual(row["fees_usdt"], 1.21, places=2)
 
+    def test_six_bot_coordinator_limits_5_positions_and_78_pct_margin(self):
+        now = datetime(2026, 11, 25, 10, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_fresh_macro(Path(tmp) / "macro_events.json", now)
+            cl = MagicMock(has_credentials=True)
+            cl.get_open_orders.return_value = []
+            ex, _ = self._build_executor(Path(tmp), cl, dry_run=False)
+            ex.config.update({"max_portfolio_open_positions": 5, "max_portfolio_margin_pct": 78.0, "leverage": 10})
+            # 5 other bots already open -> 6th bot (HBARUSDT) must be blocked by 5-position limit
+            cl.get_positions.return_value = [
+                {"symbol": s, "size": "10", "positionIM": "200.0"}
+                for s in ("ADAUSDT", "WLFIUSDT", "LTCUSDT", "MNTUSDT", "CRVUSDT")
+            ]
+            sig_hbar = _make_signal(symbol="HBARUSDT", direction="LONG", entry=0.12)
+            with self.assertLogs("bot.executor", level="INFO") as cm1:
+                self.assertIsNone(ex.open_position(sig_hbar, current_equity=2000.0, now=now, allow_network_refresh=False))
+            self.assertTrue(any("global portfolio open positions limit reached" in m for m in cm1.output))
+            cl.place_entry_limit_order.assert_not_called()
+
+            # 4 other bots open but used_im (1300) + 15% of 2000 (300) = 1600 > 78% of 2000 (1560) -> blocked by 78% margin limit
+            cl.get_positions.return_value = [
+                {"symbol": s, "size": "10", "positionIM": "325.0"}
+                for s in ("ADAUSDT", "WLFIUSDT", "LTCUSDT", "MNTUSDT")
+            ]
+            with self.assertLogs("bot.executor", level="INFO") as cm2:
+                self.assertIsNone(ex.open_position(sig_hbar, current_equity=2000.0, now=now, allow_network_refresh=False))
+            self.assertTrue(any("would exceed 78.0% of equity" in m for m in cm2.output))
+            cl.place_entry_limit_order.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
