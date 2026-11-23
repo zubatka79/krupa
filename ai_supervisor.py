@@ -454,12 +454,11 @@ class TelegramSupervisor:
                     {"text": "🧭 Режим рынка (BTC/ETH)", "callback_data": "cmd:regime"},
                 ],
                 [
-                    {"text": "📰 Новости по 5 монетам", "callback_data": "cmd:news"},
+                    {"text": "📰 Новости по 6 монетам", "callback_data": "cmd:news"},
                     {"text": "🎯 Упущенные лимитки", "callback_data": "cmd:missed"},
                 ],
                 [
                     {"text": "💧 Стакан и потолки", "callback_data": "cmd:liquidity"},
-                    {"text": "🔬 Поиск 5-й монеты", "callback_data": "cmd:rnd"},
                 ],
                 [
                     {"text": "⏸ Пауза WLFI 12ч", "callback_data": "pause:WLFIUSDT:12"},
@@ -702,12 +701,6 @@ class TelegramSupervisor:
             )
             return
 
-        # 10. R&D 5th Coin Scout (heavy, so only an explicit command or the menu button)
-        if is_rnd_command(low):
-            _, msg = trigger_rnd_scout_subprocess()
-            self.send_message(msg, chat_id=chat_id)
-            return
-
         # 10. Free-form AI question with live portfolio + market context
         ctx = {
             "portfolio": audit_trades_and_hidden_costs(days=3),
@@ -842,9 +835,6 @@ class TelegramSupervisor:
             self.send_message(self.build_missed_fills_report(), chat_id=chat_id)
         elif data == "cmd:liquidity":
             self.send_message(self.build_liquidity_report(), chat_id=chat_id)
-        elif data == "cmd:rnd":
-            _, txt = trigger_rnd_scout_subprocess()
-            self.send_message(txt, chat_id=chat_id)
 
     def poll_telegram_once(self) -> bool:
         """One getUpdates round. Returns False when the caller should back off before the next one."""
@@ -942,13 +932,6 @@ def extract_pause_symbols(low: str) -> Tuple[List[str], List[str], bool]:
     words = re.findall(r"\w+", low)
     wants_all = any(w in _ALL_WORDS for w in words)
     return found, unknown, wants_all
-
-
-def is_rnd_command(low: str) -> bool:
-    low = low.strip()
-    if low in ("/rnd", "r&d", "/scout"):
-        return True
-    return any(k in low for k in ("5-й монет", "5-ой монет", "пятой монет", "пятую монет", "r&d scout", "запусти r&d"))
 
 
 def main() -> None:
