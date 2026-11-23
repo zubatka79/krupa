@@ -500,7 +500,7 @@ class TelegramSupervisor:
             p_str = ", ".join(f"{e['symbol']} (до {e.get('expires_at', '—')})" for e in pauses)
             lines.append(f"⏸ Активные паузы: {p_str}")
         else:
-            lines.append("▶️ Все 5 ботов активны (пауз нет)")
+            lines.append(f"▶️ Все {len(BOT_CONFIGS)} ботов активны (пауз нет)")
 
         if not active:
             lines.append("\nОткрытых позиций и висящих лимиток сейчас нет.")
