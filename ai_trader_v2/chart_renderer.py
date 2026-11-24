@@ -36,6 +36,8 @@ def render_15m_chart_png_b64(
     tp1_r: float,
     candles_count: int = 72,
     div_banner: Optional[str] = None,
+    adv_banner: Optional[str] = None,
+    tv_levels: Optional[Dict[str, Optional[float]]] = None,
 ) -> Optional[str]:
     """Render compact headless PNG candlestick+volume chart to base64 string (or None on error)."""
     try:
@@ -113,6 +115,18 @@ def render_15m_chart_png_b64(
         _plot_level(sr_4h.get("nearest_resistance"), "4H Res", "#ff5252", "-.")
         _plot_level(sr_4h.get("nearest_support"), "4H Sup", "#00e676", "-.")
 
+        # Thin dashed POC (gold/amber) and PDH/PDL (cyan/slate) ONLY if strictly inside visible 72-bar range
+        if isinstance(tv_levels, dict):
+            def _plot_tv_strict(val: Optional[float], label: str, color: str) -> None:
+                if val is not None and p_min <= float(val) <= p_max:
+                    fv = float(val)
+                    ax_p.axhline(fv, color=color, linestyle="--", linewidth=0.85, alpha=0.85, zorder=2)
+                    ax_p.text(n_bars * 0.52, fv, f" {label} {fv:.6g}", color=color, fontsize=7, va="bottom", ha="center")
+
+            _plot_tv_strict(tv_levels.get("poc"), "POC", "#ffca28")
+            _plot_tv_strict(tv_levels.get("pdh"), "PDH", "#4dd0e1")
+            _plot_tv_strict(tv_levels.get("pdl"), "PDL", "#90a4ae")
+
         # Proposed Entry, SL, TP1 reference lines
         cp = float(cl[-1])
         is_l = direction == "LONG"
@@ -125,10 +139,12 @@ def render_15m_chart_png_b64(
             ax_p.axhline(tp1_p, color="#00e676", linestyle=":", linewidth=1.0, alpha=0.9)
             ax_p.text(n_bars - 1, tp1_p, f"TP1 {tp1_r:.1f}R ", color="#69f0ae", fontsize=7, va="bottom", ha="right")
 
-        title_main = f"{symbol} 15m ({direction}) | Last {n_bars} Closed Bars | Price {cp:.6g}"
+        title_lines = [f"{symbol} 15m ({direction}) | Last {n_bars} Closed Bars | Price {cp:.6g}"]
         if div_banner:
-            title_main = f"{title_main}\n{div_banner}"
-        ax_p.set_title(title_main, color=fg, fontsize=9.5, pad=6)
+            title_lines.append(div_banner)
+        if adv_banner:
+            title_lines.append(adv_banner)
+        ax_p.set_title("\n".join(title_lines), color=fg, fontsize=9.0, pad=6)
         ax_p.legend(loc="upper left", fontsize=7.5, facecolor="#161d26", edgecolor="#2e3947", labelcolor=fg, ncol=3)
         ax_p.set_xlim(-1, n_bars + 1)
 

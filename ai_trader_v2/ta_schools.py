@@ -22,6 +22,11 @@ from ai_trader_v2.divergences import (
     compute_divergence_priority_delta,
     format_divergence_banner,
 )
+from ai_trader_v2.tv_advisors import (
+    analyze_tv_advisors,
+    compute_tv_advisors_priority_delta,
+    format_tv_advisors_banner,
+)
 from bot.bybit_client import BybitClient
 from bot.indicators import compute_atr, ema
 
@@ -591,6 +596,16 @@ def evaluate_symbol_12_schools(
         )
         priority += compute_divergence_priority_delta(div_block)
 
+    # TradingView-style advisors (SFP Liquidity Sweep, 4d Volume Profile, PDH/PDL/Asia) — advisory only!
+    tv_block = analyze_tv_advisors(
+        df15=df15,
+        df1h=df1h,
+        df4h=df4h,
+        direction=direction,
+        config=config,
+    )
+    priority += compute_tv_advisors_priority_delta(tv_block)
+
     # Structural S/R levels on 1H and 4H
     sr_1h = _find_swing_levels(df1h, lookback=60, price=close_now)
     sr_4h = _find_swing_levels(df4h, lookback=60, price=close_now)
@@ -681,11 +696,14 @@ def evaluate_symbol_12_schools(
         "candles_1h_last12": _fmt_candles(df1h, 12),
         "candles_4h_last8": _fmt_candles(df4h, 8),
         "divergences": div_block,
+        "tv_advisors": tv_block,
         "btc_context": btc_ctx.summary_dict,
     }
 
     chart_b64: Optional[str] = None
     if bool(config.get("chart_png_enabled", True)):
+        vp_info = tv_block.get("volume_profile") or {}
+        sess_info = tv_block.get("session_levels") or {}
         chart_b64 = render_15m_chart_png_b64(
             symbol=symbol,
             direction=direction,
@@ -699,6 +717,12 @@ def evaluate_symbol_12_schools(
             tp1_r=rec_tp1_r,
             candles_count=int(config.get("chart_candles_count", 72)),
             div_banner=format_divergence_banner(div_block) if div_block is not None else None,
+            adv_banner=format_tv_advisors_banner(tv_block),
+            tv_levels={
+                "poc": vp_info.get("poc"),
+                "pdh": sess_info.get("pdh"),
+                "pdl": sess_info.get("pdl"),
+            },
         )
 
     return CandidateSetup(

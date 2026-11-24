@@ -32,6 +32,14 @@ from ai_trader_v2.divergences import (
     find_confirmed_pivots,
     format_divergence_banner,
 )
+from ai_trader_v2.tv_advisors import (
+    analyze_tv_advisors,
+    compute_session_levels,
+    compute_tv_advisors_priority_delta,
+    compute_volume_profile,
+    detect_liquidity_sweep,
+    format_tv_advisors_banner,
+)
 from ai_trader_v2.executor import AITradeExecutor, TelegramNotifier
 from ai_trader_v2.journal import AITradeJournal
 from ai_trader_v2.run_ai_trader import load_config
@@ -69,6 +77,8 @@ def main() -> None:
     assert cfg["trailing_atr_mult"] == 4.0
     assert cfg["entry_order_type"] == "limit" and cfg["limit_entry_ttl_minutes"] == 45
     assert cfg["divergence_enabled"] is True and cfg["divergence_min_indicators"] == 2
+    assert cfg["tv_sfp_enabled"] is True and cfg["tv_vp_enabled"] is True and cfg["tv_session_enabled"] is True
+    assert cfg["vp_bins"] == 50 and float(cfg["vp_value_area_pct"]) == 70.0
     assert "ai_provider" in cfg and "ai_model" in cfg
     print("[PASS] 1. Config validated (Demo, 29 coins, 12 schools, max 8/5, 1H shorts, 3-stage BE, RVOL S12)")
 
@@ -425,7 +435,104 @@ def main() -> None:
     assert b64_div is not None and any("DIV:" in t and "H_BEAR" in t for t in seen_titles)
     print(f"[PASS] 8. Divergences verified (REG_BULL {rb_res['count']}/4, HID_BEAR {hb_res['count']}/4, zero-repaint right=2, PNG '{banner}')")
 
-    print("\nALL 8 COMPREHENSIVE VERIFICATION CHECKS PASSED!")
+    # ------------------------------------------------------------------
+    # 9. TradingView Advisors (BULL/BEAR SFP, 4d VPVR POC/VAH/VAL, PDH/PDL/Asia UTC, PNG DIV+ADV)
+    # ------------------------------------------------------------------
+    # 9a. Exact UTC calendar-day Session Levels (Day 0: PDH=112.0, PDL=94.0; Day 1 Asia 00-08 UTC: High=106.0, Low=101.0)
+    day0_ms = 1_763_856_000_000  # 2025-11-23 00:00:00 UTC exact midnight
+    day1_ms = day0_ms + 86_400_000
+    rows_s = []
+    for k in range(96):  # Day 0 (96 x 15m)
+        ts = day0_ms + k * 900_000
+        h, l, c = 104.0, 99.0, 102.0
+        if k == 20:
+            h = 112.0  # PDH
+        if k == 50:
+            l = 94.0   # PDL
+        rows_s.append((ts, c, h, l, c, 1000.0, 1000.0 * c))
+    for k in range(44):  # Day 1 00:00 .. 10:45 UTC (first 32 bars = Asia 00-08 UTC)
+        ts = day1_ms + k * 900_000
+        h, l, c = 104.5, 102.0, 103.5
+        if k == 10:
+            h = 106.0  # ASIA_HIGH
+        if k == 18:
+            l = 101.0  # ASIA_LOW
+        if k == 43:
+            c, h, l = 111.7, 111.8, 111.3  # 0.27% below PDH=112.0 -> session_obstacle_ahead for LONG!
+        rows_s.append((ts, c, h, l, c, 1000.0, 1000.0 * c))
+    df_sess = pd.DataFrame(rows_s, columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"])
+
+    sess_l = compute_session_levels(df_sess, None, close_now=111.7, direction="LONG")
+    assert sess_l["pdh"] == 112.0 and sess_l["pdl"] == 94.0
+    assert sess_l["asia_high"] == 106.0 and sess_l["asia_low"] == 101.0
+    assert sess_l["nearest_session_level"]["name"] == "PDH"
+    assert sess_l["session_obstacle_ahead"] is True
+
+    # 9b. 4-day Volume Profile (POC anchored at massive volume cluster around 100.0)
+    vp_rows = []
+    for i in range(120):
+        ts = day0_ms + i * 900_000
+        if i < 60:
+            # High volume cluster strictly around 100.0 (99.5 .. 100.5)
+            vp_rows.append((ts, 100.0, 100.5, 99.5, 100.0, 8000.0, 800000.0))
+        elif i < 90:
+            vp_rows.append((ts, 96.0, 97.0, 95.0, 96.0, 400.0, 38400.0))
+        else:
+            vp_rows.append((ts, 104.0, 105.0, 103.0, 104.0, 400.0, 41600.0))
+    df_vp = pd.DataFrame(vp_rows, columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"])
+    vp_above = compute_volume_profile(df_vp, close_now=104.8, direction="LONG", bins=50, value_area_pct=70.0)
+    assert 99.4 <= vp_above["poc"] <= 100.6, f"POC off cluster: {vp_above}"
+    assert vp_above["val"] <= vp_above["poc"] <= vp_above["vah"]
+    assert vp_above["price_zone"] == "ABOVE_VAH" and vp_above["dist_to_poc_pct"] < 0 and vp_above["poc_obstacle_ahead"] is False
+    # Price 0.6% below POC heading LONG -> poc_obstacle_ahead MUST be True!
+    vp_obs = compute_volume_profile(df_vp, close_now=vp_above["poc"] * 0.994, direction="LONG", bins=50, value_area_pct=70.0)
+    assert vp_obs["poc_obstacle_ahead"] is True, f"Expected poc_obstacle_ahead=True, got {vp_obs}"
+
+    # 9c. BULL_SFP (sweeps PDL=94.0 with high volume and closes back at 94.6) & BEAR_SFP (sweeps PDH=112.0)
+    df_sfp_bull = df_sess.copy()
+    df_sfp_bull.loc[len(df_sfp_bull) - 1, ["open", "high", "low", "close", "volume"]] = [94.3, 94.8, 93.4, 94.6, 2200.0]
+    sfp_b_long = detect_liquidity_sweep(df_sfp_bull, df_flat, df_flat, sess_l, direction="LONG", rvol_min=1.2)
+    assert sfp_b_long["sweep_type"] == "BULL_SFP" and sfp_b_long["swept_tf"] == "PDL"
+    assert sfp_b_long["with_volume"] is True and sfp_b_long["aligns_with_direction"] is True and sfp_b_long["trap_warning"] is False
+    # Same BULL_SFP evaluated for a SHORT candidate -> trap_warning MUST be True!
+    sfp_b_short = detect_liquidity_sweep(df_sfp_bull, df_flat, df_flat, sess_l, direction="SHORT", rvol_min=1.2)
+    assert sfp_b_short["trap_warning"] is True and sfp_b_short["aligns_with_direction"] is False
+
+    df_sfp_bear = df_sess.copy()
+    df_sfp_bear.loc[len(df_sfp_bear) - 1, ["open", "high", "low", "close", "volume"]] = [111.8, 112.6, 111.4, 111.5, 2400.0]
+    sfp_bear_s = detect_liquidity_sweep(df_sfp_bear, df_flat, df_flat, sess_l, direction="SHORT", rvol_min=1.2)
+    assert sfp_bear_s["sweep_type"] == "BEAR_SFP" and sfp_bear_s["swept_tf"] == "PDH" and sfp_bear_s["aligns_with_direction"] is True
+
+    # 9d. Priority adjustment + combined PNG render with BOTH DIV and ADV lines + POC/PDH/PDL overlays
+    tv_pos = {"liquidity_sweep": sfp_b_long, "volume_profile": vp_above, "session_levels": {**sess_l, "session_obstacle_ahead": False}}
+    tv_neg = {"liquidity_sweep": sfp_b_short, "volume_profile": vp_obs, "session_levels": sess_l}
+    assert compute_tv_advisors_priority_delta(tv_pos) > 0
+    assert compute_tv_advisors_priority_delta(tv_neg) < 0
+
+    adv_banner = format_tv_advisors_banner(tv_pos)
+    assert adv_banner.startswith("ADV: SFP=BULL(PDL) | VP=ABOVE_VAH (POC ") and "| SESS=PDH " in adv_banner, f"Bad ADV banner: {adv_banner}"
+
+    seen_titles2: list[str] = []
+    def _spy_title2(self, label, *a, **kw):
+        seen_titles2.append(str(label))
+        return orig_set_title(self, label, *a, **kw)
+    matplotlib.axes.Axes.set_title = _spy_title2
+    try:
+        b64_both = render_15m_chart_png_b64(
+            "ETHUSDT", "LONG", df_ch,
+            df_ch["close"].ewm(span=20).mean().to_numpy(),
+            df_ch["close"].ewm(span=50).mean().to_numpy(),
+            df_ch["close"].rolling(20, min_periods=1).mean().to_numpy(),
+            {}, {}, sl_pct=1.4, tp1_r=1.8, candles_count=72,
+            div_banner=banner, adv_banner=adv_banner,
+            tv_levels={"poc": 106.0, "pdh": 111.0, "pdl": 102.0},
+        )
+    finally:
+        matplotlib.axes.Axes.set_title = orig_set_title
+    assert b64_both is not None and any(("DIV:" in t and "ADV:" in t) for t in seen_titles2)
+    print(f"[PASS] 9. TV Advisors verified (BULL/BEAR SFP, POC={vp_above['poc']}, PDH/PDL/Asia, PNG DIV+ADV '{adv_banner}')")
+
+    print("\nALL 9 COMPREHENSIVE VERIFICATION CHECKS PASSED!")
 
 
 if __name__ == "__main__":
