@@ -68,6 +68,8 @@
   "min_rvol_s12": 1.2,
   "min_schools_non_s12": 2,
   "min_rvol_non_s12": 1.2,
+  "divergence_enabled": true,
+  "divergence_min_indicators": 2,
   "chart_png_enabled": true,
   "chart_candles_count": 72,
   "ai_provider": "auto",

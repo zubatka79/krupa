@@ -17,6 +17,11 @@ import numpy as np
 import pandas as pd
 
 from ai_trader_v2.chart_renderer import render_15m_chart_png_b64
+from ai_trader_v2.divergences import (
+    analyze_mtf_divergences,
+    compute_divergence_priority_delta,
+    format_divergence_banner,
+)
 from bot.bybit_client import BybitClient
 from bot.indicators import compute_atr, ema
 
@@ -574,6 +579,18 @@ def evaluate_symbol_12_schools(
     if regime == "STRONG_TREND":
         priority += 6.0
 
+    # Multi-indicator divergences (15m, 1H, 4H) — advisory context + priority adjustment only (NEVER hard-blocks!)
+    div_block: Optional[Dict[str, Any]] = None
+    if bool(config.get("divergence_enabled", True)):
+        div_block = analyze_mtf_divergences(
+            df15=df15,
+            df1h=df1h,
+            df4h=df4h,
+            direction=direction,
+            min_indicators=int(config.get("divergence_min_indicators", 2)),
+        )
+        priority += compute_divergence_priority_delta(div_block)
+
     # Structural S/R levels on 1H and 4H
     sr_1h = _find_swing_levels(df1h, lookback=60, price=close_now)
     sr_4h = _find_swing_levels(df4h, lookback=60, price=close_now)
@@ -663,6 +680,7 @@ def evaluate_symbol_12_schools(
         "candles_15m_last20": _fmt_candles(df15, 20, vol_sma20),
         "candles_1h_last12": _fmt_candles(df1h, 12),
         "candles_4h_last8": _fmt_candles(df4h, 8),
+        "divergences": div_block,
         "btc_context": btc_ctx.summary_dict,
     }
 
@@ -680,6 +698,7 @@ def evaluate_symbol_12_schools(
             sl_pct=default_sl_pct,
             tp1_r=rec_tp1_r,
             candles_count=int(config.get("chart_candles_count", 72)),
+            div_banner=format_divergence_banner(div_block) if div_block is not None else None,
         )
 
     return CandidateSetup(

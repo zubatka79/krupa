@@ -35,6 +35,7 @@ def render_15m_chart_png_b64(
     sl_pct: float,
     tp1_r: float,
     candles_count: int = 72,
+    div_banner: Optional[str] = None,
 ) -> Optional[str]:
     """Render compact headless PNG candlestick+volume chart to base64 string (or None on error)."""
     try:
@@ -124,7 +125,10 @@ def render_15m_chart_png_b64(
             ax_p.axhline(tp1_p, color="#00e676", linestyle=":", linewidth=1.0, alpha=0.9)
             ax_p.text(n_bars - 1, tp1_p, f"TP1 {tp1_r:.1f}R ", color="#69f0ae", fontsize=7, va="bottom", ha="right")
 
-        ax_p.set_title(f"{symbol} 15m ({direction}) | Last {n_bars} Closed Bars | Price {cp:.6g}", color=fg, fontsize=10, pad=6)
+        title_main = f"{symbol} 15m ({direction}) | Last {n_bars} Closed Bars | Price {cp:.6g}"
+        if div_banner:
+            title_main = f"{title_main}\n{div_banner}"
+        ax_p.set_title(title_main, color=fg, fontsize=9.5, pad=6)
         ax_p.legend(loc="upper left", fontsize=7.5, facecolor="#161d26", edgecolor="#2e3947", labelcolor=fg, ncol=3)
         ax_p.set_xlim(-1, n_bars + 1)
 

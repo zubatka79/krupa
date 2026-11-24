@@ -25,6 +25,13 @@ sys.path.insert(0, str(ROOT))
 
 from ai_trader_v2.ai_judge import AITradeJudge, get_model_rates_per_m
 from ai_trader_v2.chart_renderer import render_15m_chart_png_b64
+from ai_trader_v2.divergences import (
+    analyze_mtf_divergences,
+    compute_divergence_priority_delta,
+    detect_tf_divergence,
+    find_confirmed_pivots,
+    format_divergence_banner,
+)
 from ai_trader_v2.executor import AITradeExecutor, TelegramNotifier
 from ai_trader_v2.journal import AITradeJournal
 from ai_trader_v2.run_ai_trader import load_config
@@ -61,6 +68,7 @@ def main() -> None:
     assert cfg["be_stage3_close_r"] == 2.3 and cfg["be_stage3_sl_r"] == 0.3
     assert cfg["trailing_atr_mult"] == 4.0
     assert cfg["entry_order_type"] == "limit" and cfg["limit_entry_ttl_minutes"] == 45
+    assert cfg["divergence_enabled"] is True and cfg["divergence_min_indicators"] == 2
     assert "ai_provider" in cfg and "ai_model" in cfg
     print("[PASS] 1. Config validated (Demo, 29 coins, 12 schools, max 8/5, 1H shorts, 3-stage BE, RVOL S12)")
 
@@ -313,7 +321,111 @@ def main() -> None:
     assert render_15m_chart_png_b64("BAD", "LONG", pd.DataFrame(), np.array([]), np.array([]), np.array([]), {}, {}, 1.4, 1.8) is None
     print(f"[PASS] 7. In-memory PNG chart renderer verified ({len(raw_png):,} bytes PNG, safe fallback OK)")
 
-    print("\nALL 7 COMPREHENSIVE VERIFICATION CHECKS PASSED!")
+    # ------------------------------------------------------------------
+    # 8. Multi-Indicator Divergences (Regular, Hidden, Zero-Repaint right=2, DIV Banner on PNG)
+    # ------------------------------------------------------------------
+    def _build_div_df(closes: list[float], vols: list[float], interval_ms: int = 900_000) -> pd.DataFrame:
+        n_c = len(closes)
+        base_ts = 1_760_000_000_000
+        cl_a = np.array(closes, dtype=float)
+        op_a = np.roll(cl_a, 1)
+        op_a[0] = cl_a[0]
+        # Distinct pivot extremes anchored on close so reversal bars never tie with pivot lows/highs
+        hi_a = cl_a + 0.25
+        lo_a = cl_a - 0.25
+        v_a = np.array(vols, dtype=float)
+        return pd.DataFrame({
+            "timestamp": [base_ts + i * interval_ms for i in range(n_c)],
+            "open": op_a, "high": hi_a, "low": lo_a, "close": cl_a,
+            "volume": v_a, "turnover": v_a * cl_a,
+        })
+
+    # 8a. Synthetic REGULAR_BULL: sharp selloff to pivot low p1 (100 -> 82, heavy vol),
+    # strong rebound on huge buying vol (82 -> 98), gentle low-volume drift to slightly lower low p2 (81.0),
+    # followed by 2 closed confirmation bars (right=2)!
+    reg_bull_closes = (
+        [100.0 + 0.1 * i for i in range(25)]      # clean gentle uptrend, no fake flat-plateau pivot high
+        + [97.0, 93.0, 88.0, 84.0, 82.0]          # sharp crash to p1=29 (82.0)
+        + [86.0, 90.0, 94.0, 97.0, 98.0]          # strong high-vol rally
+        + [96.0, 93.5, 91.0, 88.5, 86.0, 83.5, 81.0]  # slower low-vol drift to p2=41 (81.0 < 82.0)
+        + [83.5, 85.5]                            # 2 confirmation bars (right=2) -> n=44
+    )
+    reg_bull_vols = (
+        [1000.0] * 25
+        + [3000.0, 3500.0, 4000.0, 4500.0, 5000.0]
+        + [6000.0, 6500.0, 7000.0, 6500.0, 6000.0]
+        + [700.0, 650.0, 600.0, 600.0, 550.0, 500.0, 500.0]
+        + [2200.0, 2500.0]
+    )
+    df_rb_full = _build_div_df(reg_bull_closes, reg_bull_vols)
+    p2_idx = 41
+    # Zero-repaint check: BEFORE 2 confirmation bars close (at p2 and p2+1), p2 MUST NOT be a confirmed pivot!
+    assert p2_idx not in find_confirmed_pivots(df_rb_full["low"].iloc[: p2_idx + 1].to_numpy(), left=4, right=2, is_high=False)
+    assert p2_idx not in find_confirmed_pivots(df_rb_full["low"].iloc[: p2_idx + 2].to_numpy(), left=4, right=2, is_high=False)
+    assert detect_tf_divergence(df_rb_full.iloc[: p2_idx + 2].reset_index(drop=True), left=4, right=2)["type"] != "REGULAR_BULL"
+
+    # After right=2 bars close -> REGULAR_BULL must trigger with >= 3/4 STRONG and bars_ago == 2!
+    rb_res = detect_tf_divergence(df_rb_full, left=4, right=2, max_bars_ago=8, min_indicators=2)
+    assert rb_res["type"] == "REGULAR_BULL" and rb_res["count"] >= 3 and rb_res["strength"] == "STRONG"
+    assert rb_res["bars_ago"] == 2, f"Expected bars_ago=2, got {rb_res}"
+
+    # 8b. Synthetic HIDDEN_BEAR: downtrend with Lower High (p1=108 -> p2=104), while bounce to p2
+    # is sharper on heavier buying volume so indicators print a Higher High at p2!
+    hid_bear_closes = (
+        [120.0 - 0.5 * i for i in range(25)]            # steady downtrend 120 -> 108
+        + [106.0, 105.0, 105.5, 106.5, 108.0]           # modest bounce to p1=29 (108.0)
+        + [104.0, 100.0, 96.0, 92.0, 90.0]              # selloff to 90.0
+        + [93.0, 96.5, 100.0, 102.5, 104.0]             # sharp bounce to lower high p2=39 (104.0 < 108.0)
+        + [101.0, 99.0]                                  # 2 confirmation bars (right=2)
+    )
+    hid_bear_vols = (
+        [1500.0] * 25
+        + [1200.0, 1200.0, 900.0, 900.0, 900.0]
+        + [1000.0, 1000.0, 1000.0, 1000.0, 1000.0]
+        + [4500.0, 5000.0, 5500.0, 6000.0, 6500.0]
+        + [2000.0, 2200.0]
+    )
+    df_hb = _build_div_df(hid_bear_closes, hid_bear_vols)
+    hb_res = detect_tf_divergence(df_hb, left=4, right=2, max_bars_ago=8, min_indicators=2)
+    assert hb_res["type"] == "HIDDEN_BEAR" and hb_res["count"] >= 2, f"Expected HIDDEN_BEAR, got {hb_res}"
+
+    # 8c. MTF summary flags + priority delta + DIV banner on PNG chart
+    df_flat = _build_div_df([100.0] * 50, [1000.0] * 50)
+    mtf_short = analyze_mtf_divergences(df_hb, df_hb, df_rb_full, direction="SHORT", min_indicators=2)
+    assert mtf_short["summary"]["confirms_15m"] is True
+    assert mtf_short["summary"]["confirms_1h"] is True
+    assert mtf_short["summary"]["opposes_4h"] is True
+    assert mtf_short["summary"]["h4_exhaustion_warning"] is True
+    # Confirming 15m+1H without 4H opposition yields positive bonus; opposing 4H STRONG reduces priority
+    mtf_clean = analyze_mtf_divergences(df_rb_full, df_rb_full, df_flat, direction="LONG", min_indicators=2)
+    assert compute_divergence_priority_delta(mtf_clean) > 0
+    mtf_opposed = analyze_mtf_divergences(df_flat, df_flat, df_rb_full, direction="SHORT", min_indicators=2)
+    assert compute_divergence_priority_delta(mtf_opposed) < 0
+
+    banner = format_divergence_banner(mtf_short)
+    assert banner.startswith("DIV: 15m H_BEAR(") and "4H BULL(" in banner, f"Unexpected banner: {banner}"
+    # Verify chart renders cleanly with DIV banner in header (capture title via matplotlib Axes.set_title spy)
+    import matplotlib.axes
+    seen_titles: list[str] = []
+    orig_set_title = matplotlib.axes.Axes.set_title
+    def _spy_title(self, label, *a, **kw):
+        seen_titles.append(str(label))
+        return orig_set_title(self, label, *a, **kw)
+    matplotlib.axes.Axes.set_title = _spy_title
+    try:
+        b64_div = render_15m_chart_png_b64(
+            "ETHUSDT", "SHORT", df_ch,
+            df_ch["close"].ewm(span=20).mean().to_numpy(),
+            df_ch["close"].ewm(span=50).mean().to_numpy(),
+            df_ch["close"].rolling(20, min_periods=1).mean().to_numpy(),
+            {}, {}, sl_pct=1.4, tp1_r=1.8, candles_count=72, div_banner=banner,
+        )
+    finally:
+        matplotlib.axes.Axes.set_title = orig_set_title
+    assert b64_div is not None and any("DIV:" in t and "H_BEAR" in t for t in seen_titles)
+    print(f"[PASS] 8. Divergences verified (REG_BULL {rb_res['count']}/4, HID_BEAR {hb_res['count']}/4, zero-repaint right=2, PNG '{banner}')")
+
+    print("\nALL 8 COMPREHENSIVE VERIFICATION CHECKS PASSED!")
 
 
 if __name__ == "__main__":
