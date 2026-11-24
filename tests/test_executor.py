@@ -301,6 +301,35 @@ class TestExecutor(unittest.TestCase):
             self.assertTrue(any("would exceed 78.0% of equity" in m for m in cm2.output))
             cl.place_entry_limit_order.assert_not_called()
 
+    def test_single_stage_be1_hides_be2_when_trigger_exceeds_tp(self):
+        now = datetime(2026, 11, 25, 10, 0, tzinfo=timezone.utc)
+        with tempfile.TemporaryDirectory() as tmp:
+            _write_fresh_macro(Path(tmp) / "macro_events.json", now)
+            cl = MagicMock(has_credentials=False)
+            ex, _ = self._build_executor(Path(tmp), cl, dry_run=True)
+            ex.config.update({
+                "tp_pct": 1.4,
+                "smart_be1_trigger_pct": 0.77,
+                "smart_be1_offset_pct": 0.15,
+                "smart_be2_trigger_pct": 99.0,
+                "smart_be2_offset_pct": 0.0,
+            })
+            sent = []
+            ex.notifier = sent.append
+            sig = _make_signal(symbol="HBARUSDT", direction="LONG", entry=0.10)
+            sig.tp_pct = 1.4
+            sig.be1_trigger_pct = 0.77
+            sig.be1_offset_pct = 0.15
+            sig.be2_trigger_pct = 99.0
+            sig.be2_offset_pct = 0.0
+            tid = ex.open_position(sig, current_equity=2000.0, now=now, allow_network_refresh=False)
+            self.assertIsNotNone(tid)
+            tr = ex.get_active_trades()[0]
+            self.assertEqual(float(tr["be2_trigger_price"]), 0.0)
+            self.assertEqual(float(tr["be2_price"]), 0.0)
+            self.assertTrue(sent and "БУ1:" in sent[0])
+            self.assertNotIn("БУ2:", sent[0])
+
 
 if __name__ == "__main__":
     unittest.main()

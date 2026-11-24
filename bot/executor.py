@@ -425,17 +425,21 @@ class TradeExecutor:
         if is_long:
             sl_price = entry_price * (1.0 - sl_frac)
             tp_price = float(signal.tp_price) if signal.tp_price is not None else entry_price * (1.0 + tp_frac)
+            eff_tp_frac = (tp_price - entry_price) / entry_price if entry_price > 0 else tp_frac
+            be2_enabled = (be2_tr_frac > 0.0) and (be2_tr_frac < eff_tp_frac)
             be1_trigger = entry_price * (1.0 + be1_tr_frac)
             be1_price = entry_price * (1.0 + be1_off_frac)
-            be2_trigger = entry_price * (1.0 + be2_tr_frac) if be2_tr_frac > 0 else 0.0
-            be2_price = entry_price * (1.0 + be2_off_frac) if be2_tr_frac > 0 else 0.0
+            be2_trigger = entry_price * (1.0 + be2_tr_frac) if be2_enabled else 0.0
+            be2_price = entry_price * (1.0 + be2_off_frac) if be2_enabled else 0.0
         else:
             sl_price = entry_price * (1.0 + sl_frac)
             tp_price = float(signal.tp_price) if signal.tp_price is not None else entry_price * (1.0 - tp_frac)
+            eff_tp_frac = (entry_price - tp_price) / entry_price if entry_price > 0 else tp_frac
+            be2_enabled = (be2_tr_frac > 0.0) and (be2_tr_frac < eff_tp_frac)
             be1_trigger = entry_price * (1.0 - be1_tr_frac)
             be1_price = entry_price * (1.0 - be1_off_frac)
-            be2_trigger = entry_price * (1.0 - be2_tr_frac) if be2_tr_frac > 0 else 0.0
-            be2_price = entry_price * (1.0 - be2_off_frac) if be2_tr_frac > 0 else 0.0
+            be2_trigger = entry_price * (1.0 - be2_tr_frac) if be2_enabled else 0.0
+            be2_price = entry_price * (1.0 - be2_off_frac) if be2_enabled else 0.0
 
         if spec is not None and spec.tick_size > 0:
             entry_price = round_tick(entry_price, spec.tick_size)
@@ -477,12 +481,17 @@ class TradeExecutor:
             raise
 
         dir_badge = "🟢 LONG" if is_long else "🔴 SHORT"
+        be_line = (
+            f"БУ1: {be1_trigger} -> {be1_price} | БУ2: {be2_trigger} -> {be2_price}"
+            if be2_trigger > 0
+            else f"БУ1: {be1_trigger} -> {be1_price}"
+        )
         self._notify(
             f"⏳ ВЫСТАВЛЕН ЛИМИТНЫЙ ОРДЕР ({exec_mode.upper()}) | {signal.symbol} {dir_badge}\n"
             f"Плечо: {leverage}x Isolated | Маржа: ${margin_usdt:.2f}\n"
             f"Цена входа (Limit): {entry_price} (TTL {ttl_bars} св. / {ttl_min} мин)\n"
             f"Тейк (TP): {tp_price} (+{tp_frac*100:.2f}%) | Стоп (SL): {sl_price} (-{sl_frac*100:.2f}%)\n"
-            f"БУ1: {be1_trigger} -> {be1_price} | БУ2: {be2_trigger} -> {be2_price}\n"
+            f"{be_line}\n"
             f"💰 Баланс: ${current_equity:,.2f}"
         )
         return trade_id
