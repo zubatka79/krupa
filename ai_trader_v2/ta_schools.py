@@ -16,6 +16,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
+from ai_trader_v2.chart_renderer import render_15m_chart_png_b64
 from bot.bybit_client import BybitClient
 from bot.indicators import compute_atr, ema
 
@@ -241,6 +242,7 @@ class CandidateSetup:
     recommended_tp2_r: float
     orderbook: Dict[str, float]
     context_payload: Dict[str, Any] = field(default_factory=dict)
+    chart_png_b64: Optional[str] = None
 
 
 @dataclass
@@ -343,8 +345,10 @@ def evaluate_symbol_12_schools(
     h4_short = (c4h < e50_4h) and (e20_4h < e50_4h)
 
     btc_filter = bool(config.get("btc_filter_enabled", True))
-    allow_long = h1_long and h4_long and (btc_ctx.allow_alt_long if btc_filter else True)
-    allow_short = h1_short and h4_short and (btc_ctx.allow_alt_short if btc_filter else True)
+    long_req_4h = bool(config.get("long_require_4h", True))
+    short_req_4h = bool(config.get("short_require_4h", False))
+    allow_long = h1_long and (h4_long if long_req_4h else True) and (btc_ctx.allow_alt_long if btc_filter else True)
+    allow_short = h1_short and (h4_short if short_req_4h else True) and (btc_ctx.allow_alt_short if btc_filter else True)
     if not allow_long and not allow_short:
         return None
 
@@ -498,11 +502,17 @@ def evaluate_symbol_12_schools(
     direction = "LONG" if len(fired_long) >= len(fired_short) else "SHORT"
     fired = fired_long if direction == "LONG" else fired_short
 
-    # Variant 2 consensus pre-filter: allow S12 Derivatives alone, OR >= min_schools_non_s12 (2+) schools with RVOL >= 1.2
+    # Variant 2 consensus pre-filter + mandatory volume check for S12 too:
+    # - S12_Deriv_OI_Funding requires rvol >= min_rvol_s12 (default 1.2)
+    # - Non-S12 requires >= min_schools_non_s12 (2+) schools AND rvol >= min_rvol_non_s12 (1.2)
+    min_rvol_s12 = float(config.get("min_rvol_s12", 1.2))
     min_schools_non_s12 = int(config.get("min_schools_non_s12", 2))
-    min_rvol = float(config.get("min_rvol_non_s12", 1.2))
-    if "S12_Deriv_OI_Funding" not in fired:
-        if len(fired) < min_schools_non_s12 or rvol < min_rvol:
+    min_rvol_non_s12 = float(config.get("min_rvol_non_s12", 1.2))
+    if "S12_Deriv_OI_Funding" in fired:
+        if rvol < min_rvol_s12:
+            return None
+    else:
+        if len(fired) < min_schools_non_s12 or rvol < min_rvol_non_s12:
             return None
 
     # 4. Mandatory SL corridor check (trading-core.md: [1.2%, 1.6%] and >= 1.1 * ATR(14))
@@ -591,14 +601,14 @@ def evaluate_symbol_12_schools(
         "market_regime": regime,
         "higher_tf": {
             "1H": {
-                "trend": "BULL" if h1_long else "BEAR",
+                "trend": "BULL" if h1_long else ("BEAR" if h1_short else "NEUTRAL"),
                 "close": round(c1h, 6),
                 "ema20": round(e20_1h, 6),
                 "ema50": round(e50_1h, 6),
                 "adx14": round(adx_1h, 1),
             },
             "4H": {
-                "trend": "BULL" if h4_long else "BEAR",
+                "trend": "BULL" if h4_long else ("BEAR" if h4_short else "NEUTRAL"),
                 "close": round(c4h, 6),
                 "ema20": round(e20_4h, 6),
                 "ema50": round(e50_4h, 6),
@@ -641,13 +651,36 @@ def evaluate_symbol_12_schools(
             "recommended_tp1_r": rec_tp1_r,
             "recommended_tp2_r": rec_tp2_r,
             "tp1_close_pct": float(config.get("tp1_close_pct", 55.0)),
-            "be_after_tp1_offset_pct": float(config.get("breakeven_offset_pct", 0.15)),
+            "smart_be_stages": {
+                "stage1_close_r": float(config.get("be_stage1_close_r", 1.3)),
+                "stage1_sl_r": float(config.get("be_stage1_sl_r", -0.5)),
+                "stage2_tp1_sl_r": float(config.get("be_stage2_tp1_sl_r", -0.35)),
+                "stage3_close_r": float(config.get("be_stage3_close_r", 2.3)),
+                "stage3_sl_r": float(config.get("be_stage3_sl_r", 0.3)),
+                "trailing_atr_mult": float(config.get("trailing_atr_mult", 4.0)),
+            },
         },
         "candles_15m_last20": _fmt_candles(df15, 20, vol_sma20),
         "candles_1h_last12": _fmt_candles(df1h, 12),
         "candles_4h_last8": _fmt_candles(df4h, 8),
         "btc_context": btc_ctx.summary_dict,
     }
+
+    chart_b64: Optional[str] = None
+    if bool(config.get("chart_png_enabled", True)):
+        chart_b64 = render_15m_chart_png_b64(
+            symbol=symbol,
+            direction=direction,
+            df15=df15,
+            ema20=e20,
+            ema50=e50,
+            vwap=vwap,
+            sr_1h=sr_1h,
+            sr_4h=sr_4h,
+            sl_pct=default_sl_pct,
+            tp1_r=rec_tp1_r,
+            candles_count=int(config.get("chart_candles_count", 72)),
+        )
 
     return CandidateSetup(
         symbol=symbol,
@@ -669,4 +702,5 @@ def evaluate_symbol_12_schools(
         recommended_tp2_r=rec_tp2_r,
         orderbook=ob,
         context_payload=context_payload,
+        chart_png_b64=chart_b64,
     )

@@ -241,20 +241,27 @@ class AITraderTelegramUI:
         status_lbl = "⏸ НА ПАУЗЕ (новые входы отключены)" if st["global_paused"] else "🟢 АКТИВЕН 24/7"
         paused_coins = st.get("paused_coins") or {}
         extra = f"\n• Монеты на паузе: {', '.join(paused_coins.keys())}" if paused_coins else ""
+        s1_c = float(self.config.get("be_stage1_close_r", 1.3))
+        s1_s = float(self.config.get("be_stage1_sl_r", -0.5))
+        s2_s = float(self.config.get("be_stage2_tp1_sl_r", -0.35))
+        s3_c = float(self.config.get("be_stage3_close_r", 2.3))
+        s3_s = float(self.config.get("be_stage3_sl_r", 0.3))
+        tr_m = float(self.config.get("trailing_atr_mult", 4.0))
         return (
             f"🤖 AI-TRADER v2 — Панель управления\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"• Статус: {status_lbl}\n"
             f"• Биржа / Режим: {mode_lbl}\n"
-            f"• AI-Судья: {self.judge.active_provider_label}\n"
+            f"• AI-Судья: {self.judge.active_provider_label}"
+            f"{' · 🖼 PNG-график ВКЛ' if self.config.get('chart_png_enabled', True) else ''}\n"
             f"• Вселенная: {len(self.config['symbols'])} ликвидных монет · 12 школ ТА\n"
-            f"• ТФ: 15m (фильтры 1H + 4H + BTC) · Консенсус: S12 или 2+ школы (RVOL >= {self.config.get('min_rvol_non_s12', 1.2)})\n"
+            f"• ТФ 15m: LONG (1H+4H) | SHORT (1H, 4H контекст) + BTC · S12 (RVOL>={self.config.get('min_rvol_s12', 1.2)}) или 2+ школы (RVOL>={self.config.get('min_rvol_non_s12', 1.2)})\n"
             f"• Риск: {self.config['margin_pct_per_trade']:.0f}% × {self.config['leverage']}x | "
             f"Слоты: {self.config['max_open_positions']} (в 1 сторону: {self.config['max_same_direction']})\n"
-            f"• SL: {self.config['sl_min_pct']}–{self.config['sl_max_pct']}% | TP1 55% → БУ +{self.config['breakeven_offset_pct']}% | "
-            f"Дневной стоп: -{self.config['daily_loss_limit_pct']}%"
+            f"• SL: {self.config['sl_min_pct']}–{self.config['sl_max_pct']}% | Дневной стоп: -{self.config['daily_loss_limit_pct']}%\n"
+            f"• Умный БУ (3 ступени): 15m>={s1_c}R→{s1_s}R | TP1(55%)→{s2_s}R | 15m>={s3_c}R→+{s3_s}R+{tr_m}×ATR"
             f"{extra}\n\n"
-            f"Выбери раздел кнопкой ниже или напиши команду текстом (например: «пауза ETH 12ч» или любой вопрос к Claude):"
+            f"Выбери раздел кнопкой ниже или напиши команду текстом (например: «пауза ETH 12ч» или любой вопрос к AI):"
         )
 
     def build_positions_text(self) -> str:
@@ -276,9 +283,10 @@ class AITraderTelegramUI:
         active = self.journal.get_active_trades()
         tickers = self.executor._safe_get_tickers()
         unr = self.executor.compute_unrealized_pnl(active, tickers)
-        daily = self.journal.ensure_daily_row(eq + unr)
-        start_eq = float(daily.get("start_equity") or eq or 1.0)
-        day_chg_pct = ((eq + unr - start_eq) / start_eq) * 100.0 if start_eq > 0 else 0.0
+        total_eq = (eq + unr) if self.executor.paper_mode else eq
+        daily = self.journal.ensure_daily_row(total_eq)
+        start_eq = float(daily.get("start_equity") or total_eq or 1.0)
+        day_chg_pct = ((total_eq - start_eq) / start_eq) * 100.0 if start_eq > 0 else 0.0
         longs = sum(1 for t in active if t["direction"] == "LONG")
         shorts = sum(1 for t in active if t["direction"] == "SHORT")
 
@@ -417,10 +425,12 @@ class AITraderTelegramUI:
         return (
             f"💳 БЮДЖЕТ AI И ПАРАМЕТРЫ ДВИЖКА\n"
             f"• Провайдер: {self.judge.active_provider_label}\n"
+            f"• Выбор в конфиге: ai_provider={self.config.get('ai_provider', 'auto')} | ai_model={self.config.get('ai_model') or '(из .env/дефолт)'}\n"
             f"• Расход за {b['month']}: ${b['spent_usd']:.4f} из ${b['limit_usd']:.2f} "
             f"(осталось ${b['remaining_usd']:.2f})\n"
-            f"• Вызовов AI: {b['requests']}\n"
-            f"• Режим отбора: Вариант 2 (S12 или {self.config.get('min_schools_non_s12', 2)}+ школы & RVOL >= {self.config.get('min_rvol_non_s12', 1.2)})\n"
+            f"• Вызовов AI: {b['requests']} | Токены: {b.get('input_tokens', 0):,} in / {b.get('output_tokens', 0):,} out\n"
+            f"• PNG-график свечей для AI: {'ВКЛ 🖼' if self.config.get('chart_png_enabled', True) else 'ВЫКЛ'}\n"
+            f"• Отбор (Вариант 2): S12 (RVOL>={self.config.get('min_rvol_s12', 1.2)}) или {self.config.get('min_schools_non_s12', 2)}+ школы (RVOL>={self.config.get('min_rvol_non_s12', 1.2)})\n"
             f"• Мин. уверенность AI: {self.config.get('min_ai_confidence', 72)}/100\n"
             f"• Скипы AI в Telegram: {'ВКЛ' if st.get('telegram_send_skips') else 'ВЫКЛ'}"
         )

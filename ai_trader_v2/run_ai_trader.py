@@ -290,7 +290,11 @@ def main() -> None:
     logger = setup_logging()
     config = load_config()
     journal = AITradeJournal()
-    judge = AITradeJudge(monthly_limit_usd=float(config.get("ai_monthly_limit_usd", 50.0)))
+    judge = AITradeJudge(
+        monthly_limit_usd=float(config.get("ai_monthly_limit_usd", 50.0)),
+        provider=str(config.get("ai_provider", "auto")),
+        model=str(config.get("ai_model", "")),
+    )
 
     if args.status:
         print_status(journal, judge, config)

@@ -1,10 +1,11 @@
 """
 Autonomous AI Trade Judge (`ai_trader_v2/ai_judge.py`):
-- Reads multi-TF candle picture (15m / 1H / 4H / BTC), all fired TA schools (out of 12),
-  OI/Funding derivatives, orderbook depth/imbalance, S/R obstacles, and open portfolio state.
-- Outputs strict JSON verdict (ENTER / SKIP + confidence + structural SL/TP + Russian rationale).
-- Enforces hard Python safety guardrails (SL in [1.2%, 1.6%] >= 1.1*ATR, risk <= 2.5%, R:R bounds)
-  and monthly USD API budget cap (`ai_trader_v2/data/ai_usage.json`).
+- Reads multi-TF candle picture (15m / 1H / 4H / BTC) + attached in-memory PNG candlestick chart,
+  all fired TA schools (out of 12), OI/Funding derivatives, orderbook depth/imbalance, S/R obstacles,
+  and open portfolio state.
+- Supports configurable provider selection ("anthropic" | "gemini" | "openai" | "auto") and explicit
+  model override from `config_ai_trader.json` without editing `.env`.
+- Accurate per-model USD cost tracking in `data/ai_trader_v2/ai_usage.json` + hard Python guardrails.
 """
 
 from __future__ import annotations
@@ -16,7 +17,7 @@ import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
@@ -37,27 +38,54 @@ def redact_secrets(text: Any) -> str:
     return _SECRET_RE.sub("[REDACTED]", str(text))
 
 
-TRADER_SYSTEM_PROMPT = """Ты — старший риск-аналитик и дискреционный трейдер по криптофьючерсам Bybit USDT Perpetual (таймфрейм 15M со старшими фильтрами 1H и 4H, плечо 10x, маржа 10% от депозита).
+def get_model_rates_per_m(provider: str, model: str) -> Tuple[float, float]:
+    """Return accurate (input_usd_per_1M, output_usd_per_1M) pricing for the active model."""
+    p = provider.lower().strip()
+    m = model.lower().strip()
+    if p == "anthropic":
+        if "opus" in m:
+            # Opus 4.5/5 tier ($5/$25); legacy Opus 4/4.1 ($15/$75)
+            if any(k in m for k in ("opus-4-1", "opus-4-2025", "opus-3")):
+                return 15.0, 75.0
+            return 5.0, 25.0
+        if "haiku" in m:
+            return 0.80, 4.0
+        return 3.0, 15.0  # Sonnet default
+    if p == "gemini":
+        if "flash-lite" in m:
+            return 0.075, 0.30
+        if "pro" in m:
+            return 1.25, 10.0
+        return 0.15, 0.60  # Gemini Flash default
+    # OpenAI-compatible
+    if "mini" in m or "nano" in m:
+        return 0.15, 0.60
+    if "gpt-4o" in m or "gpt-4.1" in m:
+        return 2.50, 10.0
+    return 1.0, 4.0
 
-Твоя ЕДИНСТВЕННАЯ задача — изучить ВСЮ картину свечей (последние 20 свечей 15M, 12 свечей 1H, 8 свечей 4H, свечи BTCUSDT), сработавшие школы ТА (из 12), деривативы (OI, Funding Rate), стакан, ближайшие уровни поддержки/сопротивления 1H/4H и открытые позиции в портфеле — и решить:
+
+TRADER_SYSTEM_PROMPT = """Ты — старший риск-аналитик и дискреционный трейдер по криптофьючерсам Bybit USDT Perpetual (таймфрейм 15M, плечо 10x, маржа 10% от депозита, до 8 позиций / до 5 в одну сторону).
+
+Твоя ЕДИНСТВЕННАЯ задача — изучить приложенный PNG-график 15M (если передан) и ВСЮ картину свечей в JSON (последние 20 свечей 15M, 12 свечей 1H, 8 свечей 4H, свечи BTCUSDT), сработавшие школы ТА (из 12), деривативы (OI, Funding Rate), стакан, ближайшие уровни 1H/4H и открытые позиции — и решить:
 ВХОДИТЬ (ENTER) или ПРОПУСТИТЬ (SKIP).
 
 ПРАВИЛА ОТБОРА (СТРОГО):
 1. Защита капитала важнее количества сделок. На 10x плече 1 плохая сделка стоит -1.5% депозита. Лучше отклонить 60% слабых сигналов и пропустить только чистые сетапы.
-2. ВСЕГДА проверяй картину свечей:
-   - ОТКЛОНЯЙ (SKIP), если вход идёт прямо в сильное сопротивление (для LONG) или поддержку (для SHORT) на 1H/4H и запас хода меньше 1.5R (`nearest_obstacle_in_R < 1.5`).
-   - ОТКЛОНЯЙ (SKIP), если последняя свеча 15M — это аномальный вертикальный выстрел (перекупленный/перепроданный хвост или тело > 2.2 ATR) без отката: входить на самом хае/лое нельзя.
-   - ОТКЛОНЯЙ (SKIP), если на свечах 15M видно серию длинных теней против направления входа (отторжение уровня, shooting_pin против LONG / hammer_pin против SHORT).
-   - ОТКЛОНЯЙ (SKIP), если BTC прямо сейчас рисует сильные разворотные свечи против направления нашей сделки.
-   - ОТКЛОНЯЙ (SKIP), если в портфеле уже открыто 2–3 сильно коррелированных альта в ту же сторону и новый сигнал слабый.
+2. ВСЕГДА проверяй визуальную картину графика и свечей:
+   - Для LONG требуется подтверждение 1H + 4H; для SHORT допускаются шорты по слому 1H (даже если 4H ещё BULL/NEUTRAL) — внимательно оценивай контекст 4H, чтобы не шортить прямо в мощную поддержку 4H!
+   - ОТКЛОНЯЙ (SKIP), если вход идёт прямо в сильное сопротивление (LONG) или поддержку (SHORT) на 1H/4H и запас хода меньше 1.5R (`nearest_obstacle_in_R < 1.5`).
+   - ОТКЛОНЯЙ (SKIP), если последняя свеча 15M — аномальный вертикальный выстрел (тело > 2.2 ATR) без отката: входить на самом экстремуме нельзя.
+   - ОТКЛОНЯЙ (SKIP), если на графике 15M видна серия длинных теней против входа (отторжение уровня, shooting_pin против LONG / hammer_pin против SHORT).
+   - ОТКЛОНЯЙ (SKIP), если BTC прямо сейчас рисует сильные разворотные свечи против нашей сделки.
+   - ОТКЛОНЯЙ (SKIP), если в портфеле уже открыто 3–4 сильно коррелированных альта в ту же сторону и новый сигнал слабый.
 3. ПРИОРИТЕТНЫЕ СЕТАПЫ (высокий шанс на ENTER):
-   - Сработала школа `S12_Deriv_OI_Funding` (рост OI + перекос Funding в ловушке толпы + пробой по тренду 1H/4H) при чистой структуре свечей.
-   - Совпадение 2+ независимых школ ТА (`confluence_count >= 2`) + чистый объём (`rvol >= 1.3`) + тренд 1H/4H (`STRONG_TREND` или `SQUEEZE_BREAKOUT`) + свободное пространство до уровня `>= 2.0R`.
-   - Один сильный сигнал из трендовых школ (`S07_Ichimoku_Kumo`, `S06_TTM_Squeeze`, `S05_RS_BTC_Breakout`, `S04_Donchian_ADX`, `S09_Trend_Pullback_RSI`, `S11_VWAP_Reclaim`), если свечная формация 15M/1H/4H идеальна (чистый ретест/поджатие, сильное закрытие без встречного хвоста, поддержка BTC).
-4. ПОСТАНОВКА SL и TP:
-   - Выбирай `sl_pct` строго внутри `allowed_sl_corridor_pct` (1.2%–1.6%) и не ниже `atr_floor_sl_pct`, опираясь на структурные кандидаты (`swing_10`, `kijun`, `supertrend`).
-   - Ставь `tp1_r` в диапазоне `1.5–2.2` (обычно `1.8`, чуть перед ближайшим уровнем 1H, если уровень на `1.6R–2.1R`). После TP1 (55% позиции) бот автоматически переведёт стоп в безубыток `+0.15%`.
-   - Ставь `tp2_r` в диапазоне `2.6–4.5` (в сильном тренде `3.5–4.0`, в умеренном `2.8–3.2`), либо включи `use_trailing_after_tp1: true` для трендовых пробоев.
+   - Сработала `S12_Deriv_OI_Funding` с подтверждённым объёмом (`rvol >= 1.2`) при чистой структуре свечей.
+   - Совпадение 2+ независимых школ ТА (`confluence_count >= 2`) + объём (`rvol >= 1.2`) + свободный запас хода `>= 2.0R`.
+4. ПОСТАНОВКА SL, TP и 3-СТУПЕНЧАТОЕ СОПРОВОЖДЕНИЕ:
+   - Выбирай `sl_pct` строго внутри `allowed_sl_corridor_pct` (1.2%–1.6%) и не ниже `atr_floor_sl_pct`.
+   - Ставь `tp1_r` в диапазоне `1.5–2.2` (обычно `1.8`). Умное сопровождение работает в 3 ступени: закрытие 15M >= +1.3R -> SL -0.5R; после TP1 (55%) -> SL остатка в буфер -0.35R (даём дышать на ретесте); закрытие 15M >= +2.3R -> SL в плюс +0.3R + ATR-трейлинг.
+   - Ставь `tp2_r` в диапазоне `2.6–4.5`, либо включи `use_trailing_after_tp1: true` для трендовых пробоев.
 
 ФОРМАТ ОТВЕТА — ТОЛЬКО ВАЛИДНЫЙ JSON БЕЗ ЛИШНЕГО ТЕКСТА:
 {
@@ -68,7 +96,7 @@ TRADER_SYSTEM_PROMPT = """Ты — старший риск-аналитик и �
   "tp1_r": число от 1.5 до 2.5,
   "tp2_r": число от 2.5 до 5.0,
   "use_trailing_after_tp1": true или false,
-  "reason_ru": "Краткий разбор на русском (макс 2 предложения, до 260 символов: свечи 15M/1H/4H, уровни, BTC, OI/Funding и итог)",
+  "reason_ru": "Краткий разбор на русском (макс 2 предложения, до 260 символов: график/свечи 15M/1H/4H, уровни, BTC, OI/Funding и итог)",
   "risk_warnings": ["короткий риск 1 (до 60 символов)", "короткий риск 2"]
 }
 """
@@ -91,10 +119,18 @@ class AIDecision:
 
 
 class AITradeJudge:
-    """Multi-provider LLM trade judge (Anthropic Claude -> Google Gemini -> OpenAI) with budget cap."""
+    """Multi-provider multimodal LLM trade judge with explicit config selection & accurate USD billing."""
 
-    def __init__(self, monthly_limit_usd: float = 50.0) -> None:
+    def __init__(
+        self,
+        monthly_limit_usd: float = 50.0,
+        provider: str = "auto",
+        model: str = "",
+    ) -> None:
         self.monthly_limit_usd = monthly_limit_usd
+        self.config_provider = (provider or "auto").lower().strip()
+        self.config_model = (model or "").strip()
+
         self.anthropic_key = ""
         self.anthropic_model = "claude-sonnet-4-20250514"
         self.gemini_key = ""
@@ -107,14 +143,19 @@ class AITradeJudge:
     def reload_env(self) -> None:
         load_dotenv(override=True)
         self.anthropic_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
-        # Allow override via AI_TRADER_MODEL, else fall back to ANTHROPIC_MODEL or Sonnet
-        env_model = os.getenv("AI_TRADER_ANTHROPIC_MODEL", "").strip() or os.getenv("ANTHROPIC_MODEL", "").strip()
-        if env_model:
-            self.anthropic_model = env_model
+        env_ant_model = os.getenv("AI_TRADER_ANTHROPIC_MODEL", "").strip() or os.getenv("ANTHROPIC_MODEL", "").strip()
+        if env_ant_model:
+            self.anthropic_model = env_ant_model
+        if self.config_provider == "anthropic" and self.config_model:
+            self.anthropic_model = self.config_model
+
         self.gemini_key = os.getenv("GEMINI_API_KEY", "").strip()
         g_model = os.getenv("GEMINI_MODEL", "").strip()
         if g_model:
             self.gemini_model = g_model
+        if self.config_provider == "gemini" and self.config_model:
+            self.gemini_model = self.config_model
+
         self.openai_key = os.getenv("AI_API_KEY", "").strip()
         o_base = os.getenv("AI_API_BASE_URL", "").strip()
         if o_base:
@@ -122,6 +163,9 @@ class AITradeJudge:
         o_model = os.getenv("AI_MODEL", "").strip()
         if o_model:
             self.openai_model = o_model
+        if self.config_provider == "openai" and self.config_model:
+            self.openai_model = self.config_model
+
         env_limit = os.getenv("AI_MONTHLY_LIMIT_USD", "").strip()
         if env_limit:
             try:
@@ -129,21 +173,34 @@ class AITradeJudge:
             except ValueError:
                 pass
 
+    def _has_key(self, provider: str) -> bool:
+        k = {"anthropic": self.anthropic_key, "gemini": self.gemini_key, "openai": self.openai_key}.get(provider, "")
+        return bool(k and "your_" not in k.lower())
+
+    def _provider_order(self) -> List[str]:
+        all_p = ["anthropic", "gemini", "openai"]
+        if self.config_provider in all_p:
+            return [self.config_provider] + [p for p in all_p if p != self.config_provider]
+        return all_p
+
+    def _model_for(self, provider: str) -> str:
+        if provider == "anthropic":
+            return self.anthropic_model
+        if provider == "gemini":
+            return self.gemini_model
+        return self.openai_model
+
     @property
     def is_configured(self) -> bool:
-        for k in (self.anthropic_key, self.gemini_key, self.openai_key):
-            if k and "your_" not in k.lower():
-                return True
-        return False
+        return any(self._has_key(p) for p in self._provider_order())
 
     @property
     def active_provider_label(self) -> str:
-        if self.anthropic_key and "your_" not in self.anthropic_key.lower():
-            return f"Anthropic ({self.anthropic_model})"
-        if self.gemini_key and "your_" not in self.gemini_key.lower():
-            return f"Gemini ({self.gemini_model})"
-        if self.openai_key and "your_" not in self.openai_key.lower():
-            return f"OpenAI ({self.openai_model})"
+        for p in self._provider_order():
+            if self._has_key(p):
+                m = self._model_for(p)
+                in_r, out_r = get_model_rates_per_m(p, m)
+                return f"{p.capitalize()} ({m}, ${in_r:g}/${out_r:g} per 1M)"
         return "NONE"
 
     def _load_usage(self) -> Dict[str, Any]:
@@ -157,13 +214,15 @@ class AITradeJudge:
                 pass
         return {"month": month, "spent_usd": 0.0, "requests": 0, "input_tokens": 0, "output_tokens": 0}
 
-    def _record_usage(self, in_tok: int, out_tok: int, in_rate: float, out_rate: float) -> None:
+    def _record_usage(self, provider: str, model: str, in_tok: int, out_tok: int) -> None:
+        in_rate, out_rate = get_model_rates_per_m(provider, model)
         usage = self._load_usage()
         cost = (in_tok / 1_000_000.0) * in_rate + (out_tok / 1_000_000.0) * out_rate
         usage["input_tokens"] = int(usage.get("input_tokens", 0)) + in_tok
         usage["output_tokens"] = int(usage.get("output_tokens", 0)) + out_tok
         usage["requests"] = int(usage.get("requests", 0)) + 1
         usage["spent_usd"] = round(float(usage.get("spent_usd", 0.0)) + cost, 6)
+        usage["last_provider"] = f"{provider}:{model}"
         AI_USAGE_PATH.parent.mkdir(parents=True, exist_ok=True)
         AI_USAGE_PATH.write_text(json.dumps(usage, indent=2, ensure_ascii=False), encoding="utf-8")
 
@@ -176,13 +235,117 @@ class AITradeJudge:
             "limit_usd": self.monthly_limit_usd,
             "remaining_usd": round(max(0.0, self.monthly_limit_usd - spent), 4),
             "requests": int(u.get("requests", 0)),
+            "input_tokens": int(u.get("input_tokens", 0)),
+            "output_tokens": int(u.get("output_tokens", 0)),
         }
+
+    def _call_anthropic(self, sys_txt: str, user_text: str, max_tokens: int, image_png_b64: Optional[str]) -> Optional[str]:
+        content: Any
+        if image_png_b64:
+            content = [
+                {
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/png", "data": image_png_b64},
+                },
+                {"type": "text", "text": user_text},
+            ]
+        else:
+            content = user_text
+
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": self.anthropic_key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": self.anthropic_model,
+                "max_tokens": max_tokens,
+                "system": sys_txt,
+                "messages": [{"role": "user", "content": content}],
+            },
+            timeout=(10, 45),
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            u = data.get("usage", {})
+            self._record_usage("anthropic", self.anthropic_model, int(u.get("input_tokens", 0)), int(u.get("output_tokens", 0)))
+            blocks = data.get("content", [])
+            txt = "\n".join(str(b.get("text", "")) for b in blocks if b.get("type") == "text").strip()
+            return txt or None
+        logger.warning("Anthropic error %s: %s", resp.status_code, redact_secrets(resp.text[:200]))
+        return None
+
+    def _call_gemini(self, sys_txt: str, user_text: str, max_tokens: int, image_png_b64: Optional[str]) -> Optional[str]:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.gemini_model}:generateContent"
+        parts: List[Dict[str, Any]] = []
+        if image_png_b64:
+            parts.append({"inline_data": {"mime_type": "image/png", "data": image_png_b64}})
+        parts.append({"text": user_text})
+
+        resp = requests.post(
+            url,
+            headers={"x-goog-api-key": self.gemini_key, "Content-Type": "application/json"},
+            json={
+                "system_instruction": {"parts": [{"text": sys_txt}]},
+                "contents": [{"role": "user", "parts": parts}],
+                "generationConfig": {"temperature": 0.15, "maxOutputTokens": max_tokens},
+            },
+            timeout=(10, 45),
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            um = data.get("usageMetadata", {})
+            self._record_usage(
+                "gemini", self.gemini_model, int(um.get("promptTokenCount", 0)), int(um.get("candidatesTokenCount", 0))
+            )
+            cands = data.get("candidates", [])
+            if cands:
+                out_parts = cands[0].get("content", {}).get("parts", [])
+                txt = "\n".join(str(p.get("text", "")) for p in out_parts if "text" in p).strip()
+                return txt or None
+        logger.warning("Gemini error %s: %s", resp.status_code, redact_secrets(resp.text[:200]))
+        return None
+
+    def _call_openai(self, sys_txt: str, user_text: str, max_tokens: int, image_png_b64: Optional[str]) -> Optional[str]:
+        if image_png_b64:
+            user_content: Any = [
+                {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{image_png_b64}"}},
+                {"type": "text", "text": user_text},
+            ]
+        else:
+            user_content = user_text
+
+        resp = requests.post(
+            f"{self.openai_base}/chat/completions",
+            headers={"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"},
+            json={
+                "model": self.openai_model,
+                "temperature": 0.15,
+                "max_tokens": max_tokens,
+                "messages": [
+                    {"role": "system", "content": sys_txt},
+                    {"role": "user", "content": user_content},
+                ],
+            },
+            timeout=(10, 45),
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            u = data.get("usage", {})
+            self._record_usage("openai", self.openai_model, int(u.get("prompt_tokens", 0)), int(u.get("completion_tokens", 0)))
+            txt = data["choices"][0]["message"]["content"].strip()
+            return txt or None
+        logger.warning("OpenAI error %s: %s", resp.status_code, redact_secrets(resp.text[:200]))
+        return None
 
     def _call_llm(
         self,
         user_text: str,
         max_tokens: int = 1600,
         system_prompt: Optional[str] = None,
+        image_png_b64: Optional[str] = None,
     ) -> tuple[Optional[str], str]:
         self.reload_env()
         if not self.is_configured:
@@ -193,98 +356,34 @@ class AITradeJudge:
             return None, "budget_exceeded"
         sys_txt = system_prompt or TRADER_SYSTEM_PROMPT
 
-        # 1. Anthropic Claude
-        if self.anthropic_key and "your_" not in self.anthropic_key.lower():
+        dispatch = {
+            "anthropic": self._call_anthropic,
+            "gemini": self._call_gemini,
+            "openai": self._call_openai,
+        }
+        for prov in self._provider_order():
+            if not self._has_key(prov):
+                continue
+            fn = dispatch[prov]
+            model_name = self._model_for(prov)
             try:
-                resp = requests.post(
-                    "https://api.anthropic.com/v1/messages",
-                    headers={
-                        "x-api-key": self.anthropic_key,
-                        "anthropic-version": "2023-06-01",
-                        "content-type": "application/json",
-                    },
-                    json={
-                        "model": self.anthropic_model,
-                        "max_tokens": max_tokens,
-                        "system": sys_txt,
-                        "messages": [{"role": "user", "content": user_text}],
-                    },
-                    timeout=(10, 45),
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    u = data.get("usage", {})
-                    self._record_usage(int(u.get("input_tokens", 0)), int(u.get("output_tokens", 0)), 3.0, 15.0)
-                    blocks = data.get("content", [])
-                    txt = "\n".join(str(b.get("text", "")) for b in blocks if b.get("type") == "text").strip()
-                    if txt:
-                        return txt, f"anthropic:{self.anthropic_model}"
-                logger.warning("Anthropic error %s: %s", resp.status_code, redact_secrets(resp.text[:200]))
+                txt = fn(sys_txt, user_text, max_tokens, image_png_b64)
+                if txt:
+                    return txt, f"{prov}:{model_name}"
+                # Safe fallback: if multimodal PNG call failed, retry text-only once
+                if image_png_b64:
+                    logger.info("Retrying %s text-only fallback without PNG chart.", prov)
+                    txt2 = fn(sys_txt, user_text, max_tokens, None)
+                    if txt2:
+                        return txt2, f"{prov}:{model_name}"
             except Exception as exc:
-                logger.warning("Anthropic request failed: %s", redact_secrets(exc))
-
-        # 2. Google Gemini
-        if self.gemini_key and "your_" not in self.gemini_key.lower():
-            try:
-                url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.gemini_model}:generateContent"
-                resp = requests.post(
-                    url,
-                    headers={"x-goog-api-key": self.gemini_key, "Content-Type": "application/json"},
-                    json={
-                        "system_instruction": {"parts": [{"text": sys_txt}]},
-                        "contents": [{"role": "user", "parts": [{"text": user_text}]}],
-                        "generationConfig": {"temperature": 0.15, "maxOutputTokens": max_tokens},
-                    },
-                    timeout=(10, 45),
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    um = data.get("usageMetadata", {})
-                    self._record_usage(int(um.get("promptTokenCount", 0)), int(um.get("candidatesTokenCount", 0)), 0.15, 0.60)
-                    cands = data.get("candidates", [])
-                    if cands:
-                        parts = cands[0].get("content", {}).get("parts", [])
-                        txt = "\n".join(str(p.get("text", "")) for p in parts if "text" in p).strip()
-                        if txt:
-                            return txt, f"gemini:{self.gemini_model}"
-                logger.warning("Gemini error %s: %s", resp.status_code, redact_secrets(resp.text[:200]))
-            except Exception as exc:
-                logger.warning("Gemini request failed: %s", redact_secrets(exc))
-
-        # 3. OpenAI-compatible
-        if self.openai_key and "your_" not in self.openai_key.lower():
-            try:
-                resp = requests.post(
-                    f"{self.openai_base}/chat/completions",
-                    headers={"Authorization": f"Bearer {self.openai_key}", "Content-Type": "application/json"},
-                    json={
-                        "model": self.openai_model,
-                        "temperature": 0.15,
-                        "max_tokens": max_tokens,
-                        "messages": [
-                            {"role": "system", "content": sys_txt},
-                            {"role": "user", "content": user_text},
-                        ],
-                    },
-                    timeout=(10, 45),
-                )
-                if resp.status_code == 200:
-                    data = resp.json()
-                    u = data.get("usage", {})
-                    self._record_usage(int(u.get("prompt_tokens", 0)), int(u.get("completion_tokens", 0)), 0.5, 1.5)
-                    txt = data["choices"][0]["message"]["content"].strip()
-                    if txt:
-                        return txt, f"openai:{self.openai_model}"
-                logger.warning("OpenAI error %s: %s", resp.status_code, redact_secrets(resp.text[:200]))
-            except Exception as exc:
-                logger.warning("OpenAI request failed: %s", redact_secrets(exc))
+                logger.warning("%s request failed: %s", prov.capitalize(), redact_secrets(exc))
 
         return None, "failed"
 
     @staticmethod
     def _extract_json(raw_text: str) -> Optional[Dict[str, Any]]:
         txt = raw_text.strip()
-        # Strip markdown fences if present
         m = re.search(r"\{.*\}", txt, re.DOTALL)
         if not m:
             return None
@@ -300,19 +399,21 @@ class AITradeJudge:
         portfolio_state: Dict[str, Any],
         config: Dict[str, Any],
     ) -> AIDecision:
-        """Send full candle + TA context to AI Judge and enforce hard Python guardrails."""
+        """Send full candle + PNG chart + TA context to AI Judge and enforce hard Python guardrails."""
         payload = {
             "setup": candidate.context_payload,
             "portfolio": portfolio_state,
         }
+        img_note = "Приложен PNG-график последних закрытых свечей 15M (EMA20/50, VWAP24h, уровни 1H/4H, объём).\n" if candidate.chart_png_b64 else ""
         prompt = (
             f"Оцени кандидата {candidate.symbol} ({candidate.direction}) на закрытой свече 15M.\n"
+            f"{img_note}"
             f"Сработавшие школы ({len(candidate.fired_schools)}): {', '.join(candidate.fired_schools)}.\n"
             f"Верни ТОЛЬКО строгий JSON по заданной схеме.\n\n"
             f"{json.dumps(payload, ensure_ascii=False)}"
         )
 
-        raw_txt, provider = self._call_llm(prompt)
+        raw_txt, provider = self._call_llm(prompt, image_png_b64=candidate.chart_png_b64)
         if not raw_txt:
             return AIDecision(
                 decision="SKIP",

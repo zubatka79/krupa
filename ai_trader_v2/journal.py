@@ -66,6 +66,7 @@ class AITradeJournal:
                     tp1_price REAL NOT NULL,
                     tp2_price REAL NOT NULL,
                     be_price REAL NOT NULL,
+                    be_stage INTEGER DEFAULT 0,
                     use_trailing INTEGER DEFAULT 0,
                     peak_price REAL NOT NULL,
                     qty REAL NOT NULL,
@@ -93,6 +94,10 @@ class AITradeJournal:
                 )
                 """
             )
+            # Safe schema migration for existing DBs on persistent Docker volumes
+            cols = {str(r["name"]) for r in conn.execute("PRAGMA table_info(trades)").fetchall()}
+            if "be_stage" not in cols:
+                conn.execute("ALTER TABLE trades ADD COLUMN be_stage INTEGER DEFAULT 0")
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS ai_decisions (

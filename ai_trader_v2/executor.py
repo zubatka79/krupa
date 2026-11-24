@@ -1,12 +1,12 @@
 """
 Dual-Mode Trade Executor (`ai_trader_v2/executor.py`):
-  - Paper Mode (real-time live Bybit candles + exact fee/slippage/TP1+BE+TP2 simulation + Telegram alerts)
-  - Testnet / Demo Mode (real Bybit v5 API orders with Isolated Margin, 10x leverage, atomic server-side SL,
-    reduce-only TP1 55% + TP2 45%, automatic server-side SL move to BE +0.15% after TP1 fill, and optional trailing).
-  - Hard safety rules from trading-core.md:
-      * Daily -6.0% UTC drawdown hard stop (realized + unrealized)
-      * Mandatory server-side SL inside [1.2%, 1.6%] (>= 1.1 * ATR)
-      * Max 6 open positions, max 4 in same direction
+  - Paper Mode (real-time live Bybit candles + exact fee/slippage/3-stage Smart BE + ATR trailing)
+  - Demo / Testnet Mode (real Bybit v5 API orders: Isolated Margin, 10x leverage, passive GTC limit
+    entry with atomic server-side SL in [1.2%, 1.6%], 45m TTL, partial-fill remainder cancellation,
+    reduce-only TP1 55% + TP2 45%, 3-Stage Smart Break-Even, and live ATR(14) trailing stop).
+  - Hard safety controls:
+      * Daily -6.0% UTC drawdown hard stop (no double uPnL counting on Bybit UTA Demo/Testnet!)
+      * Max 8 open positions, max 5 in same direction (from config_ai_trader.json)
       * 10% margin x 10x leverage, risk <= 2.5% per trade
 """
 
@@ -15,6 +15,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
@@ -22,9 +23,10 @@ import requests
 from dotenv import load_dotenv
 
 from ai_trader_v2.ai_judge import AIDecision, redact_secrets
-from ai_trader_v2.journal import AITradeJournal, utc_now_iso, utc_today_str
+from ai_trader_v2.journal import AITradeJournal, utc_now_iso
 from ai_trader_v2.ta_schools import CandidateSetup
 from bot.bybit_client import BybitClient, InstrumentSpec, round_step_down, round_tick
+from bot.indicators import compute_atr
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +73,8 @@ class AITradeExecutor:
         self.notifier = notifier or TelegramNotifier(enabled=bool(config.get("telegram_enabled", True)))
         self.paper_mode = paper_mode or bool(config.get("dry_run", True)) or (not client.has_credentials)
         self._specs_cache: Dict[str, InstrumentSpec] = {}
+        # Per-symbol cache of latest closed 15m bar (bar_ts, bar_close_ms, close, atr14)
+        self._closed_15m_cache: Dict[str, Dict[str, Any]] = {}
 
     def _mode_label(self) -> str:
         return "paper" if self.paper_mode else self.client.mode
@@ -108,14 +112,22 @@ class AITradeExecutor:
         return unr
 
     def check_daily_loss_limit(self, tickers: Optional[Dict[str, Dict[str, Any]]] = None) -> tuple[bool, str]:
-        """Enforce mandatory -6.0% UTC daily loss hard stop (realized + unrealized)."""
+        """
+        Enforce mandatory -6.0% UTC daily loss hard stop.
+        - In Bybit Demo / Testnet / Live: UTA wallet `equity` ALREADY includes unrealized PnL -> total_eq = eq.
+        - In Paper mode: `equity` is realized balance only -> total_eq = eq + unr.
+        """
         eq = self.get_current_equity()
         if eq <= 0:
             return False, "equity_unavailable"
-        active = self.journal.get_active_trades()
-        tmap = tickers if tickers is not None else self._safe_get_tickers()
-        unr = self.compute_unrealized_pnl(active, tmap)
-        total_eq = eq + unr
+        if self.paper_mode:
+            active = self.journal.get_active_trades()
+            tmap = tickers if tickers is not None else self._safe_get_tickers()
+            unr = self.compute_unrealized_pnl(active, tmap)
+            total_eq = eq + unr
+        else:
+            total_eq = eq
+
         row = self.journal.ensure_daily_row(total_eq)
         if int(row.get("halted", 0)) == 1:
             return False, f"daily_halted:{row.get('halt_reason') or 'limit'}"
@@ -137,6 +149,47 @@ class AITradeExecutor:
         except Exception:
             return {}
 
+    def _get_closed_15m_bar(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Fetch latest strictly CLOSED 15m bar close & ATR(14), cached once per 15m bar."""
+        expected_ts = ((int(time.time() * 1000) // 900_000) - 1) * 900_000
+        cached = self._closed_15m_cache.get(symbol)
+        if cached is not None and int(cached.get("bar_ts", -1)) == expected_ts:
+            return cached
+        try:
+            df = self.client.get_klines(symbol, interval="15", days=2, use_cache=True, closed_only=True)
+            if df is None or len(df) < 20:
+                return cached
+            bar_ts = int(df["timestamp"].iloc[-1])
+            close_val = float(df["close"].iloc[-1])
+            atr14 = float(compute_atr(df["high"], df["low"], df["close"], 14).iloc[-1] or 0.0)
+            info = {
+                "bar_ts": bar_ts,
+                "bar_close_ms": bar_ts + 900_000,
+                "close": close_val,
+                "atr14": atr14,
+            }
+            self._closed_15m_cache[symbol] = info
+            return info
+        except Exception as exc:
+            logger.debug("Closed 15m bar fetch failed for %s: %s", symbol, exc)
+            return cached
+
+    @staticmethod
+    def _r_price(ep: float, sl_dist: float, r_mult: float, is_long: bool, tick: float) -> float:
+        raw = (ep + r_mult * sl_dist) if is_long else (ep - r_mult * sl_dist)
+        return round_tick(raw, tick)
+
+    @staticmethod
+    def _is_sl_tighter(new_sl: float, cur_sl: float, is_long: bool) -> bool:
+        return (new_sl > cur_sl) if is_long else (new_sl < cur_sl)
+
+    @staticmethod
+    def _entry_ms(t: Dict[str, Any]) -> int:
+        try:
+            return int(datetime.fromisoformat(str(t["entry_time"]).replace("Z", "+00:00")).timestamp() * 1000)
+        except Exception:
+            return 0
+
     def get_portfolio_state(self) -> Dict[str, Any]:
         active = self.journal.get_active_trades()
         eq = self.get_current_equity()
@@ -146,10 +199,10 @@ class AITradeExecutor:
             "mode": self._mode_label(),
             "equity_usdt": round(eq, 2),
             "open_count": len(active),
-            "max_open_positions": int(self.config.get("max_open_positions", 6)),
+            "max_open_positions": int(self.config.get("max_open_positions", 8)),
             "long_count": len(longs),
             "short_count": len(shorts),
-            "max_same_direction": int(self.config.get("max_same_direction", 4)),
+            "max_same_direction": int(self.config.get("max_same_direction", 5)),
             "open_longs": longs,
             "open_shorts": shorts,
         }
@@ -158,10 +211,10 @@ class AITradeExecutor:
         active = self.journal.get_active_trades()
         if any(t["symbol"] == symbol for t in active):
             return False, "already_open_or_pending"
-        max_open = int(self.config.get("max_open_positions", 6))
+        max_open = int(self.config.get("max_open_positions", 8))
         if len(active) >= max_open:
             return False, f"max_open_reached ({len(active)}/{max_open})"
-        max_same = int(self.config.get("max_same_direction", 4))
+        max_same = int(self.config.get("max_same_direction", 5))
         same_cnt = sum(1 for t in active if t["direction"] == direction)
         if same_cnt >= max_same:
             return False, f"max_same_dir_reached ({same_cnt}/{max_same} {direction})"
@@ -224,7 +277,7 @@ class AITradeExecutor:
         entry_type = str(self.config.get("entry_order_type", "limit")).lower().strip()
 
         if entry_type == "limit":
-            # Maker limit at closed price / best passive quote
+            # Passive GTC limit at closed price / best quote (NOT PostOnly)
             bb = float(candidate.orderbook.get("best_bid", 0.0))
             ba = float(candidate.orderbook.get("best_ask", 0.0))
             raw_ep = min(candidate.close_price, bb) if (is_long and bb > 0) else (
@@ -235,11 +288,11 @@ class AITradeExecutor:
 
         ep = round_tick(raw_ep, tick)
         sl_dist = ep * sl_frac
-        sl_price = round_tick((ep - sl_dist) if is_long else (ep + sl_dist), tick)
-        tp1_price = round_tick((ep + decision.tp1_r * sl_dist) if is_long else (ep - decision.tp1_r * sl_dist), tick)
-        tp2_price = round_tick((ep + decision.tp2_r * sl_dist) if is_long else (ep - decision.tp2_r * sl_dist), tick)
-        be_off = float(self.config.get("breakeven_offset_pct", 0.15)) / 100.0
-        be_price = round_tick(ep * (1.0 + be_off) if is_long else ep * (1.0 - be_off), tick)
+        sl_price = self._r_price(ep, sl_dist, -1.0, is_long, tick)
+        tp1_price = self._r_price(ep, sl_dist, decision.tp1_r, is_long, tick)
+        tp2_price = self._r_price(ep, sl_dist, decision.tp2_r, is_long, tick)
+        s2_sl_r = float(self.config.get("be_stage2_tp1_sl_r", -0.35))
+        be_price = self._r_price(ep, sl_dist, s2_sl_r, is_long, tick)
 
         qty = round_step_down(notional_usdt / ep, qty_step)
         if qty <= 0 or (min_qty > 0 and qty < min_qty):
@@ -288,6 +341,7 @@ class AITradeExecutor:
             "tp1_price": tp1_price,
             "tp2_price": tp2_price,
             "be_price": be_price,
+            "be_stage": 0,
             "use_trailing": 1 if decision.use_trailing_after_tp1 else 0,
             "peak_price": ep,
             "qty": qty,
@@ -313,13 +367,18 @@ class AITradeExecutor:
             self._place_exchange_tps(trade_id, trade_row, spec)
 
         icon = "🟢" if is_long else "🔴"
+        s1_c = float(self.config.get("be_stage1_close_r", 1.3))
+        s1_s = float(self.config.get("be_stage1_sl_r", -0.5))
+        s3_c = float(self.config.get("be_stage3_close_r", 2.3))
+        s3_s = float(self.config.get("be_stage3_sl_r", 0.3))
+        tr_m = float(self.config.get("trailing_atr_mult", 4.0))
         msg = (
             f"{icon} [AI-TRADER v2 | {self._mode_label().upper()}] {candidate.direction} {candidate.symbol}\n"
             f"Школы ({len(candidate.fired_schools)}): {', '.join(candidate.fired_schools)}\n"
             f"AI Уверенность: {decision.confidence}/100 | Режим: {candidate.regime_label}\n"
-            f"Вход ({entry_type.upper()}): {ep} | Плечо: {leverage}x | Маржа: ${trade_row['margin_usdt']:.1f}\n"
-            f"SL: {sl_price} (-{decision.sl_pct:.2f}%) | TP1 (55%): {tp1_price} ({decision.tp1_r}R -> БУ {be_price})\n"
-            f"TP2 (45%): {tp2_price} ({decision.tp2_r}R{' + Трейл' if decision.use_trailing_after_tp1 else ''})\n"
+            f"Вход ({entry_type.upper()} GTC): {ep} | Плечо: {leverage}x | Маржа: ${trade_row['margin_usdt']:.1f}\n"
+            f"SL: {sl_price} (-{decision.sl_pct:.2f}%) | TP1 (55%): {tp1_price} ({decision.tp1_r}R) | TP2 (45%): {tp2_price} ({decision.tp2_r}R)\n"
+            f"Умный БУ: 15m>={s1_c}R→{s1_s}R | TP1→{s2_sl_r}R | 15m>={s3_c}R→+{s3_s}R+{tr_m}×ATR\n"
             f"AI Разбор: {decision.reason_ru}"
         )
         logger.info(msg)
@@ -345,7 +404,7 @@ class AITradeExecutor:
         self.journal.update_trade(trade_id, {"tp1_order_id": tp1_oid, "tp2_order_id": tp2_oid})
 
     # ------------------------------------------------------------------
-    # Position Lifecycle Management (called every 30s)
+    # Position Lifecycle Management (called every 20s)
     # ------------------------------------------------------------------
     def manage_active_positions(self) -> None:
         active = self.journal.get_active_trades()
@@ -361,8 +420,127 @@ class AITradeExecutor:
             else:
                 self._manage_exchange_trade(t, tickers, specs.get(t["symbol"]))
 
+    def _apply_3stage_smart_be_and_trailing(
+        self,
+        t: Dict[str, Any],
+        cp: float,
+        spec: Optional[InstrumentSpec],
+        closed_bar: Optional[Dict[str, Any]],
+        is_exchange: bool,
+    ) -> None:
+        """
+        Shared 3-Stage Smart Break-Even & Live ATR(14) Trailing logic (Paper + Bybit Demo):
+          * Stage 1 (status=OPEN, be_stage==0): closed 15m >= +1.3R -> SL to -0.5R
+          * Stage 2 (handled on TP1 55% fill):  SL of 45% remainder -> -0.35R buffer
+          * Stage 3 (status=TP1_HIT, be_stage<3): closed 15m >= +2.3R -> SL to +0.3R + enable ATR trailing
+          * Active Trailing (status=TP1_HIT, be_stage>=3): trail peak by config['trailing_atr_mult'] * ATR(14)
+        """
+        sym = t["symbol"]
+        tid = int(t["id"])
+        is_long = t["direction"] == "LONG"
+        ep = float(t["entry_price"])
+        sl_p = float(t["sl_price"])
+        sl_dist = ep * (float(t["sl_pct"]) / 100.0)
+        if sl_dist <= 0:
+            return
+        tick = spec.tick_size if spec else 0.0001
+        be_stage = int(t.get("be_stage") or 0)
+        entry_ms = self._entry_ms(t)
+
+        s1_close_r = float(self.config.get("be_stage1_close_r", 1.3))
+        s1_sl_r = float(self.config.get("be_stage1_sl_r", -0.5))
+        s3_close_r = float(self.config.get("be_stage3_close_r", 2.3))
+        s3_sl_r = float(self.config.get("be_stage3_sl_r", 0.3))
+        tr_mult = float(self.config.get("trailing_atr_mult", 4.0))
+
+        # Only evaluate closed-candle stages on bars that closed AFTER entry_time
+        valid_closed = (
+            closed_bar is not None
+            and float(closed_bar.get("close") or 0.0) > 0.0
+            and int(closed_bar.get("bar_close_ms") or 0) > entry_ms
+        )
+        closed_c = float(closed_bar["close"]) if valid_closed else 0.0
+        cur_atr = float(closed_bar.get("atr14") or 0.0) if closed_bar is not None else 0.0
+
+        # Stage 1: Before TP1, closed 15m candle >= +1.3R -> tighten SL to -0.5R
+        if t["status"] == "OPEN" and be_stage < 1 and valid_closed:
+            s1_trigger = self._r_price(ep, sl_dist, s1_close_r, is_long, tick)
+            hit_s1 = (closed_c >= s1_trigger) if is_long else (closed_c <= s1_trigger)
+            if hit_s1:
+                new_sl = self._r_price(ep, sl_dist, s1_sl_r, is_long, tick)
+                if self._is_sl_tighter(new_sl, sl_p, is_long):
+                    if is_exchange:
+                        try:
+                            self.client.set_trading_stop(sym, stop_loss=new_sl)
+                        except Exception as exc:
+                            logger.error("Stage 1 SL update failed for %s: %s", sym, exc)
+                            return
+                    self.journal.update_trade(tid, {"sl_price": new_sl, "be_stage": 1})
+                    self.notifier.send(
+                        f"🛡️ [{self._mode_label().upper()}] Ступень 1 ({sym}): свеча 15m закрылась >= +{s1_close_r}R ({closed_c})\n"
+                        f"Серверный SL подтянут до {s1_sl_r}R: {new_sl}"
+                    )
+            return
+
+        # Stage 3: After TP1_HIT, closed 15m candle >= +2.3R -> SL to +0.3R & activate ATR(14) trailing
+        if t["status"] == "TP1_HIT" and be_stage < 3 and valid_closed:
+            s3_trigger = self._r_price(ep, sl_dist, s3_close_r, is_long, tick)
+            hit_s3 = (closed_c >= s3_trigger) if is_long else (closed_c <= s3_trigger)
+            if hit_s3:
+                peak = float(t["peak_price"])
+                if is_long:
+                    peak = max(peak, cp, closed_c)
+                else:
+                    peak = min(peak, cp if cp > 0 else peak, closed_c)
+                stage3_sl = self._r_price(ep, sl_dist, s3_sl_r, is_long, tick)
+                cand_sl = stage3_sl
+                if cur_atr > 0:
+                    tr_sl = round_tick((peak - tr_mult * cur_atr) if is_long else (peak + tr_mult * cur_atr), tick)
+                    if self._is_sl_tighter(tr_sl, cand_sl, is_long):
+                        cand_sl = tr_sl
+                new_sl = cand_sl if self._is_sl_tighter(cand_sl, sl_p, is_long) else sl_p
+                if is_exchange and new_sl != sl_p:
+                    try:
+                        self.client.set_trading_stop(sym, stop_loss=new_sl)
+                    except Exception as exc:
+                        logger.error("Stage 3 SL update failed for %s: %s", sym, exc)
+                        return
+                self.journal.update_trade(
+                    tid, {"sl_price": new_sl, "be_stage": 3, "use_trailing": 1, "peak_price": peak}
+                )
+                self.notifier.send(
+                    f"🚀 [{self._mode_label().upper()}] Ступень 3 ({sym}): свеча 15m закрылась >= +{s3_close_r}R ({closed_c})\n"
+                    f"SL в плюсе (+{s3_sl_r}R): {new_sl} | Включён трейлинг {tr_mult}×ATR(14)"
+                )
+            return
+
+        # Active live ATR(14) trailing after Stage 3 is unlocked
+        if t["status"] == "TP1_HIT" and be_stage >= 3 and cp > 0:
+            peak = float(t["peak_price"])
+            peak_updated = (is_long and cp > peak) or ((not is_long) and cp < peak)
+            if peak_updated:
+                peak = cp
+                updates: Dict[str, Any] = {"peak_price": peak}
+                if cur_atr > 0:
+                    tr_dist = tr_mult * cur_atr
+                    new_sl = round_tick((peak - tr_dist) if is_long else (peak + tr_dist), tick)
+                    if self._is_sl_tighter(new_sl, sl_p, is_long):
+                        if is_exchange:
+                            try:
+                                self.client.set_trading_stop(sym, stop_loss=new_sl)
+                                updates["sl_price"] = new_sl
+                            except Exception as exc:
+                                logger.warning("Trailing SL update failed for %s: %s", sym, exc)
+                        else:
+                            updates["sl_price"] = new_sl
+                self.journal.update_trade(tid, updates)
+
     def _manage_paper_trade(
-        self, t: Dict[str, Any], tickers: Dict[str, Dict[str, Any]], spec: Optional[InstrumentSpec]
+        self,
+        t: Dict[str, Any],
+        tickers: Dict[str, Dict[str, Any]],
+        spec: Optional[InstrumentSpec],
+        closed_bar_override: Optional[Dict[str, Any]] = None,
     ) -> None:
         sym = t["symbol"]
         cp = float(tickers.get(sym, {}).get("last_price", 0.0))
@@ -374,7 +552,8 @@ class AITradeExecutor:
         sl_p = float(t["sl_price"])
         tp1_p = float(t["tp1_price"])
         tp2_p = float(t["tp2_price"])
-        be_p = float(t["be_price"])
+        sl_dist = ep * (float(t["sl_pct"]) / 100.0)
+        tick = spec.tick_size if spec else 0.0001
         maker_fee = float(self.config.get("maker_fee_rate", 0.0002))
         taker_fee = float(self.config.get("taker_fee_rate", 0.00055))
 
@@ -426,7 +605,7 @@ class AITradeExecutor:
             )
             return
 
-        # 3. Check TP1 (55%) -> Immediate SL move to BE +0.15%
+        # 3. Stage 2: Check TP1 (55%) -> Move SL of remaining 45% to -0.35R buffer behind entry
         if t["status"] == "OPEN":
             hit_tp1 = (cp >= tp1_p) if is_long else (cp <= tp1_p)
             if hit_tp1:
@@ -435,24 +614,28 @@ class AITradeExecutor:
                 g1 = (tp1_p - ep) * tp1_qty if is_long else (ep - tp1_p) * tp1_qty
                 f1 = tp1_qty * tp1_p * maker_fee
                 part_net = g1 - f1
+                s2_sl_r = float(self.config.get("be_stage2_tp1_sl_r", -0.35))
+                s2_sl = self._r_price(ep, sl_dist, s2_sl_r, is_long, tick)
+                new_sl = s2_sl if self._is_sl_tighter(s2_sl, sl_p, is_long) else sl_p
                 self.journal.update_trade(
                     tid,
                     {
                         "status": "TP1_HIT",
-                        "sl_price": be_p,
+                        "sl_price": new_sl,
+                        "be_stage": max(int(t.get("be_stage") or 0), 2),
                         "remaining_qty": rem_qty,
                         "realized_tp1_pnl": round(part_net, 4),
                         "peak_price": cp,
                     },
                 )
                 self.notifier.send(
-                    f"🎯 [PAPER] TP1 (55%) {sym} по {tp1_p} (+${part_net:.2f})!\n"
-                    f"SL переведён в БЕЗУБЫТОК (+0.15%): {be_p}"
+                    f"🎯 [PAPER] Ступень 2 — TP1 (55%) {sym} по {tp1_p} (+${part_net:.2f})!\n"
+                    f"SL остатка перенесён в буфер {s2_sl_r}R: {new_sl} (общая сделка уже в плюсе)"
                 )
                 return
 
-        # 4. Check TP2 (45%) & optional trailing after TP1
-        if t["status"] == "TP1_HIT":
+        # 4. Check TP2 (45%) if ceiling TP2 is active (non-trailing OR before Stage 3)
+        if t["status"] == "TP1_HIT" and int(t.get("use_trailing") or 0) == 0:
             hit_tp2 = (cp >= tp2_p) if is_long else (cp <= tp2_p)
             if hit_tp2:
                 rem_qty = float(t["remaining_qty"])
@@ -483,30 +666,22 @@ class AITradeExecutor:
                 )
                 return
 
-            # Optional ATR trailing SL update on remaining 45%
-            if int(t.get("use_trailing") or 0) == 1:
-                peak = float(t["peak_price"])
-                tick = spec.tick_size if spec else 0.0001
-                trail_dist = ep * (float(t["sl_pct"]) / 100.0) * 1.4
-                if is_long and cp > peak:
-                    new_sl = round_tick(cp - trail_dist, tick)
-                    updates: Dict[str, Any] = {"peak_price": cp}
-                    if new_sl > sl_p:
-                        updates["sl_price"] = new_sl
-                    self.journal.update_trade(tid, updates)
-                elif (not is_long) and cp < peak:
-                    new_sl = round_tick(cp + trail_dist, tick)
-                    updates = {"peak_price": cp}
-                    if new_sl < sl_p:
-                        updates["sl_price"] = new_sl
-                    self.journal.update_trade(tid, updates)
+        # 5. Evaluate Stage 1 (closed >= +1.3R), Stage 3 (closed >= +2.3R), and live ATR(14) trailing
+        closed_bar = closed_bar_override if closed_bar_override is not None else self._get_closed_15m_bar(sym)
+        self._apply_3stage_smart_be_and_trailing(t, cp, spec, closed_bar, is_exchange=False)
 
     def _manage_exchange_trade(
-        self, t: Dict[str, Any], tickers: Dict[str, Dict[str, Any]], spec: Optional[InstrumentSpec]
+        self,
+        t: Dict[str, Any],
+        tickers: Dict[str, Dict[str, Any]],
+        spec: Optional[InstrumentSpec],
+        closed_bar_override: Optional[Dict[str, Any]] = None,
     ) -> None:
         sym = t["symbol"]
         tid = int(t["id"])
         is_long = t["direction"] == "LONG"
+        tick = spec.tick_size if spec else 0.0001
+        qty_step = spec.qty_step if spec else 0.001
 
         try:
             positions = self.client.get_positions(sym)
@@ -517,15 +692,40 @@ class AITradeExecutor:
         pos = positions[0] if positions else None
         pos_size = float(pos.get("size", 0.0)) if pos else 0.0
 
-        # 1. PENDING_LIMIT -> check fill or TTL expiry
+        # 1. PENDING_LIMIT -> check fill (including PARTIAL FILL remainder cancellation!) or TTL expiry
         if t["status"] == "PENDING_LIMIT":
             if pos_size > 0:
+                orig_qty = float(t["qty"])
                 avg_p = float(pos.get("avgPrice") or t["entry_price"])
-                self.journal.update_trade(tid, {"status": "OPEN", "entry_price": avg_p, "remaining_qty": pos_size})
-                t["entry_price"] = avg_p
-                t["qty"] = pos_size
+                tp1_qty = float(t["tp1_qty"])
+                partial_note = ""
+                if pos_size < orig_qty * 0.999 and t.get("entry_order_id"):
+                    # Cancel remaining unfilled portion immediately so exchange pos matches TP1/TP2 exactly!
+                    self.client.cancel_order(sym, str(t["entry_order_id"]))
+                    tp1_frac = float(self.config.get("tp1_close_pct", 55.0)) / 100.0
+                    tp1_qty = round_step_down(pos_size * tp1_frac, qty_step)
+                    if tp1_qty <= 0 or tp1_qty >= pos_size:
+                        tp1_qty = round_step_down(pos_size * 0.5, qty_step)
+                    partial_note = f" (частичный фил {pos_size}/{orig_qty}, остаток лимитки отменён)"
+                    logger.info("Partial fill on %s (%s/%s): cancelled remainder %s", sym, pos_size, orig_qty, t["entry_order_id"])
+
+                lev = max(1, int(t.get("leverage") or 10))
+                updates = {
+                    "status": "OPEN",
+                    "entry_price": avg_p,
+                    "qty": pos_size,
+                    "tp1_qty": tp1_qty,
+                    "remaining_qty": pos_size,
+                    "peak_price": avg_p,
+                    "margin_usdt": round(pos_size * avg_p / lev, 2),
+                    "notional_usdt": round(pos_size * avg_p, 2),
+                }
+                self.journal.update_trade(tid, updates)
+                t.update(updates)
                 self._place_exchange_tps(tid, t, spec)
-                self.notifier.send(f"✅ [{self.client.mode.upper()}] Вход {sym} исполнен по {avg_p}, TP1/TP2 выставлены.")
+                self.notifier.send(
+                    f"✅ [{self.client.mode.upper()}] Вход {sym} исполнен по {avg_p}{partial_note}, TP1/TP2 выставлены."
+                )
                 return
             exp = t.get("expires_at_utc")
             if exp:
@@ -542,7 +742,7 @@ class AITradeExecutor:
                 self.client.cancel_all_orders(sym)
             except Exception:
                 pass
-            entry_ms = int(datetime.fromisoformat(str(t["entry_time"]).replace("Z", "+00:00")).timestamp() * 1000) - 60_000
+            entry_ms = self._entry_ms(t) - 60_000
             net_pnl = 0.0
             try:
                 cpnls = self.client.get_closed_pnl(sym, start_ms=entry_ms, limit=10)
@@ -570,42 +770,38 @@ class AITradeExecutor:
             )
             return
 
-        # 3. Detect TP1 fill -> IMMEDIATELY move server-side SL to breakeven +0.15%
+        cp = float(tickers.get(sym, {}).get("last_price", 0.0))
+
+        # 3. Stage 2: Detect TP1 (55%) fill -> Move SL of remaining 45% to -0.35R buffer behind entry
         if t["status"] == "OPEN" and pos_size < float(t["qty"]) * 0.70:
-            be_p = float(t["be_price"])
+            ep = float(t["entry_price"])
+            sl_p = float(t["sl_price"])
+            sl_dist = ep * (float(t["sl_pct"]) / 100.0)
+            s2_sl_r = float(self.config.get("be_stage2_tp1_sl_r", -0.35))
+            s2_sl = self._r_price(ep, sl_dist, s2_sl_r, is_long, tick)
+            new_sl = s2_sl if self._is_sl_tighter(s2_sl, sl_p, is_long) else sl_p
             try:
-                self.client.set_trading_stop(sym, stop_loss=be_p)
-                self.journal.update_trade(tid, {"status": "TP1_HIT", "sl_price": be_p, "remaining_qty": pos_size})
+                if new_sl != sl_p:
+                    self.client.set_trading_stop(sym, stop_loss=new_sl)
+                peak = cp if cp > 0 else float(t["tp1_price"])
+                self.journal.update_trade(
+                    tid,
+                    {
+                        "status": "TP1_HIT",
+                        "sl_price": new_sl,
+                        "be_stage": max(int(t.get("be_stage") or 0), 2),
+                        "remaining_qty": pos_size,
+                        "peak_price": peak,
+                    },
+                )
                 self.notifier.send(
-                    f"🎯 [{self.client.mode.upper()}] TP1 (55%) {sym} исполнен!\n"
-                    f"Серверный SL переведён в БЕЗУБЫТОК (+0.15%): {be_p}"
+                    f"🎯 [{self.client.mode.upper()}] Ступень 2 — TP1 (55%) {sym} исполнен!\n"
+                    f"Серверный SL остатка перенесён в буфер {s2_sl_r}R: {new_sl} (общая сделка уже в плюсе)"
                 )
             except Exception as exc:
-                logger.error("Failed moving SL to BE for %s: %s", sym, exc)
+                logger.error("Stage 2 SL update failed for %s: %s", sym, exc)
             return
 
-        # 4. Optional trailing stop update on exchange after TP1_HIT
-        if t["status"] == "TP1_HIT" and int(t.get("use_trailing") or 0) == 1:
-            cp = float(tickers.get(sym, {}).get("last_price", 0.0))
-            if cp <= 0:
-                return
-            peak = float(t["peak_price"])
-            sl_p = float(t["sl_price"])
-            tick = spec.tick_size if spec else 0.0001
-            trail_dist = float(t["entry_price"]) * (float(t["sl_pct"]) / 100.0) * 1.4
-            if is_long and cp > peak:
-                new_sl = round_tick(cp - trail_dist, tick)
-                if new_sl > sl_p:
-                    try:
-                        self.client.set_trading_stop(sym, stop_loss=new_sl)
-                        self.journal.update_trade(tid, {"sl_price": new_sl, "peak_price": cp})
-                    except Exception:
-                        pass
-            elif (not is_long) and cp < peak:
-                new_sl = round_tick(cp + trail_dist, tick)
-                if new_sl < sl_p:
-                    try:
-                        self.client.set_trading_stop(sym, stop_loss=new_sl)
-                        self.journal.update_trade(tid, {"sl_price": new_sl, "peak_price": cp})
-                    except Exception:
-                        pass
+        # 4. Evaluate Stage 1 (closed >= +1.3R), Stage 3 (closed >= +2.3R), and live ATR(14) trailing
+        closed_bar = closed_bar_override if closed_bar_override is not None else self._get_closed_15m_bar(sym)
+        self._apply_3stage_smart_be_and_trailing(t, cp, spec, closed_bar, is_exchange=True)
