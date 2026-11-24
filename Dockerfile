@@ -14,9 +14,9 @@ RUN pip install -r requirements.txt
 COPY . .
 
 RUN useradd --system --uid 10001 --home-dir /app krupa \
-    && mkdir -p data logs \
+    && mkdir -p data/ai_trader_v2/cache logs \
     && chown -R krupa:krupa data logs
 
 USER krupa
 
-CMD ["python", "run_bot.py", "--config", "config_ada.json"]
+CMD ["python", "ai_trader_v2/run_ai_trader.py", "--demo"]
