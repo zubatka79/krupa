@@ -43,7 +43,13 @@ from ai_trader_v2.tv_advisors import (
 from ai_trader_v2.executor import AITradeExecutor, TelegramNotifier
 from ai_trader_v2.journal import AITradeJournal
 from ai_trader_v2.run_ai_trader import load_config
-from ai_trader_v2.ta_schools import ALL_12_SCHOOLS, BtcMarketContext, CandidateSetup, evaluate_symbol_12_schools
+from ai_trader_v2.ta_schools import (
+    ALL_12_SCHOOLS,
+    BtcMarketContext,
+    CandidateSetup,
+    _find_swing_levels,
+    evaluate_symbol_12_schools,
+)
 from bot.bybit_client import BybitClient, InstrumentSpec
 
 
@@ -532,7 +538,32 @@ def main() -> None:
     assert b64_both is not None and any(("DIV:" in t and "ADV:" in t) for t in seen_titles2)
     print(f"[PASS] 9. TV Advisors verified (BULL/BEAR SFP, POC={vp_above['poc']}, PDH/PDL/Asia, PNG DIV+ADV '{adv_banner}')")
 
-    print("\nALL 9 COMPREHENSIVE VERIFICATION CHECKS PASSED!")
+    # ------------------------------------------------------------------
+    # 10. _find_swing_levels() Excludes Breakout Bar Wick (No Fake 0.1R Wall)
+    # ------------------------------------------------------------------
+    # Prior history has a real confirmed swing support at 96.0 (4% below breakdown close 100.0).
+    # The latest closed breakout bar breaks down to close=100.0 with a lower wick to 99.85 (0.15% below close).
+    sr_rows = []
+    for i in range(40):
+        ts = day0_ms + i * 3_600_000
+        if i == 10:
+            # Confirmed prior pivot low at 96.0
+            sr_rows.append((ts, 98.0, 99.0, 96.0, 98.5, 1000.0, 98500.0))
+        elif i in (8, 9, 11, 12):
+            sr_rows.append((ts, 101.0, 102.0, 99.5, 101.0, 1000.0, 101000.0))
+        else:
+            sr_rows.append((ts, 104.0, 105.5, 102.5, 104.0, 1000.0, 104000.0))
+    # Append latest closed breakout candle: close=100.0, lower wick=99.85 (would be fake 0.15% / 0.1R wall!)
+    sr_rows.append((day0_ms + 40 * 3_600_000, 103.5, 103.6, 99.85, 100.0, 2500.0, 250000.0))
+    df_brk = pd.DataFrame(sr_rows, columns=["timestamp", "open", "high", "low", "close", "volume", "turnover"])
+
+    sr_res = _find_swing_levels(df_brk, lookback=60, price=100.0)
+    assert sr_res["nearest_support"] == 96.0, f"Breakout bar wick leaked into nearest_support: {sr_res}"
+    assert sr_res["dist_to_sup_pct"] == 4.0, f"Expected 4.0% clearance to prior support, got {sr_res}"
+    assert round(sr_res["dist_to_sup_pct"] / 1.4, 2) > 2.5  # > 1.5R clean clearance!
+    print(f"[PASS] 10. _find_swing_levels() breakout-wick exclusion verified (nearest_support=96.0, dist=4.0%, wick 99.85 ignored)")
+
+    print("\nALL 10 COMPREHENSIVE VERIFICATION CHECKS PASSED!")
 
 
 if __name__ == "__main__":

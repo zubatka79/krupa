@@ -170,8 +170,18 @@ def _fmt_candles(df: pd.DataFrame, count: int, vol_sma: Optional[pd.Series] = No
 
 
 def _find_swing_levels(df: pd.DataFrame, lookback: int = 48, price: float = 0.0) -> Dict[str, Any]:
-    """Identify nearest structural support & resistance from recent pivot highs/lows."""
-    sub = df.tail(lookback).reset_index(drop=True)
+    """Identify nearest structural support & resistance from PRIOR confirmed pivot highs/lows (excluding latest bar)."""
+    if df is None or len(df) < 2:
+        return {
+            "nearest_resistance": None,
+            "dist_to_res_pct": None,
+            "nearest_support": None,
+            "dist_to_sup_pct": None,
+            "top_resistances": [],
+            "top_supports": [],
+        }
+    # Exclude the latest closed bar (`[:-1]`) so a breakout candle's own wick never becomes a fake S/R wall
+    sub = df.iloc[:-1].tail(lookback).reset_index(drop=True)
     hi = sub["high"].to_numpy(float)
     lo = sub["low"].to_numpy(float)
     piv_hi: List[float] = []
@@ -181,22 +191,24 @@ def _find_swing_levels(df: pd.DataFrame, lookback: int = 48, price: float = 0.0)
             piv_hi.append(float(hi[i]))
         if lo[i] <= lo[i - 1] and lo[i] <= lo[i - 2] and lo[i] <= lo[i + 1] and lo[i] <= lo[i + 2]:
             piv_lo.append(float(lo[i]))
-    # Include rolling highs/lows as fallback
+    # Include prior rolling highs/lows (strictly excluding latest bar) as fallback if no pivots found
     if len(hi) >= 5:
-        piv_hi.append(float(np.max(hi[-24:])))
-        piv_lo.append(float(np.min(lo[-24:])))
+        if not piv_hi:
+            piv_hi.append(float(np.max(hi[-24:])))
+        if not piv_lo:
+            piv_lo.append(float(np.min(lo[-24:])))
 
-    res_above = sorted([x for x in piv_hi if x > price * 1.001])
-    sup_below = sorted([x for x in piv_lo if x < price * 0.999], reverse=True)
+    res_above = sorted({round(x, 6) for x in piv_hi if x > price * 1.001})
+    sup_below = sorted({round(x, 6) for x in piv_lo if x < price * 0.999}, reverse=True)
     nearest_res = res_above[0] if res_above else None
     nearest_sup = sup_below[0] if sup_below else None
     return {
-        "nearest_resistance": round(nearest_res, 6) if nearest_res else None,
+        "nearest_resistance": nearest_res,
         "dist_to_res_pct": round((nearest_res - price) / price * 100.0, 2) if (nearest_res and price > 0) else None,
-        "nearest_support": round(nearest_sup, 6) if nearest_sup else None,
+        "nearest_support": nearest_sup,
         "dist_to_sup_pct": round((price - nearest_sup) / price * 100.0, 2) if (nearest_sup and price > 0) else None,
-        "top_resistances": [round(x, 6) for x in res_above[:3]],
-        "top_supports": [round(x, 6) for x in sup_below[:3]],
+        "top_resistances": res_above[:3],
+        "top_supports": sup_below[:3],
     }
 
 
