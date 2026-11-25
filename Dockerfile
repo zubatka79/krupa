@@ -4,8 +4,6 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
-    MPLBACKEND=Agg \
-    MPLCONFIGDIR=/tmp/matplotlib \
     TZ=UTC
 
 WORKDIR /app
@@ -16,9 +14,9 @@ RUN pip install -r requirements.txt
 COPY . .
 
 RUN useradd --system --uid 10001 --home-dir /app krupa \
-    && mkdir -p data/ai_trader_v2/cache logs \
+    && mkdir -p data logs \
     && chown -R krupa:krupa data logs
 
 USER krupa
 
-CMD ["python", "ai_trader_v2/run_ai_trader.py", "--demo"]
+CMD ["python", "run_bot.py", "--config", "config_ada.json"]
