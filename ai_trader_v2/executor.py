@@ -58,6 +58,7 @@ class VikaExecutor:
         self.leverage = int(cfg.get("leverage", 10))
         self.margin_pct = float(cfg.get("margin_pct_per_trade", 10.0)) / 100.0
         self.max_open = int(cfg.get("max_open_positions", 8))
+        self.max_same_key = int(cfg.get("max_same_key", 2))
         self.max_total_margin_pct = float(cfg.get("max_total_margin_pct", 80.0)) / 100.0
         self.daily_loss_limit_pct = float(cfg.get("daily_loss_limit_pct", 6.0))
         self.ttl_bars = int(cfg.get("limit_entry_ttl_bars", 3))
@@ -325,6 +326,13 @@ class VikaExecutor:
         if len(active) >= self.max_open:
             logger.info("Skip %s %s: max slots %d/%d reached", sym, side, len(active), self.max_open)
             return None
+        same_key_active = sum(1 for p in active if p["key_name"] == ev.key)
+        if same_key_active >= self.max_same_key:
+            logger.info(
+                "Skip %s %s: R3 max_same_key %d/%d reached for %s",
+                sym, side, same_key_active, self.max_same_key, ev.key,
+            )
+            return None
 
         eq = self.last_equity
         if eq < 50.0:
@@ -374,6 +382,7 @@ class VikaExecutor:
             "bbw15": ev.bbw15,
             "atr15_pct": ev.atr15_pct,
             "funding_bps": ev.funding_bps,
+            "slope4h_pct": ev.slope4h_pct,
             "div4h": ev.div4h_label,
             "rvol": ev.rvol,
         }
@@ -407,7 +416,8 @@ class VikaExecutor:
             f"BE: при закрытии <code>{be_trigger_price}</code> -> SL <code>{be_lock_price}</code>\n"
             f"Объём: <code>{qty}</code> (~<code>${qty * entry_price:,.1f}</code>) | Маржа: <code>${margin_usd:,.1f}</code> (10% × {self.leverage}x)\n"
             f"Фильтры: ADX15=<code>{ev.adx15:.1f}</code> | BBW15=<code>{ev.bbw15:.2f}%</code> | "
-            f"ATR15=<code>{ev.atr15_pct:.2f}%</code> | FR=<code>{ev.funding_bps:+.2f}bps</code> | 4H Div: <code>{ev.div4h_label}</code>"
+            f"ATR15=<code>{ev.atr15_pct:.2f}%</code> | FR=<code>{ev.funding_bps:+.2f}bps</code> | "
+            f"4H Slope=<code>{ev.slope4h_pct:+.2f}%</code> | 4H Div: <code>{ev.div4h_label}</code>"
         )
         logger.info("Opened %s %s (%s) id=%s order=%s", sym, side, ev.key, pos_id, order_id)
         self.notify(msg)

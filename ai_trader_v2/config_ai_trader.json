@@ -9,6 +9,7 @@
   "margin_pct_per_trade": 10.0,
   "max_open_positions": 8,
   "max_same_direction": 8,
+  "max_same_key": 2,
   "max_total_margin_pct": 80.0,
   "max_per_symbol": 1,
   "daily_loss_limit_pct": 6.0,
@@ -25,7 +26,8 @@
     "n2_adx15_max": 40.0,
     "n2_bbw15_max": 6.5,
     "n2_atr15_pct_max": 1.5,
-    "n7_max_pay_funding_bps": 1.5
+    "n7_max_pay_funding_bps": 1.5,
+    "t4_min_4h_ema50_slope_pct": 0.15
   },
   "coins": [
     {
@@ -107,6 +109,30 @@
       "sl_pct": 2.5,
       "be_trigger_pct": 0.85,
       "be_lock_pct": 0.2
+    },
+    {
+      "symbol": "DOGEUSDT",
+      "key": "K3_MACD_STOCH",
+      "tp_pct": 1.4,
+      "sl_pct": 3.0,
+      "be_trigger_pct": 0.95,
+      "be_lock_pct": 0.25
+    },
+    {
+      "symbol": "SUIUSDT",
+      "key": "K8_SUPERTREND_BO",
+      "tp_pct": 1.2,
+      "sl_pct": 2.5,
+      "be_trigger_pct": 0.85,
+      "be_lock_pct": 0.2
+    },
+    {
+      "symbol": "XRPUSDT",
+      "key": "K1_EMA_TREND_PB",
+      "tp_pct": 1.4,
+      "sl_pct": 3.0,
+      "be_trigger_pct": 0.95,
+      "be_lock_pct": 0.25
     }
   ]
 }

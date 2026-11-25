@@ -25,6 +25,7 @@ DAY_MS = 24 * 60 * 60 * 1000
 
 KEY_SHORT_NAMES: Dict[str, str] = {
     "K1_EMA_TREND_PB": "K1 (EMA Pullback)",
+    "K3_MACD_STOCH": "K3 (MACD+Stoch)",
     "K6_VWAP_RECLAIM": "K6 (VWAP Reclaim)",
     "K7_SFP_LIQ_SWEEP": "K7 (SFP Sweep)",
     "K8_SUPERTREND_BO": "K8 (Supertrend BO)",
@@ -49,7 +50,10 @@ class CoinEvaluation:
     n2_reasons: Tuple[str, ...] = field(default_factory=tuple)
     n7_blocked_long: bool = False
     n7_blocked_short: bool = False
-    raw_signal: Optional[str] = None     # "LONG" | "SHORT" | None (before N2/N7/4H-div)
+    slope4h_pct: float = 0.0
+    t4_blocked_long: bool = False
+    t4_blocked_short: bool = False
+    raw_signal: Optional[str] = None     # "LONG" | "SHORT" | None (before filters)
     final_signal: Optional[str] = None   # "LONG" | "SHORT" | None (after ALL filters)
     block_reason: Optional[str] = None   # why raw_signal was blocked, if any
 
@@ -108,6 +112,23 @@ def macd_arr(cl: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     line = ema_arr(cl, 12) - ema_arr(cl, 26)
     sig = ema_arr(line, 9)
     return line, sig, line - sig
+
+
+def stoch_arr(
+    hi: np.ndarray,
+    lo: np.ndarray,
+    cl: np.ndarray,
+    k_len: int = 14,
+    smooth_k: int = 3,
+    smooth_d: int = 3,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Stochastic(14,3,3) formula-identical to backtest_tv_daily_top100_wr80_15m.py."""
+    hh = pd.Series(hi).rolling(k_len, min_periods=k_len).max().to_numpy(float)
+    ll = pd.Series(lo).rolling(k_len, min_periods=k_len).min().to_numpy(float)
+    raw_k = np.where((hh - ll) > 1e-12, (cl - ll) / np.maximum(hh - ll, 1e-12) * 100.0, 50.0)
+    k = pd.Series(raw_k).rolling(smooth_k, min_periods=1).mean().fillna(50.0).to_numpy(float)
+    d = pd.Series(k).rolling(smooth_d, min_periods=1).mean().fillna(50.0).to_numpy(float)
+    return k, d
 
 
 def obv_arr(cl: np.ndarray, vol: np.ndarray) -> np.ndarray:
@@ -319,17 +340,21 @@ def evaluate_coin(
     h1_up = bool(h1_up_raw[i1]) if i1 >= 50 else False
     h1_dn = bool(h1_dn_raw[i1]) if i1 >= 50 else False
 
-    # 4H trend + 4H STRONG opposing divergence (strictly closed 4H bar <= close_ts of last closed 15m bar)
+    # 4H trend + 4H EMA50 slope (T4) + 4H STRONG opposing divergence (strictly closed 4H bar <= close_ts)
     c4 = df4h["close"].to_numpy(float)
     e20_4, e50_4 = ema_arr(c4, 20), ema_arr(c4, 50)
     h4_up_raw = (c4 > e50_4) & (e20_4 > e50_4)
     h4_dn_raw = (c4 < e50_4) & (e20_4 < e50_4)
+    e50_4_p3 = np.roll(e50_4, 3)
+    e50_4_p3[:3] = e50_4[0]
+    slope4_arr = (e50_4 / np.maximum(e50_4_p3, 1e-12) - 1.0) * 100.0
     hold_bars = int(filters_cfg.get("div_4h_hold_bars", 8))
     bear4_str_arr, bull4_str_arr = compute_4h_strong_divergences(df4h, hold_bars=hold_bars)
     h4_cts = df4h["timestamp"].to_numpy(np.int64) + H4_MS
     i4 = int(np.searchsorted(h4_cts, close_ts[-1], side="right") - 1)
     h4_up = bool(h4_up_raw[i4]) if i4 >= 50 else False
     h4_dn = bool(h4_dn_raw[i4]) if i4 >= 50 else False
+    c_slope4h = float(slope4_arr[i4]) if i4 >= 50 else 0.0
     div4h_bear_strong = bool(bear4_str_arr[i4]) if i4 >= 35 else False
     div4h_bull_strong = bool(bull4_str_arr[i4]) if i4 >= 35 else False
 
@@ -338,6 +363,8 @@ def evaluate_coin(
     atr15 = atr_arr(hi, lo, cl, 14)
     atr15_pct_arr = np.where(cl > 0, atr15 / np.maximum(cl, 1e-12) * 100.0, 99.0)
     rsi = rsi_arr(cl, 14)
+    _, _, mh = macd_arr(cl)
+    st_k, st_d = stoch_arr(hi, lo, cl, 14, 3, 3)
     rvol_arr = (
         pd.Series(vol) / pd.Series(vol).rolling(20, min_periods=10).mean().replace(0.0, np.nan)
     ).fillna(0.0).to_numpy(float)
@@ -380,6 +407,19 @@ def evaluate_coin(
             and ((c_hi >= e21[i] * 0.998) or (c_hi >= e50[i] * 0.998))
             and (c_cl < e21[i]) and (c_cl < c_op)
             and (rsi[i - 1] >= 52.0) and (rsi[i] < rsi[i - 1])
+        )
+    elif key == "K3_MACD_STOCH":
+        sig_l = (
+            h4_up and ok_vol
+            and (mh[i] > mh[i - 1]) and (mh[i - 1] <= mh[i - 2])
+            and (st_k[i] > st_d[i]) and (st_k[i] <= 65.0)
+            and (c_rvol >= 1.1) and (c_cl > c_op)
+        )
+        sig_s = (
+            h4_dn and ok_vol
+            and (mh[i] < mh[i - 1]) and (mh[i - 1] >= mh[i - 2])
+            and (st_k[i] < st_d[i]) and (st_k[i] >= 35.0)
+            and (c_rvol >= 1.1) and (c_cl < c_op)
         )
     elif key == "K6_VWAP_RECLAIM":
         sig_l = (
@@ -442,7 +482,13 @@ def evaluate_coin(
     n7_blocked_long = fr_bps >= max_pay_bps
     n7_blocked_short = (-fr_bps) >= max_pay_bps
 
-    # Apply all 3 mandatory filters
+    # Filter T4: 4H EMA50 aligned slope > +0.15% for trend keys
+    min_slope4 = float(filters_cfg.get("t4_min_4h_ema50_slope_pct", 0.15))
+    is_trend_key = key != "K5_BB_MEAN_REV"
+    t4_blocked_long = is_trend_key and (c_slope4h <= min_slope4)
+    t4_blocked_short = is_trend_key and ((-c_slope4h) <= min_slope4)
+
+    # Apply all mandatory filters (4H STRONG Div, N2, N7, T4)
     final_signal = raw_signal
     block_reason: Optional[str] = None
     if raw_signal == "LONG":
@@ -455,6 +501,9 @@ def evaluate_coin(
         elif n7_blocked_long:
             final_signal = None
             block_reason = f"N7 Funding ({fr_bps:+.2f} bps >= +{max_pay_bps:g})"
+        elif t4_blocked_long:
+            final_signal = None
+            block_reason = f"T4 4H Slope ({c_slope4h:+.2f}% <= +{min_slope4:g}%)"
     elif raw_signal == "SHORT":
         if filters_cfg.get("div_4h_strong", True) and div4h_bull_strong:
             final_signal = None
@@ -465,6 +514,9 @@ def evaluate_coin(
         elif n7_blocked_short:
             final_signal = None
             block_reason = f"N7 Funding ({fr_bps:+.2f} bps <= -{max_pay_bps:g})"
+        elif t4_blocked_short:
+            final_signal = None
+            block_reason = f"T4 4H Slope ({c_slope4h:+.2f}%, aligned {-c_slope4h:+.2f}% <= +{min_slope4:g}%)"
 
     return CoinEvaluation(
         symbol=symbol,
@@ -483,6 +535,9 @@ def evaluate_coin(
         n2_reasons=tuple(n2_reasons),
         n7_blocked_long=n7_blocked_long,
         n7_blocked_short=n7_blocked_short,
+        slope4h_pct=round(c_slope4h, 2),
+        t4_blocked_long=t4_blocked_long,
+        t4_blocked_short=t4_blocked_short,
         raw_signal=raw_signal,
         final_signal=final_signal,
         block_reason=block_reason,

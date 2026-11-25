@@ -31,7 +31,7 @@ logger = logging.getLogger("vika.telegram")
 
 BTN_STATUS = "📊 Статус и Баланс"
 BTN_POSITIONS = "📈 Открытые позиции"
-BTN_PORTFOLIO = "🪙 Портфель (10 монет)"
+BTN_PORTFOLIO = "🪙 Портфель (13 монет)"
 BTN_HISTORY = "📜 История сделок"
 BTN_TOGGLE_PAUSE = "⏸ Пауза / ▶️ Старт"
 BTN_PANIC = "🛑 Закрыть всё (Panic Close)"
@@ -49,7 +49,7 @@ MAIN_KEYBOARD = {
 BOT_COMMANDS = [
     {"command": "status", "description": "Vika N2N7 — статус, баланс и дневной лимит"},
     {"command": "positions", "description": "Открытые позиции и статус BE"},
-    {"command": "portfolio", "description": "Портфель 10 монет и фильтры (4H/N2/N7)"},
+    {"command": "portfolio", "description": "Портфель 13 монет и фильтры (4H/N2/N7/T4)"},
     {"command": "history", "description": "Последние 10 закрытых сделок"},
     {"command": "pause", "description": "Пауза / Возобновление торговли"},
     {"command": "panic", "description": "Panic Close — закрыть всё по рынку"},
@@ -190,10 +190,10 @@ class VikaTelegramUI:
             f"📅 PnL за день (UTC): <b>{ds['daily_pnl_usd']:+,.2f} USDT ({ds['daily_pnl_pct']:+.2f}%)</b>",
             f"🏆 PnL всего (закрытых): <b>{stats['pnl_usd']:+,.2f} USDT</b> (сделок: {stats['trades']}, WR: {stats['wr']:.1f}%, SL: {stats['sl']})",
             f"",
-            f"🧩 Слоты: <b>{len(active)}/{self.executor.max_open}</b> (10% × 10x, макс. 80% маржи)",
+            f"🧩 Слоты: <b>{len(active)}/{self.executor.max_open}</b> (10% × 10x, макс. 80% маржи | R3: макс. {self.executor.max_same_key}/ключ)",
             f"⌛ Лимитки TTL: <code>{self.executor.ttl_sec // 60}m ({self.executor.ttl_bars} свечи 15m)</code>",
             f"🛡 Дневной лимит -6%: <b>{daily_state}</b>",
-            f"🔎 Фильтры: <code>4H STRONG Div</code> | <code>N2 Анти-кульминация</code> | <code>N7 Funding &lt;1.5bps</code>",
+            f"🔎 Фильтры: <code>4H STRONG Div</code> | <code>N2</code> | <code>N7 FR&lt;1.5bps</code> | <code>T4 4H Slope&gt;0.15%</code>",
         ]
         if self.executor.stale_warnings:
             lines.append("")
@@ -234,7 +234,8 @@ class VikaTelegramUI:
 
     def format_portfolio(self) -> str:
         evals = self.get_latest_evals()
-        lines = ["🪙 <b>ПОРТФЕЛЬ Vika N2N7 — 10 МОНЕТ</b>"]
+        n_coins = len(self.cfg["coins"])
+        lines = [f"🪙 <b>ПОРТФЕЛЬ Vika N2N7 — {n_coins} МОНЕТ</b>"]
         for idx, c in enumerate(self.cfg["coins"], 1):
             sym = c["symbol"]
             k_short = c["key"].split("_")[0]
@@ -246,11 +247,12 @@ class VikaTelegramUI:
                 d4 = "🟢" if (not ev.div4h_bear_strong and not ev.div4h_bull_strong) else ("🔴L" if ev.div4h_bear_strong else "🔴S")
                 n2 = "🟢" if not ev.n2_blocked else "🔴"
                 n7 = "🟢" if (not ev.n7_blocked_long and not ev.n7_blocked_short) else ("🔴L" if ev.n7_blocked_long else "🔴S")
+                t4 = "🟢L" if (not ev.t4_blocked_long) else ("🟢S" if (not ev.t4_blocked_short) else "🔴")
                 lines.append(
                     f"{idx}. <b>{sym}</b> | <code>{k_short}</code> ({tp_sl}) | "
-                    f"4H:{d4} N2:{n2} FR:{n7} (<code>{ev.funding_bps:+.2f}bps</code>)"
+                    f"4H:{d4} N2:{n2} FR:{n7} T4:{t4}(<code>{ev.slope4h_pct:+.2f}%</code>)"
                 )
-        lines.append("\n<i>Легенда: 🟢 свободно | 🔴 блок (L=Long, S=Short)</i>")
+        lines.append("\n<i>Легенда: 🟢 свободно | 🔴 блок | T4: 🟢L/🟢S наклон 4H EMA50 &gt;0.15%</i>")
         return "\n".join(lines)
 
     def format_history(self) -> str:
@@ -272,12 +274,13 @@ class VikaTelegramUI:
 
     def format_startup_welcome(self, lev_status: Dict[str, str]) -> str:
         ds = self.executor.check_daily_stop()
+        n_coins = len(self.cfg["coins"])
         ok_cnt = sum(1 for v in lev_status.values() if v.startswith("OK") or v.startswith("DRY_RUN"))
         header = (
-            f"🤖 <b>ЗАПУСК: Vika N2N7</b>\n"
-            f"Биржа: <code>Bybit {self.executor.mode.upper()} | 10x Cross ({ok_cnt}/10 монет)</code>\n"
-            f"Баланс: <b>${ds['current_equity']:,.2f}</b> | Риск: <code>10% × 10x | слоты 8/8 | дневной стоп -6%</code>\n"
-            f"Лимитки TTL: <code>45m (3 свечи 15m, автоотмена)</code> | Фильтры: <code>4H STRONG Div + N2 + N7</code>\n"
+            f"🤖 <b>ЗАПУСК: Vika N2N7 (13 CLEAN + R3 + T4)</b>\n"
+            f"Биржа: <code>Bybit {self.executor.mode.upper()} | 10x Cross ({ok_cnt}/{n_coins} монет)</code>\n"
+            f"Баланс: <b>${ds['current_equity']:,.2f}</b> | Риск: <code>10% × 10x | слоты 8/8 (R3: макс.{self.executor.max_same_key}/ключ) | стоп -6%</code>\n"
+            f"Лимитки TTL: <code>45m (3 свечи 15m)</code> | Фильтры: <code>4H Div + N2 + N7 + T4(4H slope&gt;0.15%)</code>\n"
         )
         if getattr(self.executor, "startup_cancelled_orders", None):
             header += "\n🧹 <b>Отменены зависшие лимитные ордера при старте:</b>\n"

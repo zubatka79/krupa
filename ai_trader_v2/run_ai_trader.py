@@ -153,8 +153,9 @@ class VikaRunner:
     # ------------------------------------------------------------------
     def run_dry_run_check(self) -> int:
         logger.info("=== VIKA_N2_N7 DRY-RUN CHECK (mode=%s, dry_run=%s) ===", self.mode, self.executor.dry_run)
+        n_coins = len(self.cfg["coins"])
         specs = self.executor.load_instruments()
-        logger.info("Loaded %d/10 Bybit Linear USDT instruments.", len(specs))
+        logger.info("Loaded %d/%d Bybit Linear USDT instruments.", len(specs), n_coins)
 
         lev_status = self.executor.ensure_cross_margin_and_leverage()
         for sym, st in lev_status.items():
@@ -170,14 +171,14 @@ class VikaRunner:
         logger.info("Wallet balance: equity=$%.2f | available=$%.2f", eq, avail)
 
         evals = self.scan_all_coins()
-        logger.info("Evaluated %d/10 coins on latest closed 15m candle:", len(evals))
-        print("\n" + "=" * 124)
+        logger.info("Evaluated %d/%d coins on latest closed 15m candle:", len(evals), n_coins)
+        print("\n" + "=" * 134)
         print(
             f"{'SYMBOL':<13} {'KEY':<17} {'CLOSE':>10} {'QTY(10%x10x)':>13} {'NOTION':>8} "
-            f"{'ADX15':>6} {'BBW%':>6} {'ATR%':>6} {'FR_bps':>7} {'4H_DIV':<11} {'RAW':<6} {'FINAL':<6} {'BLOCK'}"
+            f"{'ADX15':>6} {'BBW%':>6} {'ATR%':>6} {'FR_bps':>7} {'SLP4H%':>7} {'4H_DIV':<24} {'RAW':<6} {'FINAL':<6} {'BLOCK'}"
         )
-        print("-" * 124)
-        all_ok = len(evals) == len(self.cfg["coins"])
+        print("-" * 134)
+        all_ok = len(evals) == n_coins
         margin_usd = eq * (float(self.cfg.get("margin_pct_per_trade", 10.0)) / 100.0)
         lev = int(self.cfg.get("leverage", 10))
         for coin in self.cfg["coins"]:
@@ -195,14 +196,14 @@ class VikaRunner:
                 all_ok = False
             print(
                 f"{sym:<13} {ev.key:<17} {px:>10.5g} {qty:>13.6g} {notional:>8.1f} "
-                f"{ev.adx15:>6.1f} {ev.bbw15:>6.2f} {ev.atr15_pct:>6.2f} {ev.funding_bps:>+7.2f} "
+                f"{ev.adx15:>6.1f} {ev.bbw15:>6.2f} {ev.atr15_pct:>6.2f} {ev.funding_bps:>+7.2f} {ev.slope4h_pct:>+6.2f}% "
                 f"{ev.div4h_label:<24} {(ev.raw_signal or '-'):<6} {(ev.final_signal or '-'):<6} {ev.block_reason or '-'}"
             )
-        print("=" * 124)
+        print("=" * 134)
 
         ok_lev = sum(1 for v in lev_status.values() if v.startswith("OK") or v.startswith("DRY_RUN"))
-        print(f"Summary: instruments={len(specs)}/10 | leverage_10x_cross={ok_lev}/10 | evals={len(evals)}/10 | equity=${eq:,.2f}")
-        return 0 if (all_ok and ok_lev == 10) else 1
+        print(f"Summary: instruments={len(specs)}/{n_coins} | leverage_10x_cross={ok_lev}/{n_coins} | evals={len(evals)}/{n_coins} | equity=${eq:,.2f}")
+        return 0 if (all_ok and ok_lev == n_coins) else 1
 
     # ------------------------------------------------------------------
     # Main Production Loop
@@ -223,9 +224,9 @@ class VikaRunner:
         self.executor.check_preexisting_positions()
         self.executor.sync_with_exchange()
 
-        # Initial snapshot of all 10 coins before startup welcome message
+        # Initial snapshot of all coins before startup welcome message
         init_evals = self.scan_all_coins()
-        logger.info("Initial scan complete: %d/10 coins evaluated.", len(init_evals))
+        logger.info("Initial scan complete: %d/%d coins evaluated.", len(init_evals), len(self.cfg["coins"]))
 
         if self.tg is not None:
             cmds_ok = self.tg.register_commands()
@@ -240,11 +241,15 @@ class VikaRunner:
         last_sync_ts = time.monotonic()
 
         logger.info(
-            "Main loop active: 15m closed-candle scans + %ds exchange sync | limit_entry_ttl=%dm (%d bars / %ds).",
+            "Main loop active: 15m closed-candle scans (%d coins) + %ds exchange sync | "
+            "limit_entry_ttl=%dm (%d bars / %ds) | R3 max_same_key=%d | T4 slope4h>%.2f%%.",
+            len(self.cfg["coins"]),
             self.sync_interval,
             self.executor.ttl_sec // 60,
             self.executor.ttl_bars,
             self.executor.ttl_sec,
+            self.executor.max_same_key,
+            float(self.filters_cfg.get("t4_min_4h_ema50_slope_pct", 0.15)),
         )
         while not self._stop_evt.is_set():
             now_mono = time.monotonic()
