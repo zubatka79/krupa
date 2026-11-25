@@ -71,20 +71,36 @@ class VikaTelegramUI:
 
         self.token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         self.chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-        self.enabled = bool(self.token and self.chat_id and "your_telegram" not in self.token.lower())
+        raw_users = os.getenv("TELEGRAM_ALLOWED_USER_IDS", "").strip()
+        self.allowed_users = {u.strip() for u in raw_users.split(",") if u.strip()}
+        self.enabled = bool(
+            self.token
+            and "your_telegram" not in self.token.lower()
+            and (self.chat_id or self.allowed_users)
+        )
         self.api_base = f"https://api.telegram.org/bot{self.token}" if self.enabled else ""
 
-        self._session = requests.Session()
+        self._send_session = requests.Session()
+        self._poll_session = requests.Session()
         self._stop_evt = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._offset = 0
+
+    def is_authorized(self, chat: Dict[str, Any], user: Dict[str, Any]) -> bool:
+        cid = str(chat.get("id", ""))
+        uid = str(user.get("id", ""))
+        if self.chat_id and cid == self.chat_id:
+            return True
+        if self.allowed_users and (uid in self.allowed_users or cid in self.allowed_users):
+            return True
+        return False
 
     def register_commands(self) -> bool:
         """Overwrite Telegram bot slash-command menu via setMyCommands strictly for Vika N2N7."""
         if not self.enabled:
             return False
         try:
-            r = self._session.post(
+            r = self._send_session.post(
                 f"{self.api_base}/setMyCommands",
                 json={"commands": BOT_COMMANDS},
                 timeout=15,
@@ -105,33 +121,37 @@ class VikaTelegramUI:
         text: str,
         reply_markup: Optional[Dict[str, Any]] = None,
         parse_mode: str = "HTML",
+        chat_id: Optional[str] = None,
     ) -> bool:
         if not self.enabled:
             logger.info("[TG DISABLED] %s", text.replace("\n", " | "))
             return False
+        target_chat = str(chat_id or self.chat_id or next(iter(self.allowed_users), "")).strip()
+        if not target_chat:
+            return False
         payload: Dict[str, Any] = {
-            "chat_id": self.chat_id,
+            "chat_id": target_chat,
             "text": text,
             "parse_mode": parse_mode,
             "disable_web_page_preview": True,
+            "reply_markup": reply_markup if reply_markup is not None else MAIN_KEYBOARD,
         }
-        payload["reply_markup"] = json.dumps(reply_markup if reply_markup is not None else MAIN_KEYBOARD)
         try:
-            r = self._session.post(f"{self.api_base}/sendMessage", json=payload, timeout=15)
+            r = self._send_session.post(f"{self.api_base}/sendMessage", json=payload, timeout=15)
             data = r.json()
             if not data.get("ok"):
-                logger.warning("Telegram sendMessage failed: %s", data)
+                logger.warning("Telegram sendMessage failed (chat=%s): %s", target_chat, data)
                 return False
             return True
         except Exception as exc:
-            logger.warning("Telegram sendMessage exception: %s", exc)
+            logger.warning("Telegram sendMessage exception (chat=%s): %s", target_chat, exc)
             return False
 
     def _answer_callback(self, callback_id: str, text: str = "") -> None:
         if not self.enabled:
             return
         try:
-            self._session.post(
+            self._send_session.post(
                 f"{self.api_base}/answerCallbackQuery",
                 json={"callback_query_id": callback_id, "text": text},
                 timeout=10,
@@ -143,7 +163,17 @@ class VikaTelegramUI:
     # View Formatters
     # ------------------------------------------------------------------
     def format_status(self) -> str:
-        ds = self.executor.check_daily_stop()
+        try:
+            ds = self.executor.check_daily_stop()
+        except Exception as exc:
+            logger.warning("format_status balance refresh fallback: %s", exc)
+            eq = self.executor.last_equity
+            ds = self.journal.ensure_daily_state(eq)
+            start_eq = ds["start_equity"]
+            pnl = eq - start_eq
+            ds["current_equity"] = eq
+            ds["daily_pnl_usd"] = round(pnl, 2)
+            ds["daily_pnl_pct"] = round((pnl / start_eq * 100.0) if start_eq > 0 else 0.0, 2)
         stats = self.journal.get_total_realized_stats()
         active = self.journal.get_active_positions()
         paused = self.journal.is_paused()
@@ -267,14 +297,14 @@ class VikaTelegramUI:
             return
         # Flush old queued updates on startup so we don't replay stale panic clicks
         try:
-            r = self._session.get(f"{self.api_base}/getUpdates", params={"timeout": 1, "offset": -1}, timeout=10).json()
+            r = self._poll_session.get(f"{self.api_base}/getUpdates", params={"timeout": 1, "offset": -1}, timeout=10).json()
             if r.get("ok") and r.get("result"):
                 self._offset = int(r["result"][-1]["update_id"]) + 1
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning("Telegram initial offset flush note: %s", exc)
         self._thread = threading.Thread(target=self._poll_loop, name="vika-tg-poll", daemon=True)
         self._thread.start()
-        logger.info("Telegram polling started")
+        logger.info("Telegram polling started (chat_id=%s, allowed_users=%d)", bool(self.chat_id), len(self.allowed_users))
 
     def stop(self) -> None:
         self._stop_evt.set()
@@ -282,64 +312,84 @@ class VikaTelegramUI:
     def _poll_loop(self) -> None:
         while not self._stop_evt.is_set():
             try:
-                r = self._session.get(
+                r = self._poll_session.get(
                     f"{self.api_base}/getUpdates",
                     params={"timeout": 20, "offset": self._offset},
                     timeout=30,
                 )
                 data = r.json()
                 if not data.get("ok"):
+                    logger.warning("Telegram getUpdates non-ok: %s", data.get("description") or data)
                     time.sleep(3)
                     continue
                 for upd in data.get("result", []):
                     self._offset = int(upd["update_id"]) + 1
-                    self._handle_update(upd)
+                    try:
+                        self._handle_update(upd)
+                    except Exception as exc:
+                        logger.warning("Telegram _handle_update error: %s", exc)
             except Exception as exc:
-                logger.debug("Telegram poll retry: %s", exc)
+                logger.warning("Telegram poll retry: %s", exc)
                 time.sleep(3)
 
     def _handle_update(self, upd: Dict[str, Any]) -> None:
         if "callback_query" in upd:
             cq = upd["callback_query"]
-            cid = str(cq.get("message", {}).get("chat", {}).get("id", ""))
-            if cid != self.chat_id:
+            chat = cq.get("message", {}).get("chat", {}) or {}
+            user = cq.get("from", {}) or {}
+            if not self.is_authorized(chat, user):
                 return
+            cid = str(chat.get("id", ""))
             cdata = cq.get("data", "")
             self._answer_callback(cq["id"])
             if cdata == "panic_confirm":
                 res = self.executor.panic_close_all()
-                self.send_message(res)
+                self.send_message(res, chat_id=cid)
             elif cdata == "panic_cancel":
-                self.send_message("❌ Panic Close отменён. Бот продолжает работу в штатном режиме.")
+                self.send_message("❌ Panic Close отменён. Vika N2N7 продолжает работу в штатном режиме.", chat_id=cid)
+            else:
+                # Legacy inline button clicked -> send fresh Vika N2N7 status & ReplyKeyboard
+                self.send_message(
+                    "🔄 Интерфейс обновлён до <b>Vika N2N7</b> (10 монет, 4H+N2+N7).\n\n" + self.format_status(),
+                    chat_id=cid,
+                )
             return
 
         msg = upd.get("message")
         if not msg:
             return
-        cid = str(msg.get("chat", {}).get("id", ""))
-        if cid != self.chat_id:
+        chat = msg.get("chat", {}) or {}
+        user = msg.get("from", {}) or {}
+        if not self.is_authorized(chat, user):
+            logger.info("Ignored unauthorized Telegram message from chat=%s user=%s", chat.get("id"), user.get("id"))
             return
+        cid = str(chat.get("id", ""))
         text = (msg.get("text") or "").strip()
+        if not text:
+            return
+        cmd = text.split()[0].split("@")[0].lower()
+        low = text.lower()
 
-        if text in ("/start", "/status", BTN_STATUS):
-            self.send_message(self.format_status())
-        elif text in ("/positions", BTN_POSITIONS):
-            self.send_message(self.format_open_positions())
-        elif text in ("/portfolio", BTN_PORTFOLIO):
-            self.send_message(self.format_portfolio())
-        elif text in ("/history", BTN_HISTORY):
-            self.send_message(self.format_history())
-        elif text in ("/pause", BTN_TOGGLE_PAUSE):
+        if text == BTN_STATUS or cmd in ("/start", "/status", "/menu") or ("статус" in low and "баланс" in low):
+            self.send_message(self.format_status(), chat_id=cid)
+        elif text == BTN_POSITIONS or cmd == "/positions" or "открытые позиции" in low:
+            self.send_message(self.format_open_positions(), chat_id=cid)
+        elif text == BTN_PORTFOLIO or cmd == "/portfolio" or "портфель" in low:
+            self.send_message(self.format_portfolio(), chat_id=cid)
+        elif text == BTN_HISTORY or cmd == "/history" or "история сделок" in low:
+            self.send_message(self.format_history(), chat_id=cid)
+        elif text == BTN_TOGGLE_PAUSE or cmd in ("/pause", "/resume") or ("пауза" in low and "старт" in low):
             new_state = not self.journal.is_paused()
             self.journal.set_paused(new_state)
             if new_state:
                 self.send_message(
-                    "⏸ <b>БОТ ПОСТАВЛЕН НА ПАУЗУ</b>\n"
-                    "Новые сделки открываться не будут. Защитные SL/TP на открытых позициях сохранены."
+                    "⏸ <b>Vika N2N7 ПОСТАВЛЕН НА ПАУЗУ</b>\n"
+                    "Новые сделки открываться не будут. Защитные SL/TP на открытых позициях сохранены.",
+                    chat_id=cid,
                 )
             else:
-                self.send_message("▶️ <b>Vika N2N7 ВОЗОБНОВИЛ РАБОТУ</b>\nПоиск новых входов активен.")
-        elif text in ("/panic", BTN_PANIC):
+                self.send_message("▶️ <b>Vika N2N7 ВОЗОБНОВИЛ РАБОТУ</b>\nПоиск новых входов активен.", chat_id=cid)
+        elif text == BTN_PANIC or cmd == "/panic" or "panic close" in low or "закрыть всё" in low:
             confirm_kb = {
                 "inline_keyboard": [[
                     {"text": "✅ Да, закрыть всё по рынку", "callback_data": "panic_confirm"},
@@ -347,7 +397,8 @@ class VikaTelegramUI:
                 ]]
             }
             self.send_message(
-                "🛑 <b>ПОДТВЕРЖДЕНИЕ PANIC CLOSE</b>\n"
+                "🛑 <b>ПОДТВЕРЖДЕНИЕ PANIC CLOSE | Vika N2N7</b>\n"
                 "Закрыть ВСЕ открытые позиции по рынку, отменить активные ордера и поставить бота на паузу?",
                 reply_markup=confirm_kb,
+                chat_id=cid,
             )
