@@ -10,6 +10,11 @@ __pycache__
 .pytest_cache
 logs
 data/cache
+data/cache_v2_*
+data/ai_trader_v2
+ai_trader_v2/data
+ai_trader_v2/logs
+research_v2
 data/*.db
 data/*.db-*
 data/news_state*.json

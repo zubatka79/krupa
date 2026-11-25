@@ -1,8 +1,7 @@
 services:
-  vika-n2n7:
+  ai-trader-v2:
     build: .
-    image: krupa-vika-n2n7:latest
-    container_name: vika-n2n7
+    image: krupa-bot:latest
     restart: unless-stopped
     init: true
     stop_grace_period: 30s
