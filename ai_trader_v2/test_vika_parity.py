@@ -208,7 +208,127 @@ def test_journal_executor_and_telegram() -> None:
     print("[PASS] Journal, Executor (10%x10x, BE, Panic), and Telegram UI verified.")
 
 
+def test_limit_order_ttl_45m_partial_fill_and_startup_cleanup() -> None:
+    """Verify 45m (3-bar) TTL cancel, partial-fill remainder cancel, and startup stale cleanup."""
+    import time
+
+    with open(ROOT / "ai_trader_v2" / "config_ai_trader.json", "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    cfg["mode"] = "demo"
+    cfg["dry_run"] = False
+    assert cfg["limit_entry_ttl_bars"] == 3
+    assert cfg["limit_entry_ttl_sec"] == 2700
+
+    class MockBybitClient:
+        has_credentials = True
+
+        def __init__(self) -> None:
+            self.positions: list = []
+            self.open_orders: list = []
+            self.cancelled_calls: list = []
+
+        def get_positions(self, symbol=None):
+            if symbol:
+                return [p for p in self.positions if p["symbol"] == symbol]
+            return list(self.positions)
+
+        def get_open_orders(self, symbol=None):
+            if symbol:
+                return [o for o in self.open_orders if o["symbol"] == symbol]
+            return list(self.open_orders)
+
+        def cancel_order(self, symbol: str, order_id: str) -> None:
+            self.cancelled_calls.append((symbol, order_id))
+            self.open_orders = [o for o in self.open_orders if o["orderId"] != order_id]
+
+        def get_wallet_balance(self, coin: str = "USDT"):
+            return {"equity": 2000.0, "available": 2000.0}
+
+    with tempfile.TemporaryDirectory() as tmp:
+        journal = VikaJournal(Path(tmp) / "ttl_test.db")
+        mock = MockBybitClient()
+        sent = []
+        ex = VikaExecutor(cfg, mock, journal, notifier=sent.append)  # type: ignore[arg-type]
+
+        now_ms = int(time.time() * 1000)
+
+        # --- Case 1: Unfilled limit order aged 46m -> must cancel, free slot, notify Telegram ---
+        p1 = journal.add_position(
+            symbol="GRAMUSDT", side="LONG", key_name="K1_EMA_TREND_PB", status="PENDING",
+            order_id="ORD-UNFILLED-46M", entry_price=0.90, qty=2000.0, margin_usd=180.0, leverage=10,
+            tp_price=0.9126, sl_price=0.873, be_trigger_price=0.9085, be_lock_price=0.9022,
+            entry_bar_ts=now_ms - 4 * M15_MS, expire_ts=now_ms - 60_000, filters={},
+        )
+        mock.open_orders = [{
+            "orderId": "ORD-UNFILLED-46M", "symbol": "GRAMUSDT", "orderType": "Limit",
+            "side": "Buy", "price": "0.90", "reduceOnly": False, "stopOrderType": "",
+            "createdTime": str(now_ms - 46 * 60_000),
+        }]
+        ex.sync_with_exchange()
+        assert ("GRAMUSDT", "ORD-UNFILLED-46M") in mock.cancelled_calls
+        assert len(journal.get_active_positions()) == 0
+        assert any("Лимитный ордер по GRAMUSDT отменён по тайм-ауту 45m (3 свечи)" in m for m in sent)
+
+        # --- Case 2: Partial fill before 45m -> keep OPEN & order; after 45m -> cancel ONLY remainder ---
+        sent.clear()
+        mock.cancelled_calls.clear()
+        p2 = journal.add_position(
+            symbol="BNBUSDT", side="SHORT", key_name="K6_VWAP_RECLAIM", status="PENDING",
+            order_id="ORD-PARTIAL", entry_price=540.0, qty=3.7, margin_usd=200.0, leverage=10,
+            tp_price=532.44, sl_price=556.2, be_trigger_price=534.87, be_lock_price=538.65,
+            entry_bar_ts=now_ms - M15_MS, expire_ts=now_ms + 30 * 60_000, filters={},
+        )
+        mock.positions = [{
+            "symbol": "BNBUSDT", "side": "Sell", "size": "1.5", "avgPrice": "540.0",
+            "takeProfit": "532.44", "stopLoss": "556.2",
+        }]
+        mock.open_orders = [{
+            "orderId": "ORD-PARTIAL", "symbol": "BNBUSDT", "orderType": "Limit",
+            "side": "Sell", "price": "540.0", "reduceOnly": False, "stopOrderType": "",
+            "createdTime": str(now_ms - 10 * 60_000),
+        }]
+        ex.sync_with_exchange()
+        # Still before 45m -> position OPEN (qty 1.5), remainder NOT cancelled yet
+        act = journal.get_active_positions()
+        assert len(act) == 1 and act[0]["status"] == "OPEN" and abs(act[0]["qty"] - 1.5) < 1e-6
+        assert act[0]["order_id"] == "ORD-PARTIAL"
+        assert len(mock.cancelled_calls) == 0
+
+        # Now expire it past 45m
+        with journal._connect() as conn:
+            conn.execute("UPDATE positions SET expire_ts = ? WHERE id = ?", (now_ms - 1000, p2))
+        ex.sync_with_exchange()
+        # Remainder cancelled, OPEN filled part kept intact, order_id cleared, TG notified!
+        assert ("BNBUSDT", "ORD-PARTIAL") in mock.cancelled_calls
+        act = journal.get_active_positions()
+        assert len(act) == 1 and act[0]["status"] == "OPEN" and act[0]["order_id"] == ""
+        assert any("BNBUSDT" in m and "45m (3 свечи)" in m and "остаток" in m for m in sent)
+
+        # --- Case 3: Startup guard cancels >45m entry Limit, keeps <45m entry Limit and all TP/SL ---
+        mock.cancelled_calls.clear()
+        mock.positions = []
+        mock.open_orders = [
+            # Stale 60m opening limit -> MUST CANCEL
+            {"orderId": "STALE-60M", "symbol": "LTCUSDT", "orderType": "Limit", "side": "Buy",
+             "price": "40.0", "reduceOnly": False, "stopOrderType": "", "createdTime": str(now_ms - 60 * 60_000)},
+            # Fresh 15m opening limit -> MUST KEEP
+            {"orderId": "FRESH-15M", "symbol": "NEARUSDT", "orderType": "Limit", "side": "Buy",
+             "price": "2.7", "reduceOnly": False, "stopOrderType": "", "createdTime": str(now_ms - 15 * 60_000)},
+            # Old 5h TP/SL protective order -> MUST NEVER CANCEL
+            {"orderId": "OLD-TPSL", "symbol": "BNBUSDT", "orderType": "Limit", "side": "Buy",
+             "price": "532.44", "reduceOnly": True, "stopOrderType": "TakeProfit", "createdTime": str(now_ms - 300 * 60_000)},
+        ]
+        cancelled = ex.cleanup_stale_entry_orders()
+        assert len(cancelled) == 1 and "LTCUSDT" in cancelled[0]
+        assert mock.cancelled_calls == [("LTCUSDT", "STALE-60M")]
+        remaining_ids = {o["orderId"] for o in mock.open_orders}
+        assert remaining_ids == {"FRESH-15M", "OLD-TPSL"}
+
+    print("[PASS] 45m (3-bar) Limit TTL, Partial-Fill remainder cancel & Startup stale guard verified.")
+
+
 if __name__ == "__main__":
     test_parity_with_research()
     test_journal_executor_and_telegram()
+    test_limit_order_ttl_45m_partial_fill_and_startup_cleanup()
     print("\nALL VIKA_N2_N7 PARITY & UNIT TESTS PASSED!")

@@ -193,6 +193,26 @@ class VikaJournal:
                 (float(fill_price), float(fill_qty), float(margin_usd), int(pos_id)),
             )
 
+    def update_open_fill(
+        self,
+        pos_id: int,
+        fill_price: float,
+        fill_qty: float,
+        margin_usd: float,
+        clear_order_id: bool = False,
+    ) -> None:
+        with self._lock, self._connect() as conn:
+            if clear_order_id:
+                conn.execute(
+                    "UPDATE positions SET status = 'OPEN', entry_price = ?, qty = ?, margin_usd = ?, order_id = '' WHERE id = ?",
+                    (float(fill_price), float(fill_qty), float(margin_usd), int(pos_id)),
+                )
+            else:
+                conn.execute(
+                    "UPDATE positions SET status = 'OPEN', entry_price = ?, qty = ?, margin_usd = ? WHERE id = ?",
+                    (float(fill_price), float(fill_qty), float(margin_usd), int(pos_id)),
+                )
+
     def mark_be_active(self, pos_id: int, new_sl: float) -> None:
         with self._lock, self._connect() as conn:
             conn.execute(

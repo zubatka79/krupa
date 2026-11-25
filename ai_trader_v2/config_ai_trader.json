@@ -13,6 +13,7 @@
   "max_per_symbol": 1,
   "daily_loss_limit_pct": 6.0,
   "limit_entry_ttl_bars": 3,
+  "limit_entry_ttl_sec": 2700,
   "cooldown_bars_after_close": 4,
   "sync_interval_sec": 20,
   "db_path": "data/ai_trader_v2/vika_trades.db",

@@ -215,6 +215,11 @@ class VikaRunner:
         for sym, st in lev_status.items():
             logger.info("Margin/Leverage %-13s: %s", sym, st)
 
+        cancelled_stale = self.executor.cleanup_stale_entry_orders()
+        if cancelled_stale:
+            logger.warning("Startup stale limit orders cancelled (>45m): %s", cancelled_stale)
+        else:
+            logger.info("Startup stale limit orders check (>45m): CLEAN (0 stale entry orders).")
         self.executor.check_preexisting_positions()
         self.executor.sync_with_exchange()
 
@@ -232,7 +237,13 @@ class VikaRunner:
         last_scanned_bucket = int(time.time() * 1000) // M15_MS
         last_sync_ts = time.monotonic()
 
-        logger.info("Main loop active: 15m closed-candle scans + %ds exchange sync.", self.sync_interval)
+        logger.info(
+            "Main loop active: 15m closed-candle scans + %ds exchange sync | limit_entry_ttl=%dm (%d bars / %ds).",
+            self.sync_interval,
+            self.executor.ttl_sec // 60,
+            self.executor.ttl_bars,
+            self.executor.ttl_sec,
+        )
         while not self._stop_evt.is_set():
             now_mono = time.monotonic()
             now_ms = int(time.time() * 1000)

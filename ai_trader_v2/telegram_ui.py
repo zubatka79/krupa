@@ -216,8 +216,12 @@ class VikaTelegramUI:
             f"🤖 <b>ЗАПУСК: ВИКА (N2+N7)</b>\n"
             f"Биржа: <code>Bybit {self.executor.mode.upper()} | 10x Cross ({ok_cnt}/10 монет)</code>\n"
             f"Баланс: <b>${ds['current_equity']:,.2f}</b> | Риск: <code>10% × 10x | слоты 8/8 | дневной стоп -6%</code>\n"
-            f"Фильтры: <code>4H STRONG Div + N2 Анти-кульминация + N7 Funding</code>\n"
+            f"Лимитки TTL: <code>45m (3 свечи 15m, автоотмена)</code> | Фильтры: <code>4H STRONG Div + N2 + N7</code>\n"
         )
+        if getattr(self.executor, "startup_cancelled_orders", None):
+            header += "\n🧹 <b>Отменены зависшие лимитные ордера при старте:</b>\n"
+            for item in self.executor.startup_cancelled_orders:
+                header += f"  • <code>{item}</code>\n"
         if self.executor.stale_warnings:
             header += "\n⚠️ <b>ВНИМАНИЕ — найдены старые позиции/ордера (не закрыты):</b>\n"
             for w in self.executor.stale_warnings:
