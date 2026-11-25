@@ -66,7 +66,7 @@
   "min_orderbook_depth_03_usdt": 50000.0,
   "max_spread_bps": 10.0,
   "min_rvol_s12": 1.2,
-  "min_schools_non_s12": 2,
+  "min_schools_non_s12": 1,
   "min_rvol_non_s12": 1.2,
   "divergence_enabled": true,
   "divergence_min_indicators": 2,

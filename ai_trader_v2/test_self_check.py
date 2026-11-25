@@ -76,7 +76,7 @@ def main() -> None:
     assert cfg["mode"] == "demo"
     assert cfg["max_open_positions"] == 8 and cfg["max_same_direction"] == 5
     assert cfg["long_require_4h"] is True and cfg["short_require_4h"] is False
-    assert cfg["min_rvol_s12"] == 1.2 and cfg["min_schools_non_s12"] == 2 and cfg["min_rvol_non_s12"] == 1.2
+    assert cfg["min_rvol_s12"] == 1.2 and cfg["min_schools_non_s12"] == 1 and cfg["min_rvol_non_s12"] == 1.2
     assert cfg["be_stage1_close_r"] == 1.3 and cfg["be_stage1_sl_r"] == -0.5
     assert cfg["be_stage2_tp1_sl_r"] == -0.35
     assert cfg["be_stage3_close_r"] == 2.3 and cfg["be_stage3_sl_r"] == 0.3
