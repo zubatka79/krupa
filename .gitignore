@@ -22,6 +22,9 @@ data/ai_usage.json
 data/rnd_scout.lock
 data/blacklist.json.lock
 data/rnd_scout_latest.json
+data/ai_trader_v2/
+ai_trader_v2/data/
+ai_trader_v2/logs/
 logs/
 
 # Python environment & bytecode

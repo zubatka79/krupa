@@ -1,0 +1,111 @@
+{
+  "strategy_name": "VIKA_N2_N7",
+  "mode": "demo",
+  "dry_run": false,
+  "margin_mode": "CROSS",
+  "leverage": 10,
+  "timeframe": "15",
+  "higher_timeframes": ["60", "240"],
+  "margin_pct_per_trade": 10.0,
+  "max_open_positions": 8,
+  "max_same_direction": 8,
+  "max_total_margin_pct": 80.0,
+  "max_per_symbol": 1,
+  "daily_loss_limit_pct": 6.0,
+  "limit_entry_ttl_bars": 3,
+  "cooldown_bars_after_close": 4,
+  "sync_interval_sec": 20,
+  "db_path": "data/ai_trader_v2/vika_trades.db",
+  "cache_dir": "data/ai_trader_v2/cache",
+  "log_path": "logs/ai_trader_v2.log",
+  "filters": {
+    "div_4h_strong": true,
+    "div_4h_hold_bars": 8,
+    "n2_adx15_max": 40.0,
+    "n2_bbw15_max": 6.5,
+    "n2_atr15_pct_max": 1.5,
+    "n7_max_pay_funding_bps": 1.5
+  },
+  "coins": [
+    {
+      "symbol": "GRAMUSDT",
+      "key": "K1_EMA_TREND_PB",
+      "tp_pct": 1.4,
+      "sl_pct": 3.0,
+      "be_trigger_pct": 0.95,
+      "be_lock_pct": 0.25
+    },
+    {
+      "symbol": "BIGTIMEUSDT",
+      "key": "K7_SFP_LIQ_SWEEP",
+      "tp_pct": 1.4,
+      "sl_pct": 3.0,
+      "be_trigger_pct": 0.95,
+      "be_lock_pct": 0.25
+    },
+    {
+      "symbol": "BTWUSDT",
+      "key": "K8_SUPERTREND_BO",
+      "tp_pct": 1.2,
+      "sl_pct": 2.5,
+      "be_trigger_pct": 0.85,
+      "be_lock_pct": 0.2
+    },
+    {
+      "symbol": "VIRTUALUSDT",
+      "key": "K1_EMA_TREND_PB",
+      "tp_pct": 1.4,
+      "sl_pct": 3.0,
+      "be_trigger_pct": 0.95,
+      "be_lock_pct": 0.25
+    },
+    {
+      "symbol": "HBARUSDT",
+      "key": "K7_SFP_LIQ_SWEEP",
+      "tp_pct": 1.4,
+      "sl_pct": 3.0,
+      "be_trigger_pct": 0.95,
+      "be_lock_pct": 0.25
+    },
+    {
+      "symbol": "BNBUSDT",
+      "key": "K6_VWAP_RECLAIM",
+      "tp_pct": 1.4,
+      "sl_pct": 3.0,
+      "be_trigger_pct": 0.95,
+      "be_lock_pct": 0.25
+    },
+    {
+      "symbol": "MONUSDT",
+      "key": "K1_EMA_TREND_PB",
+      "tp_pct": 1.4,
+      "sl_pct": 3.0,
+      "be_trigger_pct": 0.95,
+      "be_lock_pct": 0.25
+    },
+    {
+      "symbol": "1000PEPEUSDT",
+      "key": "K6_VWAP_RECLAIM",
+      "tp_pct": 1.2,
+      "sl_pct": 2.5,
+      "be_trigger_pct": 0.85,
+      "be_lock_pct": 0.2
+    },
+    {
+      "symbol": "LTCUSDT",
+      "key": "K8_SUPERTREND_BO",
+      "tp_pct": 1.4,
+      "sl_pct": 3.0,
+      "be_trigger_pct": 0.95,
+      "be_lock_pct": 0.25
+    },
+    {
+      "symbol": "NEARUSDT",
+      "key": "K6_VWAP_RECLAIM",
+      "tp_pct": 1.2,
+      "sl_pct": 2.5,
+      "be_trigger_pct": 0.85,
+      "be_lock_pct": 0.2
+    }
+  ]
+}
