@@ -193,11 +193,11 @@ def test_journal_executor_and_telegram() -> None:
         tg = VikaTelegramUI(cfg, executor, journal, get_latest_evals=lambda: {"GRAMUSDT": ev})
         lev_st = executor.ensure_cross_margin_and_leverage()
         assert len(lev_st) == 10
-        assert "ВИКА (N2+N7)" in tg.format_startup_welcome(lev_st)
-        assert "СТАТУС И БАЛАНС" in tg.format_status()
-        assert "ОТКРЫТЫЕ ПОЗИЦИИ (1/8)" in tg.format_open_positions()
-        assert "ПОРТФЕЛЬ ВИКА (N2+N7)" in tg.format_portfolio()
-        assert "ИСТОРИЯ СДЕЛОК" in tg.format_history()
+        assert "Vika N2N7" in tg.format_startup_welcome(lev_st)
+        assert "СТАТУС И БАЛАНС | Vika N2N7" in tg.format_status()
+        assert "ОТКРЫТЫЕ ПОЗИЦИИ (1/8) | Vika N2N7" in tg.format_open_positions()
+        assert "ПОРТФЕЛЬ Vika N2N7" in tg.format_portfolio()
+        assert "ИСТОРИЯ СДЕЛОК | Vika N2N7" in tg.format_history()
 
         # Test Panic Close pauses bot & clears active
         panic_res = executor.panic_close_all()

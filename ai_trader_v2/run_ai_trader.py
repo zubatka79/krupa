@@ -228,6 +228,8 @@ class VikaRunner:
         logger.info("Initial scan complete: %d/10 coins evaluated.", len(init_evals))
 
         if self.tg is not None:
+            cmds_ok = self.tg.register_commands()
+            logger.info("Telegram setMyCommands updated: %s", cmds_ok)
             welcome = self.tg.format_startup_welcome(lev_status)
             sent = self.tg.send_message(welcome)
             logger.info("Telegram startup welcome sent: %s", sent)

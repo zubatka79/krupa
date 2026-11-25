@@ -46,6 +46,15 @@ MAIN_KEYBOARD = {
     "is_persistent": True,
 }
 
+BOT_COMMANDS = [
+    {"command": "status", "description": "Vika N2N7 — статус, баланс и дневной лимит"},
+    {"command": "positions", "description": "Открытые позиции и статус BE"},
+    {"command": "portfolio", "description": "Портфель 10 монет и фильтры (4H/N2/N7)"},
+    {"command": "history", "description": "Последние 10 закрытых сделок"},
+    {"command": "pause", "description": "Пауза / Возобновление торговли"},
+    {"command": "panic", "description": "Panic Close — закрыть всё по рынку"},
+]
+
 
 class VikaTelegramUI:
     def __init__(
@@ -69,6 +78,27 @@ class VikaTelegramUI:
         self._stop_evt = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._offset = 0
+
+    def register_commands(self) -> bool:
+        """Overwrite Telegram bot slash-command menu via setMyCommands strictly for Vika N2N7."""
+        if not self.enabled:
+            return False
+        try:
+            r = self._session.post(
+                f"{self.api_base}/setMyCommands",
+                json={"commands": BOT_COMMANDS},
+                timeout=15,
+            )
+            data = r.json()
+            ok = bool(data.get("ok"))
+            if not ok:
+                logger.warning("Telegram setMyCommands failed: %s", data)
+            else:
+                logger.info("Telegram setMyCommands updated for Vika N2N7: %d commands", len(BOT_COMMANDS))
+            return ok
+        except Exception as exc:
+            logger.warning("Telegram setMyCommands exception: %s", exc)
+            return False
 
     def send_message(
         self,
@@ -122,7 +152,7 @@ class VikaTelegramUI:
         daily_state = "🚨 СТОП -6% (до 00:00 UTC)" if ds["halted"] else "✅ В норме"
 
         lines = [
-            f"📊 <b>СТАТУС И БАЛАНС | ВИКА (N2+N7)</b>",
+            f"📊 <b>СТАТУС И БАЛАНС | Vika N2N7</b>",
             f"Режим биржи: <code>Bybit {mode_str} | 10x Cross</code>",
             f"Статус бота: <b>{run_state}</b>",
             f"",
@@ -131,6 +161,7 @@ class VikaTelegramUI:
             f"🏆 PnL всего (закрытых): <b>{stats['pnl_usd']:+,.2f} USDT</b> (сделок: {stats['trades']}, WR: {stats['wr']:.1f}%, SL: {stats['sl']})",
             f"",
             f"🧩 Слоты: <b>{len(active)}/{self.executor.max_open}</b> (10% × 10x, макс. 80% маржи)",
+            f"⌛ Лимитки TTL: <code>{self.executor.ttl_sec // 60}m ({self.executor.ttl_bars} свечи 15m)</code>",
             f"🛡 Дневной лимит -6%: <b>{daily_state}</b>",
             f"🔎 Фильтры: <code>4H STRONG Div</code> | <code>N2 Анти-кульминация</code> | <code>N7 Funding &lt;1.5bps</code>",
         ]
@@ -144,10 +175,10 @@ class VikaTelegramUI:
     def format_open_positions(self) -> str:
         active = self.journal.get_active_positions()
         if not active:
-            return "📈 <b>ОТКРЫТЫЕ ПОЗИЦИИ (0/8)</b>\nСейчас активных сделок нет."
+            return "📈 <b>ОТКРЫТЫЕ ПОЗИЦИИ (0/8) | Vika N2N7</b>\nСейчас активных сделок нет."
 
         ex_map = self.executor.last_exchange_positions
-        lines = [f"📈 <b>ОТКРЫТЫЕ ПОЗИЦИИ ({len(active)}/{self.executor.max_open})</b>"]
+        lines = [f"📈 <b>ОТКРЫТЫЕ ПОЗИЦИИ ({len(active)}/{self.executor.max_open}) | Vika N2N7</b>"]
         for p in active:
             sym = p["symbol"]
             badge = "🟢 LONG" if p["side"] == "LONG" else "🔴 SHORT"
@@ -173,7 +204,7 @@ class VikaTelegramUI:
 
     def format_portfolio(self) -> str:
         evals = self.get_latest_evals()
-        lines = ["🪙 <b>ПОРТФЕЛЬ ВИКА (N2+N7) — 10 МОНЕТ</b>"]
+        lines = ["🪙 <b>ПОРТФЕЛЬ Vika N2N7 — 10 МОНЕТ</b>"]
         for idx, c in enumerate(self.cfg["coins"], 1):
             sym = c["symbol"]
             k_short = c["key"].split("_")[0]
@@ -195,8 +226,8 @@ class VikaTelegramUI:
     def format_history(self) -> str:
         closed = self.journal.get_recent_closed(limit=10)
         if not closed:
-            return "📜 <b>ИСТОРИЯ СДЕЛОК</b>\nЗакрытых сделок пока нет."
-        lines = ["📜 <b>ПОСЛЕДНИЕ 10 ЗАКРЫТЫХ СДЕЛОК</b>"]
+            return "📜 <b>ИСТОРИЯ СДЕЛОК | Vika N2N7</b>\nЗакрытых сделок пока нет."
+        lines = ["📜 <b>ПОСЛЕДНИЕ 10 ЗАКРЫТЫХ СДЕЛОК | Vika N2N7</b>"]
         for r in closed:
             pnl = float(r.get("pnl_usd") or 0.0)
             pct = float(r.get("pnl_pct") or 0.0)
@@ -213,7 +244,7 @@ class VikaTelegramUI:
         ds = self.executor.check_daily_stop()
         ok_cnt = sum(1 for v in lev_status.values() if v.startswith("OK") or v.startswith("DRY_RUN"))
         header = (
-            f"🤖 <b>ЗАПУСК: ВИКА (N2+N7)</b>\n"
+            f"🤖 <b>ЗАПУСК: Vika N2N7</b>\n"
             f"Биржа: <code>Bybit {self.executor.mode.upper()} | 10x Cross ({ok_cnt}/10 монет)</code>\n"
             f"Баланс: <b>${ds['current_equity']:,.2f}</b> | Риск: <code>10% × 10x | слоты 8/8 | дневной стоп -6%</code>\n"
             f"Лимитки TTL: <code>45m (3 свечи 15m, автоотмена)</code> | Фильтры: <code>4H STRONG Div + N2 + N7</code>\n"
@@ -307,7 +338,7 @@ class VikaTelegramUI:
                     "Новые сделки открываться не будут. Защитные SL/TP на открытых позициях сохранены."
                 )
             else:
-                self.send_message("▶️ <b>БОТ ВОЗОБНОВИЛ РАБОТУ</b>\nПоиск новых входов «ВИКА (N2+N7)» активен.")
+                self.send_message("▶️ <b>Vika N2N7 ВОЗОБНОВИЛ РАБОТУ</b>\nПоиск новых входов активен.")
         elif text in ("/panic", BTN_PANIC):
             confirm_kb = {
                 "inline_keyboard": [[
