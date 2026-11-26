@@ -16,7 +16,7 @@ import logging
 import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from bot.bybit_client import BybitClient, InstrumentSpec, round_step_down, round_tick
+from bot.bybit_client import BybitClient, InstrumentSpec, fmt_num, round_step_down, round_tick
 from ai_trader_v2.journal import VikaJournal
 from ai_trader_v2.vika_engine import CoinEvaluation, M15_MS
 
@@ -300,10 +300,10 @@ class VikaExecutor:
             symbol=symbol,
             side=bybit_side,
             orderType="Limit",
-            qty=str(qty),
-            price=str(price),
-            takeProfit=str(tp_price),
-            stopLoss=str(sl_price),
+            qty=fmt_num(qty),
+            price=fmt_num(price),
+            takeProfit=fmt_num(tp_price),
+            stopLoss=fmt_num(sl_price),
             tpTriggerBy="MarkPrice",
             slTriggerBy="MarkPrice",
             tpslMode="Full",
@@ -327,8 +327,8 @@ class VikaExecutor:
             symbol=symbol,
             side=bybit_side,
             orderType="Market",
-            qty=str(qty),
-            stopLoss=str(sl_price),
+            qty=fmt_num(qty),
+            stopLoss=fmt_num(sl_price),
             slTriggerBy="MarkPrice",
             tpslMode="Full",
             timeInForce="IOC",
@@ -354,7 +354,7 @@ class VikaExecutor:
                 priv.set_trading_stop(
                     category="linear",
                     symbol=symbol,
-                    takeProfit=str(tp_price),
+                    takeProfit=fmt_num(tp_price),
                     tpTriggerBy="MarkPrice",
                     tpslMode="Full",
                     positionIdx=0,
@@ -692,7 +692,7 @@ class VikaExecutor:
                         # Cancel ONLY unfilled remainder; keep open filled portion protected by server-side TP/SL
                         self.client.cancel_order(sym, oid)
                         self.journal.update_open_fill(pos_id, fill_px, fill_qty, fill_margin, clear_order_id=True)
-                        self._ensure_server_tpsl(sym, pos, ep_ex)
+                        self._ensure_server_tpsl(sym, pos, ep_ex, ex_ord_list)
                         logger.info(
                             "Cancelled expired partial-fill remainder for %s (45m TTL); kept open qty=%s @ %s",
                             sym, fill_qty, fill_px,
@@ -701,7 +701,7 @@ class VikaExecutor:
                     else:
                         # Transition to OPEN while retaining order_id so remainder is watched until 45m TTL
                         self.journal.update_open_fill(pos_id, fill_px, fill_qty, fill_margin, clear_order_id=False)
-                        self._ensure_server_tpsl(sym, pos, ep_ex)
+                        self._ensure_server_tpsl(sym, pos, ep_ex, ex_ord_list)
                         logger.info(
                             "Partial fill active on %s: qty=%s @ %s (watching remainder until 45m TTL)",
                             sym, fill_qty, fill_px,
@@ -713,7 +713,7 @@ class VikaExecutor:
                     fill_qty = float(ep_ex.get("size") or pos["qty"])
                     fill_margin = round(fill_qty * fill_px / self.leverage, 2)
                     self.journal.update_open_fill(pos_id, fill_px, fill_qty, fill_margin, clear_order_id=True)
-                    self._ensure_server_tpsl(sym, pos, ep_ex)
+                    self._ensure_server_tpsl(sym, pos, ep_ex, ex_ord_list)
                     logger.info("Pending order filled on exchange: %s qty=%s @ %s", sym, fill_qty, fill_px)
                 elif expired:
                     # Unfilled and >= 45m (3 bars): cancel limit order and verify no last-ms fill occurred

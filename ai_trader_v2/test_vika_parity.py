@@ -547,6 +547,17 @@ def test_only_short_and_k7_candle_color_fix() -> None:
         )
         assert ex.open_signal(ev_s) is not None, "only_short mode must allow SHORT in executor"
 
+        # Verify SHORT closed-bar BE trigger moves SL below entry_price (locking profit)
+        ex.check_breakeven_on_closed_bar("HBARUSDT", ev_s.bar_ts + M15_MS, 0.0544)
+        act_s = journal.get_active_positions()
+        assert len(act_s) == 1 and act_s[0]["be_active"] == 1 and act_s[0]["sl_price"] < act_s[0]["entry_price"]
+
+        # Verify fmt_num cleanly formats integer lots (PUMPFUN/1000PEPE) and micro prices (no '.0' or 'e-05')
+        from bot.bybit_client import fmt_num
+        assert fmt_num(783500.0) == "783500"
+        assert fmt_num(0.002586) == "0.002586"
+        assert fmt_num(0.00009) == "0.00009"
+
         tg = VikaTelegramUI(cfg_paper, ex, journal, get_latest_evals=lambda: {})
         assert "ONLY SHORT" in tg.format_status()
         assert "K7 color" in tg.format_status()

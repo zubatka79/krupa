@@ -111,6 +111,12 @@ def round_tick(value: float, tick: float) -> float:
     return round(round(value / tick) * tick, precision)
 
 
+def fmt_num(value: float) -> str:
+    """Format float cleanly for Bybit v5 API (no '.0' on integers, no scientific notation)."""
+    s = f"{float(value):.10f}".rstrip("0").rstrip(".")
+    return "0" if s in ("", "-0") else s
+
+
 class BybitClient:
     """Hybrid Bybit v5 client for public market data + private futures trading."""
 
@@ -680,9 +686,9 @@ class BybitClient:
             symbol=symbol,
             side=side,
             orderType="Limit",
-            qty=str(qty),
-            price=str(price),
-            stopLoss=str(stop_loss),
+            qty=fmt_num(qty),
+            price=fmt_num(price),
+            stopLoss=fmt_num(stop_loss),
             slTriggerBy="MarkPrice",
             timeInForce="GTC",
         )
@@ -704,8 +710,8 @@ class BybitClient:
             symbol=symbol,
             side=side,
             orderType="Market",
-            qty=str(qty),
-            stopLoss=str(stop_loss),
+            qty=fmt_num(qty),
+            stopLoss=fmt_num(stop_loss),
             slTriggerBy="MarkPrice",
             timeInForce="IOC",
         )
@@ -727,8 +733,8 @@ class BybitClient:
             symbol=symbol,
             side=side,
             orderType="Limit",
-            qty=str(qty),
-            price=str(price),
+            qty=fmt_num(qty),
+            price=fmt_num(price),
             reduceOnly=True,
             timeInForce="GTC",
         )
@@ -749,7 +755,7 @@ class BybitClient:
             symbol=symbol,
             side=side,
             orderType="Market",
-            qty=str(qty),
+            qty=fmt_num(qty),
             reduceOnly=True,
             timeInForce="IOC",
         )
@@ -763,7 +769,7 @@ class BybitClient:
         resp = client.set_trading_stop(
             category="linear",
             symbol=symbol,
-            stopLoss=str(stop_loss),
+            stopLoss=fmt_num(stop_loss),
             slTriggerBy="MarkPrice",
             positionIdx=position_idx,
         )
@@ -773,7 +779,7 @@ class BybitClient:
 
     def get_positions(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         client = self._require_private()
-        params: Dict[str, Any] = {"category": "linear", "settleCoin": "USDT"}
+        params: Dict[str, Any] = {"category": "linear", "settleCoin": "USDT", "limit": 50}
         if symbol:
             params["symbol"] = symbol
         resp = client.get_positions(**params)
@@ -783,7 +789,7 @@ class BybitClient:
 
     def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         client = self._require_private()
-        params: Dict[str, Any] = {"category": "linear", "settleCoin": "USDT"}
+        params: Dict[str, Any] = {"category": "linear", "settleCoin": "USDT", "limit": 50}
         if symbol:
             params["symbol"] = symbol
         resp = client.get_open_orders(**params)
