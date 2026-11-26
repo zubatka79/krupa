@@ -559,8 +559,12 @@ def test_only_short_and_k7_candle_color_fix() -> None:
         assert fmt_num(0.00009) == "0.00009"
 
         tg = VikaTelegramUI(cfg_paper, ex, journal, get_latest_evals=lambda: {})
+        assert tg.btn_portfolio == "🪙 Портфель (18 монет)"
+        assert any("18 монет" in c["description"] for c in tg.bot_commands)
         assert "ONLY SHORT" in tg.format_status()
         assert "K7 color" in tg.format_status()
+        assert "(18 монет)" in tg.format_status()
+        assert len(tg.format_startup_welcome({c["symbol"]: "OK (10x Cross)" for c in cfg["coins"]})) < 4096
 
     # 2. Verify K7 candle-color fix on real cached HBARUSDT bars (if cache present)
     cache_dir = ROOT / "data" / "cache" / "tv_top100_65d"

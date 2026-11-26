@@ -1,11 +1,11 @@
 """
-Telegram Bot Interface strictly designed for VIKA_N2_N7 (10 coins, 4H STRONG div, N2, N7).
-Zero legacy menus, zero old coins, zero deprecated filters.
+Telegram Bot Interface strictly designed for Vika N2N7 (dynamic N-coin portfolio, Variant B).
+Zero legacy menus, zero hardcoded coin counts, zero deprecated filters.
 
 ReplyKeyboard Buttons:
   1. 📊 Статус и Баланс
   2. 📈 Открытые позиции
-  3. 🪙 Портфель (10 монет)
+  3. 🪙 Портфель (18 монет)  [dynamic from config]
   4. 📜 История сделок
   5. ⏸ Пауза / ▶️ Старт
   6. 🛑 Закрыть всё (Panic Close)  [with inline confirmation]
@@ -18,6 +18,7 @@ import logging
 import os
 import threading
 import time
+from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
@@ -31,29 +32,17 @@ logger = logging.getLogger("vika.telegram")
 
 BTN_STATUS = "📊 Статус и Баланс"
 BTN_POSITIONS = "📈 Открытые позиции"
-BTN_PORTFOLIO = "🪙 Портфель (13 монет)"
+BTN_PORTFOLIO_PREFIX = "🪙 Портфель"
 BTN_HISTORY = "📜 История сделок"
 BTN_TOGGLE_PAUSE = "⏸ Пауза / ▶️ Старт"
 BTN_PANIC = "🛑 Закрыть всё (Panic Close)"
 
-MAIN_KEYBOARD = {
-    "keyboard": [
-        [{"text": BTN_STATUS}, {"text": BTN_POSITIONS}],
-        [{"text": BTN_PORTFOLIO}, {"text": BTN_HISTORY}],
-        [{"text": BTN_TOGGLE_PAUSE}, {"text": BTN_PANIC}],
-    ],
-    "resize_keyboard": True,
-    "is_persistent": True,
+DIR_LABELS: Dict[str, str] = {
+    "only_short": "🔴 ONLY SHORT",
+    "only_long": "🟢 ONLY LONG",
+    "long_short": "🟢🔴 LONG + SHORT",
+    "paused": "⏸ PAUSED",
 }
-
-BOT_COMMANDS = [
-    {"command": "status", "description": "Vika N2N7 — статус, баланс и дневной лимит"},
-    {"command": "positions", "description": "Открытые позиции и статус BE"},
-    {"command": "portfolio", "description": "Портфель 13 монет и фильтры (4H/N2/N7/T4)"},
-    {"command": "history", "description": "Последние 10 закрытых сделок"},
-    {"command": "pause", "description": "Пауза / Возобновление торговли"},
-    {"command": "panic", "description": "Panic Close — закрыть всё по рынку"},
-]
 
 
 class VikaTelegramUI:
@@ -68,6 +57,25 @@ class VikaTelegramUI:
         self.executor = executor
         self.journal = journal
         self.get_latest_evals = get_latest_evals
+        self.n_coins = len(cfg.get("coins", []))
+        self.btn_portfolio = f"{BTN_PORTFOLIO_PREFIX} ({self.n_coins} монет)"
+        self.main_keyboard: Dict[str, Any] = {
+            "keyboard": [
+                [{"text": BTN_STATUS}, {"text": BTN_POSITIONS}],
+                [{"text": self.btn_portfolio}, {"text": BTN_HISTORY}],
+                [{"text": BTN_TOGGLE_PAUSE}, {"text": BTN_PANIC}],
+            ],
+            "resize_keyboard": True,
+            "is_persistent": True,
+        }
+        self.bot_commands: List[Dict[str, str]] = [
+            {"command": "status", "description": f"Vika N2N7 ({self.n_coins} монет) — статус, баланс и лимиты"},
+            {"command": "positions", "description": "Открытые позиции, TP/SL и статус BE"},
+            {"command": "portfolio", "description": f"Портфель {self.n_coins} монет и фильтры (4H/N2/N7/T4/K7)"},
+            {"command": "history", "description": "Последние 10 закрытых сделок"},
+            {"command": "pause", "description": "Пауза / Возобновление торговли"},
+            {"command": "panic", "description": "Panic Close — закрыть всё по рынку"},
+        ]
 
         self.token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
         self.chat_id = os.getenv("TELEGRAM_CHAT_ID", "").strip()
@@ -86,6 +94,19 @@ class VikaTelegramUI:
         self._thread: Optional[threading.Thread] = None
         self._offset = 0
 
+    def _dir_label(self) -> str:
+        raw = getattr(self.executor, "allowed_directions", str(self.cfg.get("allowed_directions", "long_short"))).lower()
+        return DIR_LABELS.get(raw, "🟢🔴 LONG + SHORT")
+
+    def _keys_summary(self) -> str:
+        cnt = Counter(c["key"].split("_")[0] for c in self.cfg.get("coins", []))
+        order = ["K1", "K7", "K6", "K8", "K3"]
+        parts = [f"{k}:{cnt[k]}" for k in order if cnt.get(k)]
+        for k, v in sorted(cnt.items()):
+            if k not in order:
+                parts.append(f"{k}:{v}")
+        return " ".join(parts)
+
     def is_authorized(self, chat: Dict[str, Any], user: Dict[str, Any]) -> bool:
         cid = str(chat.get("id", ""))
         uid = str(user.get("id", ""))
@@ -102,7 +123,7 @@ class VikaTelegramUI:
         try:
             r = self._send_session.post(
                 f"{self.api_base}/setMyCommands",
-                json={"commands": BOT_COMMANDS},
+                json={"commands": self.bot_commands},
                 timeout=15,
             )
             data = r.json()
@@ -110,7 +131,7 @@ class VikaTelegramUI:
             if not ok:
                 logger.warning("Telegram setMyCommands failed: %s", data)
             else:
-                logger.info("Telegram setMyCommands updated for Vika N2N7: %d commands", len(BOT_COMMANDS))
+                logger.info("Telegram setMyCommands updated for Vika N2N7 (%d coins): %d commands", self.n_coins, len(self.bot_commands))
             return ok
         except Exception as exc:
             logger.warning("Telegram setMyCommands exception: %s", exc)
@@ -134,7 +155,7 @@ class VikaTelegramUI:
             "text": text,
             "parse_mode": parse_mode,
             "disable_web_page_preview": True,
-            "reply_markup": reply_markup if reply_markup is not None else MAIN_KEYBOARD,
+            "reply_markup": reply_markup if reply_markup is not None else self.main_keyboard,
         }
         try:
             r = self._send_session.post(f"{self.api_base}/sendMessage", json=payload, timeout=15)
@@ -182,20 +203,14 @@ class VikaTelegramUI:
         daily_state = "🚨 СТОП -6% (до 00:00 UTC)" if ds["halted"] else "✅ В норме"
 
         exec_mode_str = (
-            "Market вход + Limit TP (0.02%) + Market SL/BE"
+            "Market IOC + Limit Maker TP (0.02%) + Market SL/BE"
             if getattr(self.executor, "entry_order_type", "Market") == "Market"
             else f"Limit вход (TTL {self.executor.ttl_sec // 60}m) + Market SL/BE"
         )
-        dir_map = {
-            "only_short": "🔴 ONLY SHORT",
-            "only_long": "🟢 ONLY LONG",
-            "long_short": "🟢🔴 LONG + SHORT",
-            "paused": "⏸ PAUSED",
-        }
-        dir_str = dir_map.get(getattr(self.executor, "allowed_directions", "long_short"), "LONG + SHORT")
+        dir_str = self._dir_label()
         k7_tag = " | <code>K7 color</code>" if self.cfg.get("filters", {}).get("k7_require_candle_dir", True) else ""
         lines = [
-            f"📊 <b>СТАТУС И БАЛАНС | Vika N2N7</b>",
+            f"📊 <b>СТАТУС И БАЛАНС | Vika N2N7 ({self.n_coins} монет)</b>",
             f"Режим биржи: <code>Bybit {mode_str} | 10x Cross</code>",
             f"Направление: <b>{dir_str}</b> | Статус: <b>{run_state}</b>",
             f"",
@@ -204,6 +219,7 @@ class VikaTelegramUI:
             f"🏆 PnL всего (закрытых): <b>{stats['pnl_usd']:+,.2f} USDT</b> (сделок: {stats['trades']}, WR: {stats['wr']:.1f}%, SL: {stats['sl']})",
             f"",
             f"🧩 Слоты: <b>{len(active)}/{self.executor.max_open}</b> (10% × 10x, макс. 80% маржи | R3: макс. {self.executor.max_same_key}/ключ)",
+            f"🪙 Монеты ({self.n_coins}): <code>{self._keys_summary()}</code>",
             f"⚡ Ордера: <code>{exec_mode_str}</code>",
             f"🛡 Дневной лимит -6%: <b>{daily_state}</b>",
             f"🔎 Фильтры: <code>4H STRONG Div</code> | <code>N2</code> | <code>N7 FR&lt;1.5bps</code> | <code>T4 4H Slope&gt;0.15%</code>{k7_tag}",
@@ -247,8 +263,9 @@ class VikaTelegramUI:
 
     def format_portfolio(self) -> str:
         evals = self.get_latest_evals()
-        n_coins = len(self.cfg["coins"])
-        lines = [f"🪙 <b>ПОРТФЕЛЬ Vika N2N7 — {n_coins} МОНЕТ</b>"]
+        n_coins = self.n_coins
+        allowed = getattr(self.executor, "allowed_directions", "long_short")
+        lines = [f"🪙 <b>ПОРТФЕЛЬ Vika N2N7 — {n_coins} МОНЕТ ({self._dir_label()})</b>"]
         for idx, c in enumerate(self.cfg["coins"], 1):
             sym = c["symbol"]
             k_short = c["key"].split("_")[0]
@@ -260,12 +277,17 @@ class VikaTelegramUI:
                 d4 = "🟢" if (not ev.div4h_bear_strong and not ev.div4h_bull_strong) else ("🔴L" if ev.div4h_bear_strong else "🔴S")
                 n2 = "🟢" if not ev.n2_blocked else "🔴"
                 n7 = "🟢" if (not ev.n7_blocked_long and not ev.n7_blocked_short) else ("🔴L" if ev.n7_blocked_long else "🔴S")
-                t4 = "🟢L" if (not ev.t4_blocked_long) else ("🟢S" if (not ev.t4_blocked_short) else "🔴")
+                if not ev.t4_blocked_short:
+                    t4 = "🟢S" if allowed in ("long_short", "only_short") else "⚪S"
+                elif not ev.t4_blocked_long:
+                    t4 = "🟢L" if allowed in ("long_short", "only_long") else "⚪L"
+                else:
+                    t4 = "🔴"
                 lines.append(
                     f"{idx}. <b>{sym}</b> | <code>{k_short}</code> ({tp_sl}) | "
                     f"4H:{d4} N2:{n2} FR:{n7} T4:{t4}(<code>{ev.slope4h_pct:+.2f}%</code>)"
                 )
-        lines.append("\n<i>Легенда: 🟢 свободно | 🔴 блок | T4: 🟢L/🟢S наклон 4H EMA50 &gt;0.15%</i>")
+        lines.append("\n<i>Легенда: 🟢 свободно | ⚪ выкл. направлением | 🔴 блок | T4: наклон 4H EMA50 &gt;0.15%</i>")
         return "\n".join(lines)
 
     def format_history(self) -> str:
@@ -290,22 +312,16 @@ class VikaTelegramUI:
         n_coins = len(self.cfg["coins"])
         ok_cnt = sum(1 for v in lev_status.values() if v.startswith("OK") or v.startswith("DRY_RUN"))
         exec_mode_str = (
-            "Market вход + Limit Maker TP (0.02%) + Market SL/BE"
+            "Market IOC + Limit Maker TP (0.02%) + Market SL/BE"
             if getattr(self.executor, "entry_order_type", "Market") == "Market"
             else f"Limit вход (TTL {self.executor.ttl_sec // 60}m)"
         )
-        dir_map = {
-            "only_short": "🔴 ONLY SHORT",
-            "only_long": "🟢 ONLY LONG",
-            "long_short": "🟢🔴 LONG + SHORT",
-            "paused": "⏸ PAUSED",
-        }
-        dir_str = dir_map.get(getattr(self.executor, "allowed_directions", "long_short"), "LONG + SHORT")
+        dir_str = self._dir_label()
         k7_tag = " + K7 color" if self.cfg.get("filters", {}).get("k7_require_candle_dir", True) else ""
         header = (
             f"🤖 <b>ЗАПУСК: Vika N2N7 ({n_coins} CLEAN + R3 + T4)</b>\n"
             f"Биржа: <code>Bybit {self.executor.mode.upper()} | 10x Cross ({ok_cnt}/{n_coins} монет)</code>\n"
-            f"Направление: <b>{dir_str}</b>\n"
+            f"Направление: <b>{dir_str}</b> | Ключи: <code>{self._keys_summary()}</code>\n"
             f"Баланс: <b>${ds['current_equity']:,.2f}</b> | Риск: <code>10% × 10x | слоты 8/8 (R3: макс.{self.executor.max_same_key}/ключ) | стоп -6%</code>\n"
             f"Ордера: <code>{exec_mode_str}</code>\n"
             f"Фильтры: <code>4H Div + N2 + N7 + T4(4H slope&gt;0.15%){k7_tag}</code>\n"
@@ -379,9 +395,10 @@ class VikaTelegramUI:
             elif cdata == "panic_cancel":
                 self.send_message("❌ Panic Close отменён. Vika N2N7 продолжает работу в штатном режиме.", chat_id=cid)
             else:
-                # Legacy inline button clicked -> send fresh Vika N2N7 status & ReplyKeyboard
+                # Legacy inline button clicked -> send fresh Vika N2N7 status & updated ReplyKeyboard
                 self.send_message(
-                    "🔄 Интерфейс обновлён до <b>Vika N2N7</b> (10 монет, 4H+N2+N7).\n\n" + self.format_status(),
+                    f"🔄 Интерфейс обновлён до <b>Vika N2N7</b> ({self.n_coins} монет, {self._dir_label()}).\n\n"
+                    + self.format_status(),
                     chat_id=cid,
                 )
             return
@@ -405,7 +422,7 @@ class VikaTelegramUI:
             self.send_message(self.format_status(), chat_id=cid)
         elif text == BTN_POSITIONS or cmd == "/positions" or "открытые позиции" in low:
             self.send_message(self.format_open_positions(), chat_id=cid)
-        elif text == BTN_PORTFOLIO or cmd == "/portfolio" or "портфель" in low:
+        elif text == self.btn_portfolio or cmd == "/portfolio" or "портфель" in low:
             self.send_message(self.format_portfolio(), chat_id=cid)
         elif text == BTN_HISTORY or cmd == "/history" or "история сделок" in low:
             self.send_message(self.format_history(), chat_id=cid)
