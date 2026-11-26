@@ -2,6 +2,7 @@
   "strategy_name": "VIKA_N2_N7",
   "mode": "demo",
   "dry_run": false,
+  "allowed_directions": "only_short",
   "margin_mode": "CROSS",
   "leverage": 10,
   "entry_order_type": "Market",
@@ -29,7 +30,8 @@
     "n2_bbw15_max": 6.5,
     "n2_atr15_pct_max": 1.5,
     "n7_max_pay_funding_bps": 1.5,
-    "t4_min_4h_ema50_slope_pct": 0.15
+    "t4_min_4h_ema50_slope_pct": 0.15,
+    "k7_require_candle_dir": true
   },
   "coins": [
     {

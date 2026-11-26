@@ -445,8 +445,9 @@ def evaluate_coin(
             or (np.isfinite(pdh[i]) and (c_hi > pdh[i]) and (c_cl < pdh[i]))
             or (np.isfinite(asia_hi[i]) and (c_hi > asia_hi[i]) and (c_cl < asia_hi[i]))
         )
-        sig_l = h4_up and ok_vol and sw_l and (l_wick >= 0.30) and (c_rvol >= 1.25)
-        sig_s = h4_dn and ok_vol and sw_s and (u_wick >= 0.30) and (c_rvol >= 1.25)
+        k7_req_dir = bool(filters_cfg.get("k7_require_candle_dir", True))
+        sig_l = h4_up and ok_vol and sw_l and (l_wick >= 0.30) and (c_rvol >= 1.25) and ((c_cl > c_op) if k7_req_dir else True)
+        sig_s = h4_dn and ok_vol and sw_s and (u_wick >= 0.30) and (c_rvol >= 1.25) and ((c_cl < c_op) if k7_req_dir else True)
     elif key == "K8_SUPERTREND_BO":
         sig_l = (
             h1_up and h4_up and ok_vol
@@ -488,11 +489,15 @@ def evaluate_coin(
     t4_blocked_long = is_trend_key and (c_slope4h <= min_slope4)
     t4_blocked_short = is_trend_key and ((-c_slope4h) <= min_slope4)
 
-    # Apply all mandatory filters (4H STRONG Div, N2, N7, T4)
+    # Apply all mandatory filters (Direction Mode, 4H STRONG Div, N2, N7, T4)
+    allowed_dir = str(filters_cfg.get("allowed_directions", "long_short")).strip().lower()
     final_signal = raw_signal
     block_reason: Optional[str] = None
     if raw_signal == "LONG":
-        if filters_cfg.get("div_4h_strong", True) and div4h_bear_strong:
+        if allowed_dir not in ("long_short", "only_long"):
+            final_signal = None
+            block_reason = f"Direction Mode ({allowed_dir})"
+        elif filters_cfg.get("div_4h_strong", True) and div4h_bear_strong:
             final_signal = None
             block_reason = "4H STRONG Bearish Divergence"
         elif n2_blocked:
@@ -505,7 +510,10 @@ def evaluate_coin(
             final_signal = None
             block_reason = f"T4 4H Slope ({c_slope4h:+.2f}% <= +{min_slope4:g}%)"
     elif raw_signal == "SHORT":
-        if filters_cfg.get("div_4h_strong", True) and div4h_bull_strong:
+        if allowed_dir not in ("long_short", "only_short"):
+            final_signal = None
+            block_reason = f"Direction Mode ({allowed_dir})"
+        elif filters_cfg.get("div_4h_strong", True) and div4h_bull_strong:
             final_signal = None
             block_reason = "4H STRONG Bullish Divergence"
         elif n2_blocked:

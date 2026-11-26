@@ -72,6 +72,7 @@ class VikaExecutor:
         self.strategy_name = str(cfg.get("strategy_name", "VIKA_N2_N7"))
         self.mode = str(cfg.get("mode", "demo")).lower()
         self.dry_run = bool(cfg.get("dry_run", False)) or (self.mode == "paper")
+        self.allowed_directions = str(cfg.get("allowed_directions", "long_short")).strip().lower()
         self.leverage = int(cfg.get("leverage", 10))
         self.entry_order_type = str(cfg.get("entry_order_type", "Market")).strip().capitalize()
         self.tp_order_type = str(cfg.get("tp_order_type", "Limit")).strip().capitalize()
@@ -367,6 +368,13 @@ class VikaExecutor:
         sym = ev.symbol
         side = ev.final_signal
         if side not in ("LONG", "SHORT"):
+            return None
+
+        if side == "LONG" and self.allowed_directions not in ("long_short", "only_long"):
+            logger.info("Skip %s %s: allowed_directions=%s", sym, side, self.allowed_directions)
+            return None
+        if side == "SHORT" and self.allowed_directions not in ("long_short", "only_short"):
+            logger.info("Skip %s %s: allowed_directions=%s", sym, side, self.allowed_directions)
             return None
 
         # Prevent duplicate signal processing on the same closed 15m bar

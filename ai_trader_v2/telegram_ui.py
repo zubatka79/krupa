@@ -186,10 +186,18 @@ class VikaTelegramUI:
             if getattr(self.executor, "entry_order_type", "Market") == "Market"
             else f"Limit вход (TTL {self.executor.ttl_sec // 60}m) + Market SL/BE"
         )
+        dir_map = {
+            "only_short": "🔴 ONLY SHORT",
+            "only_long": "🟢 ONLY LONG",
+            "long_short": "🟢🔴 LONG + SHORT",
+            "paused": "⏸ PAUSED",
+        }
+        dir_str = dir_map.get(getattr(self.executor, "allowed_directions", "long_short"), "LONG + SHORT")
+        k7_tag = " | <code>K7 color</code>" if self.cfg.get("filters", {}).get("k7_require_candle_dir", True) else ""
         lines = [
             f"📊 <b>СТАТУС И БАЛАНС | Vika N2N7</b>",
             f"Режим биржи: <code>Bybit {mode_str} | 10x Cross</code>",
-            f"Статус бота: <b>{run_state}</b>",
+            f"Направление: <b>{dir_str}</b> | Статус: <b>{run_state}</b>",
             f"",
             f"💰 Текущий депозит: <b>${ds['current_equity']:,.2f}</b> (свободно <code>${self.executor.last_available:,.2f}</code>)",
             f"📅 PnL за день (UTC): <b>{ds['daily_pnl_usd']:+,.2f} USDT ({ds['daily_pnl_pct']:+.2f}%)</b>",
@@ -198,7 +206,7 @@ class VikaTelegramUI:
             f"🧩 Слоты: <b>{len(active)}/{self.executor.max_open}</b> (10% × 10x, макс. 80% маржи | R3: макс. {self.executor.max_same_key}/ключ)",
             f"⚡ Ордера: <code>{exec_mode_str}</code>",
             f"🛡 Дневной лимит -6%: <b>{daily_state}</b>",
-            f"🔎 Фильтры: <code>4H STRONG Div</code> | <code>N2</code> | <code>N7 FR&lt;1.5bps</code> | <code>T4 4H Slope&gt;0.15%</code>",
+            f"🔎 Фильтры: <code>4H STRONG Div</code> | <code>N2</code> | <code>N7 FR&lt;1.5bps</code> | <code>T4 4H Slope&gt;0.15%</code>{k7_tag}",
         ]
         if self.executor.stale_warnings:
             lines.append("")
@@ -286,12 +294,21 @@ class VikaTelegramUI:
             if getattr(self.executor, "entry_order_type", "Market") == "Market"
             else f"Limit вход (TTL {self.executor.ttl_sec // 60}m)"
         )
+        dir_map = {
+            "only_short": "🔴 ONLY SHORT",
+            "only_long": "🟢 ONLY LONG",
+            "long_short": "🟢🔴 LONG + SHORT",
+            "paused": "⏸ PAUSED",
+        }
+        dir_str = dir_map.get(getattr(self.executor, "allowed_directions", "long_short"), "LONG + SHORT")
+        k7_tag = " + K7 color" if self.cfg.get("filters", {}).get("k7_require_candle_dir", True) else ""
         header = (
             f"🤖 <b>ЗАПУСК: Vika N2N7 (13 CLEAN + R3 + T4)</b>\n"
             f"Биржа: <code>Bybit {self.executor.mode.upper()} | 10x Cross ({ok_cnt}/{n_coins} монет)</code>\n"
+            f"Направление: <b>{dir_str}</b>\n"
             f"Баланс: <b>${ds['current_equity']:,.2f}</b> | Риск: <code>10% × 10x | слоты 8/8 (R3: макс.{self.executor.max_same_key}/ключ) | стоп -6%</code>\n"
             f"Ордера: <code>{exec_mode_str}</code>\n"
-            f"Фильтры: <code>4H Div + N2 + N7 + T4(4H slope&gt;0.15%)</code>\n"
+            f"Фильтры: <code>4H Div + N2 + N7 + T4(4H slope&gt;0.15%){k7_tag}</code>\n"
         )
         if getattr(self.executor, "startup_cancelled_orders", None):
             header += "\n🧹 <b>Отменены зависшие лимитные ордера при старте:</b>\n"

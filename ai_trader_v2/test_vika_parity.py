@@ -50,7 +50,10 @@ def test_parity_with_research() -> None:
 
     with open(ROOT / "ai_trader_v2" / "config_ai_trader.json", "r", encoding="utf-8") as f:
         cfg = json.load(f)
-    filters_cfg = cfg["filters"]
+    # Match original research module (pre-Variant B) for exact historical parity check
+    filters_cfg = dict(cfg["filters"])
+    filters_cfg["allowed_directions"] = "long_short"
+    filters_cfg["k7_require_candle_dir"] = False
 
     # Test representative coins across ALL 5 active keys (K1, K3, K6, K7, K8) including the 3 new coins
     test_cases = [
@@ -155,6 +158,7 @@ def test_journal_executor_and_telegram() -> None:
         cfg = json.load(f)
     cfg["mode"] = "paper"
     cfg["dry_run"] = True
+    cfg["allowed_directions"] = "long_short"
 
     with tempfile.TemporaryDirectory() as tmp:
         db_path = Path(tmp) / "test_vika.db"
@@ -373,6 +377,7 @@ def test_market_entry_and_limit_maker_tp() -> None:
     assert cfg["tp_order_type"] == "Limit"
     cfg["mode"] = "demo"
     cfg["dry_run"] = False
+    cfg["allowed_directions"] = "long_short"
 
     class MockPriv:
         def __init__(self, parent) -> None:
@@ -489,9 +494,89 @@ def test_market_entry_and_limit_maker_tp() -> None:
     print("[PASS] Market entry + atomic Market SL + Limit Maker TP (0.02%) & sync recovery verified.")
 
 
+def test_only_short_and_k7_candle_color_fix() -> None:
+    """Verify Variant B: allowed_directions=only_short and K7_SFP_LIQ_SWEEP candle-color requirement."""
+    with open(ROOT / "ai_trader_v2" / "config_ai_trader.json", "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    assert cfg["mode"] == "demo"
+    assert cfg["allowed_directions"] == "only_short"
+    assert cfg["filters"]["k7_require_candle_dir"] is True
+
+    # 1. Executor blocks LONG and allows SHORT in only_short mode
+    cfg_paper = dict(cfg)
+    cfg_paper["mode"] = "paper"
+    cfg_paper["dry_run"] = True
+    with tempfile.TemporaryDirectory() as tmp:
+        journal = VikaJournal(Path(tmp) / "dir_test.db")
+        client = BybitClient(mode="testnet", cache_dir=tmp)
+        ex = VikaExecutor(cfg_paper, client, journal)
+        ex.specs["HBARUSDT"] = InstrumentSpec(
+            symbol="HBARUSDT", base_coin="HBAR", quote_coin="USDT",
+            status="Trading", min_order_qty=1.0, qty_step=1.0,
+            min_notional=5.0, tick_size=0.0001, min_leverage=1.0, max_leverage=50.0,
+        )
+        from ai_trader_v2.vika_engine import CoinEvaluation
+
+        ev_l = CoinEvaluation(
+            symbol="HBARUSDT", key="K7_SFP_LIQ_SWEEP", bar_ts=1_760_000_000_000,
+            close_price=0.0550, rvol=1.5, adx15=20.0, bbw15=2.0, atr15_pct=0.50,
+            funding_rate=0.0, funding_bps=0.0, slope4h_pct=0.40,
+            div4h_bear_strong=False, div4h_bull_strong=False,
+            n2_blocked=False, n7_blocked_long=False, n7_blocked_short=False,
+            raw_signal="LONG", final_signal="LONG", block_reason=None,
+        )
+        assert ex.open_signal(ev_l) is None, "only_short mode must block LONG in executor"
+
+        ev_s = CoinEvaluation(
+            symbol="HBARUSDT", key="K7_SFP_LIQ_SWEEP", bar_ts=1_760_000_000_000,
+            close_price=0.0550, rvol=1.5, adx15=20.0, bbw15=2.0, atr15_pct=0.50,
+            funding_rate=0.0, funding_bps=0.0, slope4h_pct=-0.40,
+            div4h_bear_strong=False, div4h_bull_strong=False,
+            n2_blocked=False, n7_blocked_long=False, n7_blocked_short=False,
+            raw_signal="SHORT", final_signal="SHORT", block_reason=None,
+        )
+        assert ex.open_signal(ev_s) is not None, "only_short mode must allow SHORT in executor"
+
+        tg = VikaTelegramUI(cfg_paper, ex, journal, get_latest_evals=lambda: {})
+        assert "ONLY SHORT" in tg.format_status()
+        assert "K7 color" in tg.format_status()
+
+    # 2. Verify K7 candle-color fix on real cached HBARUSDT bars (if cache present)
+    cache_dir = ROOT / "data" / "cache" / "tv_top100_65d"
+    p15 = cache_dir / "HBARUSDT_15m.csv.gz"
+    p1h = cache_dir / "HBARUSDT_1h.csv.gz"
+    p4h = cache_dir / "HBARUSDT_4h.csv.gz"
+    if p15.exists() and p1h.exists() and p4h.exists():
+        df15 = pd.read_csv(p15, compression="gzip").drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)
+        df1h = pd.read_csv(p1h, compression="gzip").drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)
+        df4h = pd.read_csv(p4h, compression="gzip").drop_duplicates("timestamp").sort_values("timestamp").reset_index(drop=True)
+        f_no_col = dict(cfg["filters"], allowed_directions="only_short", k7_require_candle_dir=False)
+        f_col = dict(cfg["filters"], allowed_directions="only_short", k7_require_candle_dir=True)
+        # Scan recent 800 bars to find at least one wrong-color K7 SHORT that gets filtered out
+        checked_diff = 0
+        for idx in range(len(df15) - 10, max(350, len(df15) - 1200), -1):
+            bar_ts = int(df15.at[idx, "timestamp"])
+            now_ms = bar_ts + M15_MS + 1000
+            if float(df15.at[idx, "close"]) < float(df15.at[idx, "open"]):
+                continue  # green bar only
+            w15 = df15.iloc[max(0, idx - 319) : idx + 1].reset_index(drop=True)
+            w1h = df1h[df1h["timestamp"] <= bar_ts].tail(240).reset_index(drop=True)
+            w4h = df4h[df4h["timestamp"] <= bar_ts].tail(240).reset_index(drop=True)
+            ev_old = evaluate_coin("HBARUSDT", "K7_SFP_LIQ_SWEEP", w15, w1h, w4h, 0.0, now_ms, f_no_col)
+            if ev_old.raw_signal == "SHORT":
+                ev_new = evaluate_coin("HBARUSDT", "K7_SFP_LIQ_SWEEP", w15, w1h, w4h, 0.0, now_ms, f_col)
+                assert ev_new.raw_signal is None, "K7 candle-color fix failed to block green SHORT candle"
+                checked_diff += 1
+                break
+        assert checked_diff == 1, "Expected to verify at least 1 green K7 SHORT candle blocked on HBARUSDT"
+
+    print("[PASS] Variant B (allowed_directions=only_short + K7 candle-color fix) verified.")
+
+
 if __name__ == "__main__":
     test_parity_with_research()
     test_journal_executor_and_telegram()
     test_limit_order_ttl_45m_partial_fill_and_startup_cleanup()
     test_market_entry_and_limit_maker_tp()
+    test_only_short_and_k7_candle_color_fix()
     print("\nALL VIKA_N2_N7 PARITY & UNIT TESTS PASSED!")

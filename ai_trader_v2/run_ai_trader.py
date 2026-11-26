@@ -106,7 +106,8 @@ class VikaRunner:
 
         self.mode = str(cfg.get("mode", "demo")).lower()
         self.sync_interval = max(10, int(cfg.get("sync_interval_sec", 20)))
-        self.filters_cfg = cfg.get("filters", {})
+        self.filters_cfg = dict(cfg.get("filters", {}))
+        self.filters_cfg.setdefault("allowed_directions", str(cfg.get("allowed_directions", "long_short")).strip().lower())
 
         self.client = BybitClient(
             mode=self.mode,
@@ -284,13 +285,15 @@ class VikaRunner:
 
         logger.info(
             "Main loop active: 15m closed-candle scans (%d coins, parallel) + %ds exchange sync | "
-            "entry=%s tp=%s sl=Market | R3 max_same_key=%d | T4 slope4h>%.2f%%.",
+            "dir=%s entry=%s tp=%s sl=Market | R3 max_same_key=%d | T4 slope4h>%.2f%% | K7_color=%s.",
             len(self.cfg["coins"]),
             self.sync_interval,
+            self.executor.allowed_directions,
             self.executor.entry_order_type,
             self.executor.tp_order_type,
             self.executor.max_same_key,
             float(self.filters_cfg.get("t4_min_4h_ema50_slope_pct", 0.15)),
+            bool(self.filters_cfg.get("k7_require_candle_dir", True)),
         )
         stall_sec = float(self.cfg.get("stall_restart_sec", 600))
         stall_guard = StallGuard(
