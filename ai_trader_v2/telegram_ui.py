@@ -181,6 +181,11 @@ class VikaTelegramUI:
         run_state = "⏸ Пауза" if paused else "▶️ Активен"
         daily_state = "🚨 СТОП -6% (до 00:00 UTC)" if ds["halted"] else "✅ В норме"
 
+        exec_mode_str = (
+            "Market вход + Limit TP (0.02%) + Market SL/BE"
+            if getattr(self.executor, "entry_order_type", "Market") == "Market"
+            else f"Limit вход (TTL {self.executor.ttl_sec // 60}m) + Market SL/BE"
+        )
         lines = [
             f"📊 <b>СТАТУС И БАЛАНС | Vika N2N7</b>",
             f"Режим биржи: <code>Bybit {mode_str} | 10x Cross</code>",
@@ -191,7 +196,7 @@ class VikaTelegramUI:
             f"🏆 PnL всего (закрытых): <b>{stats['pnl_usd']:+,.2f} USDT</b> (сделок: {stats['trades']}, WR: {stats['wr']:.1f}%, SL: {stats['sl']})",
             f"",
             f"🧩 Слоты: <b>{len(active)}/{self.executor.max_open}</b> (10% × 10x, макс. 80% маржи | R3: макс. {self.executor.max_same_key}/ключ)",
-            f"⌛ Лимитки TTL: <code>{self.executor.ttl_sec // 60}m ({self.executor.ttl_bars} свечи 15m)</code>",
+            f"⚡ Ордера: <code>{exec_mode_str}</code>",
             f"🛡 Дневной лимит -6%: <b>{daily_state}</b>",
             f"🔎 Фильтры: <code>4H STRONG Div</code> | <code>N2</code> | <code>N7 FR&lt;1.5bps</code> | <code>T4 4H Slope&gt;0.15%</code>",
         ]
@@ -276,11 +281,17 @@ class VikaTelegramUI:
         ds = self.executor.check_daily_stop()
         n_coins = len(self.cfg["coins"])
         ok_cnt = sum(1 for v in lev_status.values() if v.startswith("OK") or v.startswith("DRY_RUN"))
+        exec_mode_str = (
+            "Market вход + Limit Maker TP (0.02%) + Market SL/BE"
+            if getattr(self.executor, "entry_order_type", "Market") == "Market"
+            else f"Limit вход (TTL {self.executor.ttl_sec // 60}m)"
+        )
         header = (
             f"🤖 <b>ЗАПУСК: Vika N2N7 (13 CLEAN + R3 + T4)</b>\n"
             f"Биржа: <code>Bybit {self.executor.mode.upper()} | 10x Cross ({ok_cnt}/{n_coins} монет)</code>\n"
             f"Баланс: <b>${ds['current_equity']:,.2f}</b> | Риск: <code>10% × 10x | слоты 8/8 (R3: макс.{self.executor.max_same_key}/ключ) | стоп -6%</code>\n"
-            f"Лимитки TTL: <code>45m (3 свечи 15m)</code> | Фильтры: <code>4H Div + N2 + N7 + T4(4H slope&gt;0.15%)</code>\n"
+            f"Ордера: <code>{exec_mode_str}</code>\n"
+            f"Фильтры: <code>4H Div + N2 + N7 + T4(4H slope&gt;0.15%)</code>\n"
         )
         if getattr(self.executor, "startup_cancelled_orders", None):
             header += "\n🧹 <b>Отменены зависшие лимитные ордера при старте:</b>\n"

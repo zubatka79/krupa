@@ -4,6 +4,8 @@
   "dry_run": false,
   "margin_mode": "CROSS",
   "leverage": 10,
+  "entry_order_type": "Market",
+  "tp_order_type": "Limit",
   "timeframe": "15",
   "higher_timeframes": ["60", "240"],
   "margin_pct_per_trade": 10.0,

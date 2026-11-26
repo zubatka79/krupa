@@ -13,6 +13,7 @@ Note: Mainnet requires explicit config modification by the user.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import json
 import logging
 import signal
@@ -21,9 +22,10 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
+import requests
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -57,20 +59,43 @@ def setup_logging(log_path: str) -> None:
     root_log.addHandler(sh)
 
 
+_thread_local = threading.local()
+
+
+def _get_thread_session() -> requests.Session:
+    sess = getattr(_thread_local, "session", None)
+    if sess is None:
+        sess = requests.Session()
+        sess.headers.update({"User-Agent": "bybit-autonomous-engine/1.0"})
+        _thread_local.session = sess
+    return sess
+
+
 def fetch_recent_klines(client: BybitClient, symbol: str, interval: str, limit: int = 300) -> pd.DataFrame:
-    """Fast single-request fetch of the latest `limit` klines (including forming bar, stripped downstream)."""
-    res = client._public_get(
-        "/v5/market/kline",
-        params={"category": "linear", "symbol": symbol, "interval": str(interval), "limit": int(limit)},
-    )
-    rows = res.get("list", [])
-    if not rows:
-        return pd.DataFrame(columns=KLINE_COLUMNS)
-    df = pd.DataFrame(rows, columns=KLINE_COLUMNS)
-    df["timestamp"] = df["timestamp"].astype("int64")
-    for col in ("open", "high", "low", "close", "volume", "turnover"):
-        df[col] = df[col].astype("float64")
-    return df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+    """Thread-safe single-request fetch of the latest `limit` klines (forming bar stripped downstream)."""
+    url = f"{client.public_base_url}/v5/market/kline"
+    params = {"category": "linear", "symbol": symbol, "interval": str(interval), "limit": int(limit)}
+    sess = _get_thread_session()
+    last_err: Optional[Exception] = None
+    for attempt in range(3):
+        try:
+            resp = sess.get(url, params=params, timeout=(6, 12))
+            resp.raise_for_status()
+            payload = resp.json()
+            if payload.get("retCode") == 0:
+                rows = payload.get("result", {}).get("list", [])
+                if not rows:
+                    return pd.DataFrame(columns=KLINE_COLUMNS)
+                df = pd.DataFrame(rows, columns=KLINE_COLUMNS)
+                df["timestamp"] = df["timestamp"].astype("int64")
+                for col in ("open", "high", "low", "close", "volume", "turnover"):
+                    df[col] = df[col].astype("float64")
+                return df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
+            last_err = RuntimeError(f"Bybit kline retCode={payload.get('retCode')}: {payload.get('retMsg')}")
+        except Exception as exc:
+            last_err = exc
+        time.sleep(0.4 * (attempt + 1))
+    raise RuntimeError(f"Failed fetching klines {symbol} {interval}m: {last_err}")
 
 
 class VikaRunner:
@@ -120,12 +145,13 @@ class VikaRunner:
             return dict(self._latest_evals)
 
     def scan_all_coins(self) -> Dict[str, CoinEvaluation]:
-        """Fetch latest closed 15m/1H/4H candles & live Funding Rates and evaluate all 10 coins."""
+        """Parallel (~1.5-2s) fetch of closed 15m/1H/4H candles & live Funding Rates across all 13 coins."""
+        t0 = time.monotonic()
         now_ms = int(time.time() * 1000)
         tickers = self.client.get_tickers()
         evals: Dict[str, CoinEvaluation] = {}
 
-        for coin in self.cfg["coins"]:
+        def _eval_one(coin: Dict[str, Any]) -> Tuple[str, Optional[CoinEvaluation]]:
             sym = coin["symbol"]
             key = coin["key"]
             try:
@@ -143,10 +169,18 @@ class VikaRunner:
                     now_ms=now_ms,
                     filters_cfg=self.filters_cfg,
                 )
-                evals[sym] = ev
+                return sym, ev
             except Exception as exc:
                 logger.error("Failed to evaluate %s: %s", sym, exc)
+                return sym, None
 
+        max_workers = min(8, max(1, len(self.cfg["coins"])))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
+            for sym, ev in pool.map(_eval_one, self.cfg["coins"]):
+                if ev is not None:
+                    evals[sym] = ev
+
+        logger.info("Scanned %d/%d coins in %.2fs", len(evals), len(self.cfg["coins"]), time.monotonic() - t0)
         with self._evals_lock:
             self._latest_evals = evals
         return evals
@@ -249,13 +283,12 @@ class VikaRunner:
         last_sync_ts = time.monotonic()
 
         logger.info(
-            "Main loop active: 15m closed-candle scans (%d coins) + %ds exchange sync | "
-            "limit_entry_ttl=%dm (%d bars / %ds) | R3 max_same_key=%d | T4 slope4h>%.2f%%.",
+            "Main loop active: 15m closed-candle scans (%d coins, parallel) + %ds exchange sync | "
+            "entry=%s tp=%s sl=Market | R3 max_same_key=%d | T4 slope4h>%.2f%%.",
             len(self.cfg["coins"]),
             self.sync_interval,
-            self.executor.ttl_sec // 60,
-            self.executor.ttl_bars,
-            self.executor.ttl_sec,
+            self.executor.entry_order_type,
+            self.executor.tp_order_type,
             self.executor.max_same_key,
             float(self.filters_cfg.get("t4_min_4h_ema50_slope_pct", 0.15)),
         )
@@ -281,10 +314,10 @@ class VikaRunner:
                     logger.error("Sync loop exception: %s", exc)
                 last_sync_ts = time.monotonic()
 
-            # 2. Closed 15m candle boundary check (+5s buffer for Bybit candle finalization)
+            # 2. Closed 15m candle boundary check (+2.5s buffer for Bybit candle finalization)
             cur_bucket = now_ms // M15_MS
             ms_into_bar = now_ms % M15_MS
-            if cur_bucket > last_scanned_bucket and ms_into_bar >= 5000:
+            if cur_bucket > last_scanned_bucket and ms_into_bar >= 2500:
                 last_scanned_bucket = cur_bucket
                 bar_dt = datetime.fromtimestamp((cur_bucket * M15_MS) / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
                 logger.info("--- Closed 15m bar scan @ %s ---", bar_dt)

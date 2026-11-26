@@ -39,6 +39,23 @@ def _is_entry_limit_order(order: Dict[str, Any]) -> bool:
     return True
 
 
+def _is_reduce_only_limit_tp(order: Dict[str, Any], symbol: str, close_side: str) -> bool:
+    """Return True if order is an active reduceOnly Limit TP order for `symbol`."""
+    if str(order.get("symbol", "")) != symbol:
+        return False
+    if str(order.get("side", "")) != close_side:
+        return False
+    if str(order.get("orderType", "")).lower() != "limit":
+        return False
+    reduce_only = order.get("reduceOnly")
+    if not (reduce_only is True or str(reduce_only).lower() == "true"):
+        return False
+    stop_type = str(order.get("stopOrderType", "") or "").strip()
+    if stop_type and stop_type.upper() != "UNKNOWN":
+        return False
+    return True
+
+
 class VikaExecutor:
     def __init__(
         self,
@@ -56,6 +73,8 @@ class VikaExecutor:
         self.mode = str(cfg.get("mode", "demo")).lower()
         self.dry_run = bool(cfg.get("dry_run", False)) or (self.mode == "paper")
         self.leverage = int(cfg.get("leverage", 10))
+        self.entry_order_type = str(cfg.get("entry_order_type", "Market")).strip().capitalize()
+        self.tp_order_type = str(cfg.get("tp_order_type", "Limit")).strip().capitalize()
         self.margin_pct = float(cfg.get("margin_pct_per_trade", 10.0)) / 100.0
         self.max_open = int(cfg.get("max_open_positions", 8))
         self.max_same_key = int(cfg.get("max_same_key", 2))
@@ -265,7 +284,7 @@ class VikaExecutor:
         return ds
 
     # ------------------------------------------------------------------
-    # Atomic Order Placement (Limit GTC with Server-Side TP & SL)
+    # Atomic Order Placement: Market+SL + Maker Limit TP (or Limit GTC)
     # ------------------------------------------------------------------
     def _place_entry_with_tpsl(
         self, symbol: str, side: str, qty: float, price: float, tp_price: float, sl_price: float
@@ -293,6 +312,56 @@ class VikaExecutor:
             raise RuntimeError(f"Bybit place_order failed for {symbol}: {resp}")
         return str(resp["result"].get("orderId", ""))
 
+    def _place_market_entry_with_sl(
+        self, symbol: str, side: str, qty: float, sl_price: float
+    ) -> str:
+        """Open position immediately via Market IOC with atomic server-side Market Stop-Loss."""
+        if self.dry_run:
+            return f"PAPER-MKT-{symbol}-{int(time.time() * 1000)}"
+
+        priv = self.client._require_private()
+        bybit_side = "Buy" if side == "LONG" else "Sell"
+        resp = priv.place_order(
+            category="linear",
+            symbol=symbol,
+            side=bybit_side,
+            orderType="Market",
+            qty=str(qty),
+            stopLoss=str(sl_price),
+            slTriggerBy="MarkPrice",
+            tpslMode="Full",
+            timeInForce="IOC",
+        )
+        if resp.get("retCode") != 0:
+            raise RuntimeError(f"Bybit Market place_order failed for {symbol}: {resp}")
+        return str(resp["result"].get("orderId", ""))
+
+    def _place_limit_tp(self, symbol: str, side: str, qty: float, tp_price: float) -> Optional[str]:
+        """Place resting reduceOnly Limit GTC Take-Profit order in the book (Maker 0.02%)."""
+        if self.dry_run or not self.client.has_credentials:
+            return f"PAPER-TP-{symbol}"
+        close_side = "Sell" if side == "LONG" else "Buy"
+        try:
+            res = self.client.place_limit_tp_order(symbol, close_side, qty, tp_price)
+            oid = str(res.get("orderId", ""))
+            logger.info("Placed Limit Maker TP for %s (%s qty=%s @ %s) id=%s", symbol, close_side, qty, tp_price, oid)
+            return oid
+        except Exception as exc:
+            logger.error("Failed placing Limit Maker TP for %s @ %s: %s (falling back to server TP)", symbol, tp_price, exc)
+            try:
+                priv = self.client._require_private()
+                priv.set_trading_stop(
+                    category="linear",
+                    symbol=symbol,
+                    takeProfit=str(tp_price),
+                    tpTriggerBy="MarkPrice",
+                    tpslMode="Full",
+                    positionIdx=0,
+                )
+            except Exception as exc2:
+                logger.error("Fallback set_trading_stop TP also failed for %s: %s", symbol, exc2)
+            return None
+
     def open_signal(self, ev: CoinEvaluation) -> Optional[int]:
         """Attempt to open a position for a passed VIKA_N2_N7 signal."""
         sym = ev.symbol
@@ -303,7 +372,6 @@ class VikaExecutor:
         # Prevent duplicate signal processing on the same closed 15m bar
         if self.journal.get_last_signal_bar_ts(sym) >= ev.bar_ts:
             return None
-        self.journal.set_last_signal_bar_ts(sym, ev.bar_ts)
 
         if self.journal.is_paused():
             logger.info("Skip %s %s: bot is PAUSED", sym, side)
@@ -347,10 +415,10 @@ class VikaExecutor:
 
         spec = self.specs[sym]
         coin_cfg = self.coin_cfg_map[sym]
-        entry_price = round_tick(ev.close_price, spec.tick_size)
+        ref_price = round_tick(ev.close_price, spec.tick_size)
         notional = margin_usd * self.leverage
-        qty = round_step_down(notional / entry_price, spec.qty_step)
-        if qty < spec.min_order_qty or (qty * entry_price) < max(spec.min_notional, 5.0):
+        qty = round_step_down(notional / ref_price, spec.qty_step)
+        if qty < spec.min_order_qty or (qty * ref_price) < max(spec.min_notional, 5.0):
             logger.warning("Skip %s %s: qty %.6f below min lot/notional", sym, side, qty)
             return None
 
@@ -359,23 +427,85 @@ class VikaExecutor:
         be_trig_pct = float(coin_cfg["be_trigger_pct"]) / 100.0
         be_lock_pct = float(coin_cfg["be_lock_pct"]) / 100.0
 
-        if side == "LONG":
-            tp_price = round_tick(entry_price * (1.0 + tp_pct), spec.tick_size)
-            sl_price = round_tick(entry_price * (1.0 - sl_pct), spec.tick_size)
-            be_trigger_price = round_tick(entry_price * (1.0 + be_trig_pct), spec.tick_size)
-            be_lock_price = round_tick(entry_price * (1.0 + be_lock_pct), spec.tick_size)
-        else:
-            tp_price = round_tick(entry_price * (1.0 - tp_pct), spec.tick_size)
-            sl_price = round_tick(entry_price * (1.0 + sl_pct), spec.tick_size)
-            be_trigger_price = round_tick(entry_price * (1.0 - be_trig_pct), spec.tick_size)
-            be_lock_price = round_tick(entry_price * (1.0 - be_lock_pct), spec.tick_size)
+        def _calc_levels(base_px: float) -> Tuple[float, float, float, float]:
+            if side == "LONG":
+                return (
+                    round_tick(base_px * (1.0 + tp_pct), spec.tick_size),
+                    round_tick(base_px * (1.0 - sl_pct), spec.tick_size),
+                    round_tick(base_px * (1.0 + be_trig_pct), spec.tick_size),
+                    round_tick(base_px * (1.0 + be_lock_pct), spec.tick_size),
+                )
+            return (
+                round_tick(base_px * (1.0 - tp_pct), spec.tick_size),
+                round_tick(base_px * (1.0 + sl_pct), spec.tick_size),
+                round_tick(base_px * (1.0 - be_trig_pct), spec.tick_size),
+                round_tick(base_px * (1.0 - be_lock_pct), spec.tick_size),
+            )
 
-        order_id = self._place_entry_with_tpsl(sym, side, qty, entry_price, tp_price, sl_price)
-        placed_ms = int(time.time() * 1000)
-        bar_expire_ts = ev.bar_ts + (self.ttl_bars + 1) * M15_MS
-        time_expire_ts = placed_ms + self.ttl_sec * 1000
-        expire_ts = min(bar_expire_ts, time_expire_ts) if bar_expire_ts > placed_ms else time_expire_ts
-        init_status = "OPEN" if self.dry_run else "PENDING"
+        tp_price, sl_price, be_trigger_price, be_lock_price = _calc_levels(ref_price)
+        entry_price = ref_price
+        fill_qty = qty
+
+        if self.entry_order_type == "Market":
+            # 1. Instant Market entry with atomic server-side Market SL
+            self._place_market_entry_with_sl(sym, side, qty, sl_price)
+            self.journal.set_last_signal_bar_ts(sym, ev.bar_ts)
+
+            # 2. Fetch actual fill price & size from Bybit to place exact Limit Maker TP
+            if not self.dry_run and self.client.has_credentials:
+                for _ in range(3):
+                    time.sleep(0.35)
+                    try:
+                        ex_p = self.client.get_positions(sym)
+                        if ex_p:
+                            avg_p = float(ex_p[0].get("avgPrice") or 0.0)
+                            ex_sz = float(ex_p[0].get("size") or 0.0)
+                            if avg_p > 0:
+                                entry_price = avg_p
+                            if ex_sz > 0:
+                                fill_qty = ex_sz
+                            break
+                    except Exception as exc:
+                        logger.warning("Post-market fill lookup retry for %s: %s", sym, exc)
+
+            # Recalculate exact TP & BE levels from actual executed entry_price
+            tp_price, actual_sl, be_trigger_price, be_lock_price = _calc_levels(entry_price)
+            if (not self.dry_run) and self.client.has_credentials and abs(actual_sl - sl_price) >= spec.tick_size:
+                try:
+                    self.client.set_trading_stop(sym, actual_sl)
+                    sl_price = actual_sl
+                except Exception as exc:
+                    logger.warning("Keeping initial atomic SL %s for %s (%s)", sl_price, sym, exc)
+
+            # 3. Place resting reduceOnly Limit GTC Take-Profit order in the book (Maker 0.02%)
+            if self.tp_order_type == "Limit":
+                self._place_limit_tp(sym, side, fill_qty, tp_price)
+            elif not self.dry_run and self.client.has_credentials:
+                try:
+                    priv = self.client._require_private()
+                    priv.set_trading_stop(
+                        category="linear", symbol=sym, takeProfit=str(tp_price),
+                        tpTriggerBy="MarkPrice", tpslMode="Full", positionIdx=0,
+                    )
+                except Exception as exc:
+                    logger.warning("Failed attaching Market TP for %s: %s", sym, exc)
+
+            order_id = ""  # Entry already fully executed
+            expire_ts = 0
+            init_status = "OPEN"
+            entry_lbl = "Market"
+            tp_lbl = "Limit Maker" if self.tp_order_type == "Limit" else "Market"
+        else:
+            # Legacy Limit GTC entry mode (TTL 45m)
+            order_id = self._place_entry_with_tpsl(sym, side, qty, entry_price, tp_price, sl_price)
+            self.journal.set_last_signal_bar_ts(sym, ev.bar_ts)
+            placed_ms = int(time.time() * 1000)
+            bar_expire_ts = ev.bar_ts + (self.ttl_bars + 1) * M15_MS
+            time_expire_ts = placed_ms + self.ttl_sec * 1000
+            expire_ts = min(bar_expire_ts, time_expire_ts) if bar_expire_ts > placed_ms else time_expire_ts
+            init_status = "OPEN" if self.dry_run else "PENDING"
+            entry_lbl = "Limit"
+            tp_lbl = "Server"
 
         filters_snap = {
             "adx15": ev.adx15,
@@ -386,6 +516,7 @@ class VikaExecutor:
             "div4h": ev.div4h_label,
             "rvol": ev.rvol,
         }
+        actual_margin = round(fill_qty * entry_price / self.leverage, 2)
         pos_id = self.journal.add_position(
             symbol=sym,
             side=side,
@@ -393,8 +524,8 @@ class VikaExecutor:
             status=init_status,
             order_id=order_id,
             entry_price=entry_price,
-            qty=qty,
-            margin_usd=round(qty * entry_price / self.leverage, 2),
+            qty=fill_qty,
+            margin_usd=actual_margin,
             leverage=self.leverage,
             tp_price=tp_price,
             sl_price=sl_price,
@@ -411,15 +542,15 @@ class VikaExecutor:
         msg = (
             f"🚀 <b>ВХОД В СДЕЛКУ{mode_tag} | {sym} {badge}</b>\n"
             f"Ключ: <code>{ev.key}</code> | Слоты: <b>{slots_used}/{self.max_open}</b>\n"
-            f"Вход (Limit): <code>{entry_price}</code>\n"
-            f"TP: <code>{tp_price}</code> (+{coin_cfg['tp_pct']}%) | SL: <code>{sl_price}</code> (-{coin_cfg['sl_pct']}%)\n"
+            f"Вход ({entry_lbl}): <code>{entry_price}</code>\n"
+            f"TP ({tp_lbl}): <code>{tp_price}</code> (+{coin_cfg['tp_pct']}%) | SL (Market): <code>{sl_price}</code> (-{coin_cfg['sl_pct']}%)\n"
             f"BE: при закрытии <code>{be_trigger_price}</code> -> SL <code>{be_lock_price}</code>\n"
-            f"Объём: <code>{qty}</code> (~<code>${qty * entry_price:,.1f}</code>) | Маржа: <code>${margin_usd:,.1f}</code> (10% × {self.leverage}x)\n"
+            f"Объём: <code>{fill_qty}</code> (~<code>${fill_qty * entry_price:,.1f}</code>) | Маржа: <code>${actual_margin:,.1f}</code> (10% × {self.leverage}x)\n"
             f"Фильтры: ADX15=<code>{ev.adx15:.1f}</code> | BBW15=<code>{ev.bbw15:.2f}%</code> | "
             f"ATR15=<code>{ev.atr15_pct:.2f}%</code> | FR=<code>{ev.funding_bps:+.2f}bps</code> | "
             f"4H Slope=<code>{ev.slope4h_pct:+.2f}%</code> | 4H Div: <code>{ev.div4h_label}</code>"
         )
-        logger.info("Opened %s %s (%s) id=%s order=%s", sym, side, ev.key, pos_id, order_id)
+        logger.info("Opened %s %s (%s, %s) id=%s qty=%s @ %s", sym, side, ev.key, entry_lbl, pos_id, fill_qty, entry_price)
         self.notify(msg)
         return pos_id
 
@@ -432,27 +563,55 @@ class VikaExecutor:
         age_ms = now_ms - int(pos.get("opened_at") or 0)
         return (age_ms >= ttl_ms) or (now_ms >= int(pos.get("expire_ts") or 0))
 
-    def _ensure_server_tpsl(self, sym: str, pos: Dict[str, Any], ep_ex: Dict[str, Any]) -> None:
-        """Ensure server-side TP and SL remain attached on Bybit for an open position."""
+    def _ensure_server_tpsl(
+        self,
+        sym: str,
+        pos: Dict[str, Any],
+        ep_ex: Dict[str, Any],
+        ex_ord_list: Optional[List[Dict[str, Any]]] = None,
+    ) -> None:
+        """
+        Ensure both protective exits remain intact for an open position:
+          1) Server-side Market Stop-Loss on the position (`stopLoss > 0`)
+          2) Take-Profit: either native `takeProfit > 0` (legacy/existing positions — untouched!)
+             OR resting `reduceOnly=True` Limit Maker TP order in the book.
+        """
         ex_sl = float(ep_ex.get("stopLoss") or 0.0)
         ex_tp = float(ep_ex.get("takeProfit") or 0.0)
-        if ex_sl > 0 and ex_tp > 0:
+        if ex_sl <= 0:
+            try:
+                self.client.set_trading_stop(sym, float(pos["sl_price"]))
+                logger.info("Restored missing server-side SL for %s @ %s", sym, pos["sl_price"])
+            except Exception as exc:
+                logger.warning("Failed to restore SL for %s: %s", sym, exc)
+
+        # If position already carries native server-side TP (e.g., pre-upgrade position), leave it intact
+        if ex_tp > 0:
             return
-        try:
-            priv = self.client._require_private()
-            priv.set_trading_stop(
-                category="linear",
-                symbol=sym,
-                takeProfit=str(pos["tp_price"]),
-                stopLoss=str(pos["sl_price"]),
-                tpTriggerBy="MarkPrice",
-                slTriggerBy="MarkPrice",
-                tpslMode="Full",
-                positionIdx=0,
-            )
-            logger.info("Restored missing server-side TP/SL for %s", sym)
-        except Exception as exc:
-            logger.warning("Failed to restore TP/SL for %s: %s", sym, exc)
+
+        if self.tp_order_type == "Limit":
+            close_side = "Sell" if pos["side"] == "LONG" else "Buy"
+            orders = ex_ord_list if ex_ord_list is not None else []
+            has_limit_tp = any(_is_reduce_only_limit_tp(o, sym, close_side) for o in orders)
+            if not has_limit_tp:
+                ex_sz = float(ep_ex.get("size") or pos["qty"])
+                if ex_sz > 0:
+                    logger.info("Restoring missing Limit Maker TP for %s (qty=%s @ %s)", sym, ex_sz, pos["tp_price"])
+                    self._place_limit_tp(sym, pos["side"], ex_sz, float(pos["tp_price"]))
+        else:
+            try:
+                priv = self.client._require_private()
+                priv.set_trading_stop(
+                    category="linear",
+                    symbol=sym,
+                    takeProfit=str(pos["tp_price"]),
+                    tpTriggerBy="MarkPrice",
+                    tpslMode="Full",
+                    positionIdx=0,
+                )
+                logger.info("Restored missing server-side TP for %s", sym)
+            except Exception as exc:
+                logger.warning("Failed to restore TP for %s: %s", sym, exc)
 
     def _notify_ttl_cancelled(
         self,
@@ -552,18 +711,22 @@ class VikaExecutor:
                     # Unfilled and >= 45m (3 bars): cancel limit order and verify no last-ms fill occurred
                     if has_ord:
                         self.client.cancel_order(sym, oid)
+                    recheck_ok = False
                     recheck = []
                     try:
                         recheck = self.client.get_positions(sym)
-                    except Exception:
-                        pass
+                        recheck_ok = True
+                    except Exception as exc:
+                        logger.warning("TTL cancel race-check get_positions failed for %s: %s (will retry)", sym, exc)
+                    if not recheck_ok:
+                        continue
                     if recheck:
                         ep_ex = recheck[0]
                         fill_px = float(ep_ex.get("avgPrice") or pos["entry_price"])
                         fill_qty = float(ep_ex.get("size") or pos["qty"])
                         fill_margin = round(fill_qty * fill_px / self.leverage, 2)
                         self.journal.update_open_fill(pos_id, fill_px, fill_qty, fill_margin, clear_order_id=True)
-                        self._ensure_server_tpsl(sym, pos, ep_ex)
+                        self._ensure_server_tpsl(sym, pos, ep_ex, ex_ord_list)
                         logger.info("Order filled just before 45m TTL cancel: %s qty=%s @ %s", sym, fill_qty, fill_px)
                     else:
                         self.journal.mark_cancelled(pos_id, "TTL_EXPIRED")
@@ -578,6 +741,11 @@ class VikaExecutor:
                     if has_ord:
                         # Clean up any leftover partial-fill entry order if the filled part already hit TP/SL
                         self.client.cancel_order(sym, oid)
+                    # Also clean up any leftover reduceOnly Limit TP order if exchange didn't auto-clear yet
+                    close_side = "Sell" if pos["side"] == "LONG" else "Buy"
+                    for o in ex_ord_list:
+                        if _is_reduce_only_limit_tp(o, sym, close_side) and o.get("orderId"):
+                            self.client.cancel_order(sym, str(o["orderId"]))
                     self._reconcile_missing_position(pos, now_ms)
                 else:
                     ep_ex = ex_pos_map[sym]
@@ -601,7 +769,7 @@ class VikaExecutor:
                             # Remainder completed filling!
                             self.journal.update_open_fill(pos_id, fill_px, fill_qty, fill_margin, clear_order_id=True)
                             logger.info("Partial fill completed for %s: final qty=%s @ %s", sym, fill_qty, fill_px)
-                    self._ensure_server_tpsl(sym, pos, ep_ex)
+                    self._ensure_server_tpsl(sym, pos, ep_ex, ex_ord_list)
 
         self.check_daily_stop()
 

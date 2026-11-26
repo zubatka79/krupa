@@ -365,8 +365,133 @@ def test_limit_order_ttl_45m_partial_fill_and_startup_cleanup() -> None:
     print("[PASS] 45m (3-bar) Limit TTL, Partial-Fill remainder cancel & Startup stale guard verified.")
 
 
+def test_market_entry_and_limit_maker_tp() -> None:
+    """Verify Market IOC entry + atomic server-side Market SL + resting reduceOnly Limit Maker TP."""
+    with open(ROOT / "ai_trader_v2" / "config_ai_trader.json", "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+    assert cfg["entry_order_type"] == "Market"
+    assert cfg["tp_order_type"] == "Limit"
+    cfg["mode"] = "demo"
+    cfg["dry_run"] = False
+
+    class MockPriv:
+        def __init__(self, parent) -> None:
+            self.parent = parent
+
+        def place_order(self, **kwargs):
+            self.parent.place_order_calls.append(kwargs)
+            # Simulate immediate Market fill at 0.1802 (slight slip from 0.1800)
+            self.parent.positions = [{
+                "symbol": kwargs["symbol"],
+                "side": kwargs["side"],
+                "size": kwargs["qty"],
+                "avgPrice": "0.1802",
+                "stopLoss": kwargs["stopLoss"],
+                "takeProfit": "0",
+            }]
+            return {"retCode": 0, "result": {"orderId": "MKT-001"}}
+
+    class MockClient:
+        has_credentials = True
+
+        def __init__(self) -> None:
+            self.place_order_calls: list = []
+            self.limit_tp_calls: list = []
+            self.sl_calls: list = []
+            self.cancelled_calls: list = []
+            self.positions: list = []
+            self.open_orders: list = []
+            self._priv = MockPriv(self)
+
+        def _require_private(self):
+            return self._priv
+
+        def get_wallet_balance(self, coin: str = "USDT"):
+            return {"equity": 2000.0, "available": 2000.0}
+
+        def get_positions(self, symbol=None):
+            if symbol:
+                return [p for p in self.positions if p["symbol"] == symbol]
+            return list(self.positions)
+
+        def get_open_orders(self, symbol=None):
+            if symbol:
+                return [o for o in self.open_orders if o["symbol"] == symbol]
+            return list(self.open_orders)
+
+        def set_trading_stop(self, symbol: str, stop_loss: float, position_idx: int = 0):
+            self.sl_calls.append((symbol, stop_loss))
+            for p in self.positions:
+                if p["symbol"] == symbol:
+                    p["stopLoss"] = str(stop_loss)
+            return {}
+
+        def place_limit_tp_order(self, symbol: str, side: str, qty: float, price: float):
+            self.limit_tp_calls.append((symbol, side, qty, price))
+            oid = f"TP-{len(self.limit_tp_calls)}"
+            self.open_orders.append({
+                "orderId": oid, "symbol": symbol, "side": side,
+                "orderType": "Limit", "reduceOnly": True, "stopOrderType": "",
+                "qty": str(qty), "price": str(price),
+            })
+            return {"orderId": oid}
+
+        def cancel_order(self, symbol: str, order_id: str):
+            self.cancelled_calls.append((symbol, order_id))
+            self.open_orders = [o for o in self.open_orders if o["orderId"] != order_id]
+
+    with tempfile.TemporaryDirectory() as tmp:
+        journal = VikaJournal(Path(tmp) / "mkt_test.db")
+        mock = MockClient()
+        sent = []
+        ex = VikaExecutor(cfg, mock, journal, notifier=sent.append)  # type: ignore[arg-type]
+        ex.specs["DOGEUSDT"] = InstrumentSpec(
+            symbol="DOGEUSDT", base_coin="DOGE", quote_coin="USDT",
+            status="Trading", min_order_qty=1.0, qty_step=1.0,
+            min_notional=5.0, tick_size=0.0001, min_leverage=1.0, max_leverage=50.0,
+        )
+
+        from ai_trader_v2.vika_engine import CoinEvaluation
+
+        ev = CoinEvaluation(
+            symbol="DOGEUSDT", key="K3_MACD_STOCH", bar_ts=1_760_000_000_000,
+            close_price=0.1800, rvol=1.6, adx15=24.0, bbw15=2.5, atr15_pct=0.65,
+            funding_rate=0.00004, funding_bps=0.40, slope4h_pct=0.55,
+            div4h_bear_strong=False, div4h_bull_strong=False,
+            n2_blocked=False, n7_blocked_long=False, n7_blocked_short=False,
+            raw_signal="LONG", final_signal="LONG", block_reason=None,
+        )
+        pos_id = ex.open_signal(ev)
+        assert pos_id is not None
+        assert len(mock.place_order_calls) == 1
+        po = mock.place_order_calls[0]
+        assert po["orderType"] == "Market" and po["timeInForce"] == "IOC"
+        assert float(po["stopLoss"]) > 0 and "takeProfit" not in po
+        # Resting Limit Maker TP placed from actual avgPrice 0.1802 (+1.4% = 0.1827)
+        assert len(mock.limit_tp_calls) == 1
+        assert mock.limit_tp_calls[0][1] == "Sell"
+        assert abs(mock.limit_tp_calls[0][3] - 0.1827) < 1e-6
+        act = journal.get_active_positions()
+        assert len(act) == 1 and act[0]["status"] == "OPEN" and abs(act[0]["entry_price"] - 0.1802) < 1e-6
+        assert any("Вход (Market)" in m and "TP (Limit Maker)" in m for m in sent)
+
+        # If Limit Maker TP disappears during sync -> automatically restored
+        mock.open_orders.clear()
+        ex.sync_with_exchange()
+        assert len(mock.limit_tp_calls) == 2
+
+        # If position carries native server takeProfit > 0 (pre-upgrade position) -> do NOT duplicate Limit TP
+        mock.open_orders.clear()
+        mock.positions[0]["takeProfit"] = "0.1827"
+        ex.sync_with_exchange()
+        assert len(mock.limit_tp_calls) == 2
+
+    print("[PASS] Market entry + atomic Market SL + Limit Maker TP (0.02%) & sync recovery verified.")
+
+
 if __name__ == "__main__":
     test_parity_with_research()
     test_journal_executor_and_telegram()
     test_limit_order_ttl_45m_partial_fill_and_startup_cleanup()
+    test_market_entry_and_limit_maker_tp()
     print("\nALL VIKA_N2_N7 PARITY & UNIT TESTS PASSED!")
