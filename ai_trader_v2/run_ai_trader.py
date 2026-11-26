@@ -33,6 +33,7 @@ if str(ROOT) not in sys.path:
 from bot.bybit_client import BybitClient, KLINE_COLUMNS, round_step_down, round_tick
 from ai_trader_v2.executor import VikaExecutor
 from ai_trader_v2.journal import VikaJournal
+from ai_trader_v2.liveness import RunState, StallGuard, git_version, send_telegram_plain
 from ai_trader_v2.telegram_ui import VikaTelegramUI
 from ai_trader_v2.vika_engine import CoinEvaluation, M15_MS, evaluate_coin
 
@@ -92,6 +93,8 @@ class VikaRunner:
         self._evals_lock = threading.Lock()
         self._latest_evals: Dict[str, CoinEvaluation] = {}
         self._stop_evt = threading.Event()
+        self.version = "unknown"
+        self.run_state: Optional[RunState] = None
 
         # Wire executor <-> telegram notifier
         self.tg: Optional[VikaTelegramUI] = None
@@ -209,7 +212,9 @@ class VikaRunner:
     # Main Production Loop
     # ------------------------------------------------------------------
     def run_forever(self) -> None:
-        logger.info("Starting VIKA_N2_N7 runner (mode=%s, dry_run=%s)", self.mode, self.executor.dry_run)
+        logger.info(
+            "Starting VIKA_N2_N7 runner (mode=%s, dry_run=%s, version=%s)", self.mode, self.executor.dry_run, self.version
+        )
 
         self.executor.load_instruments()
         lev_status = self.executor.ensure_cross_margin_and_leverage()
@@ -231,7 +236,10 @@ class VikaRunner:
         if self.tg is not None:
             cmds_ok = self.tg.register_commands()
             logger.info("Telegram setMyCommands updated: %s", cmds_ok)
-            welcome = self.tg.format_startup_welcome(lev_status)
+            welcome = self.tg.format_startup_welcome(lev_status) + f"\nВерсия: <code>{self.version}</code>"
+            note = self.run_state.startup_note() if self.run_state else ""
+            if note:
+                welcome += f"\n{note}"
             sent = self.tg.send_message(welcome)
             logger.info("Telegram startup welcome sent: %s", sent)
             self.tg.start_polling()
@@ -251,7 +259,17 @@ class VikaRunner:
             self.executor.max_same_key,
             float(self.filters_cfg.get("t4_min_4h_ema50_slope_pct", 0.15)),
         )
+        stall_sec = float(self.cfg.get("stall_restart_sec", 600))
+        stall_guard = StallGuard(
+            stall_sec,
+            on_stall=lambda age: send_telegram_plain(
+                f"🚨 Vika зависла: главный цикл стоит {age / 60:.0f} мин. Перезапускаю процесс (версия {self.version})."
+            ),
+        )
+        stall_guard.start()
+
         while not self._stop_evt.is_set():
+            stall_guard.beat()
             now_mono = time.monotonic()
             now_ms = int(time.time() * 1000)
 
@@ -303,6 +321,7 @@ class VikaRunner:
 
             self._stop_evt.wait(timeout=1.0)
 
+        stall_guard.stop()
         if self.tg is not None:
             self.tg.stop()
         logger.info("VIKA_N2_N7 runner stopped cleanly.")
@@ -342,7 +361,22 @@ def main() -> int:
         cfg["dry_run"] = True
 
     setup_logging(cfg.get("log_path", "logs/ai_trader_v2.log"))
-    runner = VikaRunner(cfg)
+    if args.dry_run_check:
+        return VikaRunner(cfg).run_dry_run_check()
+
+    version = git_version(ROOT)
+    db_dir = (ROOT / cfg.get("db_path", "data/ai_trader_v2/vika_trades.db")).parent
+    run_state = RunState(db_dir / "run_state.json")
+    run_state.start(version)
+    try:
+        runner = VikaRunner(cfg)
+    except Exception as exc:
+        logger.exception("Runner init failed: %s", exc)
+        if run_state.fatal_alert_allowed():
+            send_telegram_plain(f"❌ Vika не запустилась (версия {version}): {type(exc).__name__}: {exc}"[:600])
+        return 1
+    runner.version = version
+    runner.run_state = run_state
 
     def _sig_handler(signum: int, frame: Any) -> None:
         logger.info("Received signal %s, shutting down...", signum)
@@ -351,10 +385,14 @@ def main() -> int:
     signal.signal(signal.SIGINT, _sig_handler)
     signal.signal(signal.SIGTERM, _sig_handler)
 
-    if args.dry_run_check:
-        return runner.run_dry_run_check()
-
-    runner.run_forever()
+    try:
+        runner.run_forever()
+    except Exception as exc:
+        logger.exception("Runner crashed: %s", exc)
+        if run_state.fatal_alert_allowed():
+            send_telegram_plain(f"❌ Vika упала (версия {version}): {type(exc).__name__}: {exc}"[:600])
+        return 1
+    run_state.mark_clean_exit()
     return 0
 
 

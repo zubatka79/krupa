@@ -10,6 +10,8 @@ services:
     volumes:
       - krupa-data:/app/data
       - krupa-logs:/app/logs
+      # Read-only, only so the bot can report which commit is running
+      - ./.git:/app/.git:ro
     logging:
       driver: json-file
       options:
