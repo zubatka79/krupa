@@ -49,10 +49,10 @@
     {
       "symbol": "BTWUSDT",
       "key": "K8_SUPERTREND_BO",
-      "tp_pct": 1.2,
-      "sl_pct": 2.5,
-      "be_trigger_pct": 0.85,
-      "be_lock_pct": 0.2
+      "tp_pct": 1.4,
+      "sl_pct": 3.0,
+      "be_trigger_pct": 0.95,
+      "be_lock_pct": 0.25
     },
     {
       "symbol": "VIRTUALUSDT",
@@ -81,10 +81,10 @@
     {
       "symbol": "MONUSDT",
       "key": "K1_EMA_TREND_PB",
-      "tp_pct": 1.4,
-      "sl_pct": 3.0,
-      "be_trigger_pct": 0.95,
-      "be_lock_pct": 0.25
+      "tp_pct": 1.2,
+      "sl_pct": 2.5,
+      "be_trigger_pct": 0.85,
+      "be_lock_pct": 0.2
     },
     {
       "symbol": "1000PEPEUSDT",
