@@ -146,7 +146,7 @@ class VikaRunner:
             return dict(self._latest_evals)
 
     def scan_all_coins(self) -> Dict[str, CoinEvaluation]:
-        """Parallel (~1.5-2s) fetch of closed 15m/1H/4H candles & live Funding Rates across all 13 coins."""
+        """Parallel (~2-3s) fetch of closed 15m/1H/4H candles & live Funding Rates across all configured coins."""
         t0 = time.monotonic()
         now_ms = int(time.time() * 1000)
         tickers = self.client.get_tickers()
@@ -175,7 +175,7 @@ class VikaRunner:
                 logger.error("Failed to evaluate %s: %s", sym, exc)
                 return sym, None
 
-        max_workers = min(8, max(1, len(self.cfg["coins"])))
+        max_workers = min(10, max(1, len(self.cfg["coins"])))
         with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as pool:
             for sym, ev in pool.map(_eval_one, self.cfg["coins"]):
                 if ev is not None:

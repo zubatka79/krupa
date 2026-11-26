@@ -303,7 +303,7 @@ class VikaTelegramUI:
         dir_str = dir_map.get(getattr(self.executor, "allowed_directions", "long_short"), "LONG + SHORT")
         k7_tag = " + K7 color" if self.cfg.get("filters", {}).get("k7_require_candle_dir", True) else ""
         header = (
-            f"🤖 <b>ЗАПУСК: Vika N2N7 (13 CLEAN + R3 + T4)</b>\n"
+            f"🤖 <b>ЗАПУСК: Vika N2N7 ({n_coins} CLEAN + R3 + T4)</b>\n"
             f"Биржа: <code>Bybit {self.executor.mode.upper()} | 10x Cross ({ok_cnt}/{n_coins} монет)</code>\n"
             f"Направление: <b>{dir_str}</b>\n"
             f"Баланс: <b>${ds['current_equity']:,.2f}</b> | Риск: <code>10% × 10x | слоты 8/8 (R3: макс.{self.executor.max_same_key}/ключ) | стоп -6%</code>\n"

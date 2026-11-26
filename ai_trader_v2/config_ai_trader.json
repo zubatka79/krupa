@@ -137,6 +137,46 @@
       "sl_pct": 3.0,
       "be_trigger_pct": 0.95,
       "be_lock_pct": 0.25
+    },
+    {
+      "symbol": "WLDUSDT",
+      "key": "K1_EMA_TREND_PB",
+      "tp_pct": 1.4,
+      "sl_pct": 3.0,
+      "be_trigger_pct": 0.95,
+      "be_lock_pct": 0.25
+    },
+    {
+      "symbol": "ADAUSDT",
+      "key": "K7_SFP_LIQ_SWEEP",
+      "tp_pct": 1.2,
+      "sl_pct": 2.5,
+      "be_trigger_pct": 0.85,
+      "be_lock_pct": 0.2
+    },
+    {
+      "symbol": "SOLUSDT",
+      "key": "K6_VWAP_RECLAIM",
+      "tp_pct": 1.4,
+      "sl_pct": 3.0,
+      "be_trigger_pct": 0.95,
+      "be_lock_pct": 0.25
+    },
+    {
+      "symbol": "HYPEUSDT",
+      "key": "K7_SFP_LIQ_SWEEP",
+      "tp_pct": 1.4,
+      "sl_pct": 3.0,
+      "be_trigger_pct": 0.95,
+      "be_lock_pct": 0.25
+    },
+    {
+      "symbol": "PUMPFUNUSDT",
+      "key": "K7_SFP_LIQ_SWEEP",
+      "tp_pct": 1.2,
+      "sl_pct": 2.5,
+      "be_trigger_pct": 0.85,
+      "be_lock_pct": 0.2
     }
   ]
 }

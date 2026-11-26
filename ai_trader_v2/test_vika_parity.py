@@ -231,14 +231,14 @@ def test_journal_executor_and_telegram() -> None:
         assert executor.open_signal(ev_k1_3) is None, "R3 max_same_key=2 failed to block 3rd K1 trade"
         assert executor.open_signal(ev_k3) is not None, "K3_MACD_STOCH trade should open despite K1 at cap"
 
-        # Test Telegram UI formatters for 13 coins + R3 + T4
+        # Test Telegram UI formatters for 18 coins + R3 + T4
         tg = VikaTelegramUI(cfg, executor, journal, get_latest_evals=lambda: {"GRAMUSDT": ev, "DOGEUSDT": ev_k3})
         lev_st = executor.ensure_cross_margin_and_leverage()
-        assert len(lev_st) == 13
-        assert "13 CLEAN + R3 + T4" in tg.format_startup_welcome(lev_st)
+        assert len(lev_st) == 18
+        assert "18 CLEAN + R3 + T4" in tg.format_startup_welcome(lev_st)
         assert "СТАТУС И БАЛАНС | Vika N2N7" in tg.format_status()
         assert "ОТКРЫТЫЕ ПОЗИЦИИ (3/8) | Vika N2N7" in tg.format_open_positions()
-        assert "ПОРТФЕЛЬ Vika N2N7 — 13 МОНЕТ" in tg.format_portfolio()
+        assert "ПОРТФЕЛЬ Vika N2N7 — 18 МОНЕТ" in tg.format_portfolio()
         assert "ИСТОРИЯ СДЕЛОК | Vika N2N7" in tg.format_history()
 
         # Test Panic Close pauses bot & clears active
@@ -247,7 +247,7 @@ def test_journal_executor_and_telegram() -> None:
         assert journal.is_paused() is True
         assert len(journal.get_active_positions()) == 0
 
-    print("[PASS] Journal, Executor (10%x10x, R3 max_same_key=2, BE, Panic), and 13-coin Telegram UI verified.")
+    print("[PASS] Journal, Executor (10%x10x, R3 max_same_key=2, BE, Panic), and 18-coin Telegram UI verified.")
 
 
 def test_limit_order_ttl_45m_partial_fill_and_startup_cleanup() -> None:
@@ -501,6 +501,16 @@ def test_only_short_and_k7_candle_color_fix() -> None:
     assert cfg["mode"] == "demo"
     assert cfg["allowed_directions"] == "only_short"
     assert cfg["filters"]["k7_require_candle_dir"] is True
+    assert len(cfg["coins"]) == 18
+    coin_map = {c["symbol"]: c for c in cfg["coins"]}
+    for sym, exp_k, exp_tp in [
+        ("WLDUSDT", "K1_EMA_TREND_PB", 1.4),
+        ("ADAUSDT", "K7_SFP_LIQ_SWEEP", 1.2),
+        ("SOLUSDT", "K6_VWAP_RECLAIM", 1.4),
+        ("HYPEUSDT", "K7_SFP_LIQ_SWEEP", 1.4),
+        ("PUMPFUNUSDT", "K7_SFP_LIQ_SWEEP", 1.2),
+    ]:
+        assert sym in coin_map and coin_map[sym]["key"] == exp_k and coin_map[sym]["tp_pct"] == exp_tp
 
     # 1. Executor blocks LONG and allows SHORT in only_short mode
     cfg_paper = dict(cfg)
