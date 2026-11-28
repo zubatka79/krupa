@@ -321,7 +321,18 @@ def test_3_executor_dca_be_hard_sl_antisalvo_and_telegram() -> None:
         assert any("ЗАКРЫТИЕ (HARD_SL)" in m and "AC 6ч (SHORT)" in m for m in sent)
 
         # 6) Verify Rebuilt Telegram UI formatters & handlers (ZERO legacy strings, < 4096 chars!)
-        tg = VikaTelegramUI(cfg, ex, journal, get_latest_evals=lambda: {}, get_latest_long_evals=lambda: {})
+        evals_s = {"DOTUSDT": _mk_s("DOTUSDT", "K1_EMA_TREND_PB"), "LTCUSDT": CoinEvaluation(
+            symbol="LTCUSDT", key="K6_VWAP_RECLAIM", bar_ts=bar_ts, close_price=100.0, rvol=1.6, adx15=22.0, bbw15=2.1,
+            atr15_pct=0.5, funding_rate=0.0, funding_bps=0.0, div4h_bear_strong=False, div4h_bull_strong=False,
+            n2_blocked=False, slope4h_pct=-0.4, retail_ls_z=-1.4, retail_ls_available=True,
+            raw_signal="SHORT", final_signal=None,
+        )}
+        evals_l = {"HBARUSDT": LongCoinEvaluation(
+            symbol="HBARUSDT", key="T14_DONCHIAN_BO", bar_ts=bar_ts, close_price=0.05, high_price=0.051, rvol=1.5,
+            atr15_pct=0.5, h1_up=True, h4_up=True, dist4h_ema50_pct=2.0, btc_4h_up=False, utc_hour=14,
+            retail_ls_z=0.2, retail_ls_available=True,
+        )}
+        tg = VikaTelegramUI(cfg, ex, journal, get_latest_evals=lambda: evals_s, get_latest_long_evals=lambda: evals_l)
         lev_st = ex.ensure_margin_and_leverage()
         welcome = tg.format_startup_welcome(lev_st)
         status = tg.format_status()
@@ -338,10 +349,20 @@ def test_3_executor_dca_be_hard_sl_antisalvo_and_telegram() -> None:
             assert "<" not in cleaned_html and ">" not in cleaned_html, f"Unescaped HTML bracket in Telegram msg: {cleaned_html}"
 
         assert "Vika Hybrid" in welcome and "Vika Hybrid" in status
-        assert "15x ISOLATED" in status and "5×12%" in status and "Резерв Bybit" in status
+        assert "15x ISOLATED" in status and "5×12%" in status and "Резерв Bybit" in status and "DCA (35/65)" in status
         assert "FOMC" in macro_v and "CPI" in macro_v and "NFP" in macro_v and "AC 6ч" in macro_v
         assert "All-Thick-18 (18L + 18S)" in portfolio
+        assert "SHORT (18 | допущено: 1)" in portfolio and "⚪ <b>LONG (18 | откл. BTC)" in portfolio
+        assert "⛔ <code>LTC" in portfolio and "🟢 <code>DOT" in portfolio and "⚪ <code>HBAR" in portfolio
         assert "[HARD_SL]" in history and "[BE]" in history
+
+        # Storm DCA (30/70) check
+        ex.last_btc_regime = BtcL2Regime(
+            bar_ts_4h=1_795_000_000_000, close_4h=95000, ema20_4h=94000, ema50_4h=92000,
+            v1_long=False, v1_short=True, day_ts_1d=1_794_960_000_000, close_1d=95000, ema20_1d=96000,
+            d1_dir=-1, atr1d_pct=5.0, in_storm=True,
+        )
+        assert "DCA (30/70)" in tg.format_status()
 
         # Test interactive Telegram update router (buttons + panic inline confirm)
         tg.chat_id = "12345"

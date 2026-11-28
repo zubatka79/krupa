@@ -235,6 +235,7 @@ class VikaTelegramUI:
         prob_txt = ", ".join(s.replace("USDT", "") for s, _ in probs) if probs else "нет"
 
         cap_tag = f"${snap['effective_cap_usd']:,.0f}" + (" ⚡ШТОРМ" if snap["in_storm"] else " (шторм $2,500)")
+        dca_split = "30/70" if snap["in_storm"] else "35/65"
         res_icon = "🔴" if snap["reserve_pct"] >= 78.0 else ("🟡" if snap["reserve_pct"] >= 60.0 else "🟢")
 
         lines = [
@@ -250,7 +251,7 @@ class VikaTelegramUI:
             f"🧩 Слоты <b>5×12%</b>: 🟢L <b>{snap['open_long']}/{self.executor.max_same_dir}</b> | 🔴S <b>{snap['open_short']}/{self.executor.max_same_dir}</b> | Всего <b>{snap['open_total']}/{self.executor.max_open}</b>",
             f"🛡 AntiSalvo: <code>≤{self.executor.max_entries_per_bar_l}L / ≤{self.executor.max_entries_per_bar_s}S за бар, ≤{self.executor.max_same_key}/ключ</code>",
             f"💼 Кап слота: <code>{cap_tag}</code> | {res_icon} Резерв Bybit: <b>{snap['reserve_pct']:.1f}% / {snap['limit_pct']:.0f}%</b> (<code>${snap['reserved_usd']:,.1f}</code>)",
-            f"🪜 DCA (35/65): <code>{snap['dca_pending']}</code> в стакане | <code>{snap['dca_filled']}</code> залито | BE <code>+1.0% → +0.30%</code> + отмена DCA",
+            f"🪜 DCA ({dca_split}): <code>{snap['dca_pending']}</code> в стакане | <code>{snap['dca_filled']}</code> залито | BE <code>+1.0% → +0.30%</code> + отмена DCA",
             "",
             f"🧊 Паузы (только Hard SL):",
             f"  • AC {self.executor.ac_pause_hours}ч LONG: {ac_l}",
@@ -335,36 +336,76 @@ class VikaTelegramUI:
         l_evals = self.get_latest_long_evals()
         s_evals = self.get_latest_evals()
         btc = self.get_btc_regime()
+        now_ms = int(time.time() * 1000)
+        prob_syms = {s for s, _ in self.journal.get_all_active_probations(now_ms)}
+        ls_max_z = float(self.cfg.get("filters", {}).get("retail_ls_max_abs_z", 1.0))
+        allow_long = bool(btc.allow_long) if btc else False
+        allow_short = bool(btc.allow_short) if btc else False
+
         lines = [f"🪙 <b>ПОРТФЕЛЬ All-Thick-18 ({self.n_long}L + {self.n_short}S)</b>"]
         if btc:
             lines.append(btc.mode_label)
-        lines.append("<i>Фильтр Retail L/S: |z| &lt; 1.0 (1h, Bybit V5)</i>")
+        lines.append("<i>🟢 допущена | ⛔ блок |z|≥1.0 / Probation | ⚪ откл. BTC</i>")
 
         if self.n_long > 0:
-            lines.append(f"\n🟢 <b>LONG ({self.n_long}):</b>")
+            l_rows: List[str] = []
+            allowed_l = 0
             for c in self.cfg.get("long_coins", []):
                 sym = c["symbol"]
                 ks = c["key"].split("_")[0]
                 ev = l_evals.get(sym)
                 if ev is None:
-                    lines.append(f"• <code>{sym[:-4]:<9}</code> {ks} | ⏳")
+                    l_rows.append(f"• <code>{sym[:-4]:<9}</code> {ks} | ⏳")
+                    continue
+                ls_s = f"z={ev.retail_ls_z:+.1f}" if ev.retail_ls_available else "z=n/a"
+                in_prob = sym in prob_syms
+                ls_blk = ev.retail_ls_available and (ev.retail_ls_z > ls_max_z)
+                if not allow_long:
+                    ico = "⚪"
+                elif in_prob or ls_blk:
+                    ico = "⛔"
                 else:
-                    ls_s = f"z={ev.retail_ls_z:+.1f}" if ev.retail_ls_available else "z=n/a"
-                    ico = "🔴" if ev.retail_ls_blocked else ("🟢" if ev.h1_up and ev.h4_up else "⚪")
-                    lines.append(f"{ico} <code>{sym[:-4]:<9}</code> {ks:<3} | {ls_s}")
+                    ico = "🟢"
+                    allowed_l += 1
+                prob_tag = " [P]" if in_prob else ""
+                l_rows.append(f"{ico} <code>{sym[:-4]:<9}</code> {ks:<3} | {ls_s}{prob_tag}")
+            l_hdr = (
+                f"\n🟢 <b>LONG ({self.n_long} | допущено: {allowed_l}):</b>"
+                if allow_long
+                else f"\n⚪ <b>LONG ({self.n_long} | откл. BTC):</b>"
+            )
+            lines.append(l_hdr)
+            lines.extend(l_rows)
 
         if self.n_short > 0:
-            lines.append(f"\n🔴 <b>SHORT ({self.n_short}):</b>")
+            s_rows: List[str] = []
+            allowed_s = 0
             for c in self.cfg.get("short_coins", self.cfg.get("coins", [])):
                 sym = c["symbol"]
                 ks = c["key"].split("_")[0]
                 ev = s_evals.get(sym)
                 if ev is None:
-                    lines.append(f"• <code>{sym[:-4]:<9}</code> {ks} | ⏳")
+                    s_rows.append(f"• <code>{sym[:-4]:<9}</code> {ks} | ⏳")
+                    continue
+                ls_s = f"z={ev.retail_ls_z:+.1f}" if ev.retail_ls_available else "z=n/a"
+                in_prob = sym in prob_syms
+                ls_blk = ev.retail_ls_available and (ev.retail_ls_z < -ls_max_z)
+                if not allow_short:
+                    ico = "⚪"
+                elif in_prob or ls_blk:
+                    ico = "⛔"
                 else:
-                    ls_s = f"z={ev.retail_ls_z:+.1f}" if ev.retail_ls_available else "z=n/a"
-                    ico = "🔴" if (ev.retail_ls_blocked or ev.n2_blocked or ev.div4h_bull_strong) else "🟢"
-                    lines.append(f"{ico} <code>{sym[:-4]:<9}</code> {ks:<3} | {ls_s} | 4H:{ev.slope4h_pct:+.1f}%")
+                    ico = "🟢"
+                    allowed_s += 1
+                prob_tag = " [P]" if in_prob else ""
+                s_rows.append(f"{ico} <code>{sym[:-4]:<9}</code> {ks:<3} | {ls_s}{prob_tag} | 4H:{ev.slope4h_pct:+.1f}%")
+            s_hdr = (
+                f"\n🔴 <b>SHORT ({self.n_short} | допущено: {allowed_s}):</b>"
+                if allow_short
+                else f"\n⚪ <b>SHORT ({self.n_short} | откл. BTC):</b>"
+            )
+            lines.append(s_hdr)
+            lines.extend(s_rows)
 
         return "\n".join(lines)
 
