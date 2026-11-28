@@ -198,7 +198,24 @@ def test_1_configs_and_macro_calendar() -> None:
         raise AssertionError("Should have rejected invalid payload")
     except ValueError:
         pass
-    print("[PASS] 1. Demo configs, All-Thick-18, macro calendar [T-60m..T+45m], horizon warn & validator")
+
+    # Verify Dokploy in-place redeploy contract: single service `ai-trader-v2` with exact old entry point
+    dc_txt = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
+    assert "ai-trader-v2:" in dc_txt and "ai_trader_v2/run_ai_trader.py" in dc_txt
+    assert "vika-hybrid:" not in dc_txt and "run_long_trader.py" not in dc_txt
+
+    # Verify runtime_override_path picks fresher calendar while preserving fallback
+    with tempfile.TemporaryDirectory() as tmp:
+        rt_cal = Path(tmp) / "macro_events_utc.json"
+        rt_payload = dict(cal)
+        rt_payload["events"] = list(cal["events"]) + [
+            {"type": "NFP", "title": "US NFP (Jan 2027)", "utc": "2027-02-05T13:30:00Z"}
+        ]
+        update_macro_calendar.atomic_write_json(rt_cal, rt_payload)
+        g2 = MacroCalendarGuard(ROOT / "config" / "macro_events_utc.json", runtime_override_path=rt_cal)
+        st2 = g2.evaluate(now_ref)
+        assert st2.horizon_days > 65.0 and len(st2.upcoming_events) >= 6
+    print("[PASS] 1. Demo configs, Dokploy ai-trader-v2 contract, macro calendar [T-60m..T+45m] & runtime override")
 
 
 def test_2_strict_closed_1d_causality() -> None:

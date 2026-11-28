@@ -71,56 +71,93 @@ class MacroCalendarGuard:
         self,
         calendar_path: str | Path,
         *,
+        runtime_override_path: Optional[str | Path] = None,
         pre_minutes: int = 60,
         post_minutes: int = 45,
         horizon_warn_days: float = 3.0,
     ) -> None:
         self.path = Path(calendar_path)
+        self.runtime_override_path = Path(runtime_override_path) if runtime_override_path else None
         self.default_pre = int(pre_minutes)
         self.default_post = int(post_minutes)
         self.horizon_warn_days = float(horizon_warn_days)
 
         self._lock = threading.RLock()
-        self._mtime: float = -1.0
+        self._mtimes: Tuple[float, float] = (-1.0, -1.0)
         self._events: List[MacroEvent] = []
         self._pre_min: int = self.default_pre
         self._post_min: int = self.default_post
         self._last_error: Optional[str] = None
+        self._active_source: str = str(self.path.name)
         self._reload_if_needed(force=True)
+
+    def _parse_file(self, fp: Path) -> Tuple[List[MacroEvent], int, int, str]:
+        raw = json.loads(fp.read_text(encoding="utf-8"))
+        bw = raw.get("blackout_window") or {}
+        pre_m = int(bw.get("pre_minutes", self.default_pre))
+        post_m = int(bw.get("post_minutes", self.default_post))
+        parsed: List[MacroEvent] = []
+        for item in raw.get("events", []):
+            ev_type = str(item.get("type", "")).strip().upper()
+            title = str(item.get("title", "")).strip() or ev_type
+            iso = str(item.get("utc", "")).strip()
+            dt_utc = _parse_iso_utc(iso)
+            parsed.append(MacroEvent(event_type=ev_type, title=title, dt_utc=dt_utc, iso_utc=dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ")))
+        parsed.sort(key=lambda e: e.dt_utc)
+        upd = str(raw.get("updated_at_utc") or "")
+        return parsed, pre_m, post_m, upd
 
     def _reload_if_needed(self, force: bool = False) -> None:
         with self._lock:
-            if not self.path.exists():
+            m1 = self.path.stat().st_mtime if self.path.exists() else -1.0
+            m2 = (
+                self.runtime_override_path.stat().st_mtime
+                if (self.runtime_override_path is not None and self.runtime_override_path.exists())
+                else -1.0
+            )
+            cur_mtimes = (m1, m2)
+            if (not force) and cur_mtimes == self._mtimes:
+                return
+
+            candidates: List[Tuple[str, Path]] = []
+            if self.path.exists():
+                candidates.append((self.path.name, self.path))
+            if self.runtime_override_path is not None and self.runtime_override_path.exists():
+                candidates.append((f"runtime:{self.runtime_override_path.name}", self.runtime_override_path))
+
+            if not candidates:
                 self._last_error = f"Файл не найден: {self.path.name}"
                 return
-            try:
-                st = self.path.stat()
-                if (not force) and st.st_mtime == self._mtime:
-                    return
-                raw = json.loads(self.path.read_text(encoding="utf-8"))
-                bw = raw.get("blackout_window") or {}
-                pre_m = int(bw.get("pre_minutes", self.default_pre))
-                post_m = int(bw.get("post_minutes", self.default_post))
-                parsed: List[MacroEvent] = []
-                for item in raw.get("events", []):
-                    ev_type = str(item.get("type", "")).strip().upper()
-                    title = str(item.get("title", "")).strip() or ev_type
-                    iso = str(item.get("utc", "")).strip()
-                    dt_utc = _parse_iso_utc(iso)
-                    parsed.append(MacroEvent(event_type=ev_type, title=title, dt_utc=dt_utc, iso_utc=dt_utc.strftime("%Y-%m-%dT%H:%M:%SZ")))
-                parsed.sort(key=lambda e: e.dt_utc)
-                self._events = parsed
+
+            best: Optional[Tuple[datetime, str, List[MacroEvent], int, int]] = None
+            last_exc: Optional[Exception] = None
+            for lbl, fp in candidates:
+                try:
+                    evs, pre_m, post_m, upd = self._parse_file(fp)
+                    if not evs:
+                        continue
+                    farthest = evs[-1].dt_utc
+                    if best is None or farthest > best[0]:
+                        best = (farthest, lbl, evs, pre_m, post_m)
+                except Exception as exc:
+                    last_exc = exc
+                    logger.warning("Failed parsing macro calendar %s: %s", fp, exc)
+
+            if best is not None:
+                _, lbl, evs, pre_m, post_m = best
+                self._events = evs
                 self._pre_min = pre_m
                 self._post_min = post_m
-                self._mtime = st.st_mtime
+                self._mtimes = cur_mtimes
+                self._active_source = lbl
                 self._last_error = None
                 logger.info(
-                    "Loaded macro calendar %s: %d events (window [-%dm..+%dm]).",
-                    self.path.name, len(parsed), pre_m, post_m,
+                    "Loaded macro calendar %s: %d events (window [-%dm..+%dm], latest=%s).",
+                    lbl, len(evs), pre_m, post_m, evs[-1].iso_utc,
                 )
-            except Exception as exc:
-                self._last_error = str(exc)
-                logger.error("Failed loading macro calendar %s (keeping previous %d events): %s", self.path, len(self._events), exc)
+            elif last_exc is not None:
+                self._last_error = str(last_exc)
+                logger.error("Failed loading macro calendar (keeping previous %d events): %s", len(self._events), last_exc)
 
     def evaluate(self, now_utc: Optional[datetime] = None) -> MacroCalendarStatus:
         self._reload_if_needed()

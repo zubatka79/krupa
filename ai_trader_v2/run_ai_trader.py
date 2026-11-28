@@ -22,6 +22,7 @@ import argparse
 import concurrent.futures
 import json
 import logging
+import os
 import signal
 import sys
 import threading
@@ -47,6 +48,7 @@ from ai_trader_v2.telegram_ui import VikaTelegramUI
 from ai_trader_v2.vika_engine import CoinEvaluation, M15_MS, evaluate_coin
 from ai_trader_v2_long.long_engine import BtcRegimeState, LongCoinEvaluation, evaluate_long_coin
 from bot.bybit_client import BybitClient, KLINE_COLUMNS, round_step_down, round_tick
+import update_macro_calendar
 
 logger = logging.getLogger("vika.runner")
 
@@ -123,13 +125,20 @@ class VikaRunner:
         self.short_coins: List[Dict[str, Any]] = list(cfg.get("short_coins", cfg.get("coins", [])))
 
         cal_rel = str(cfg.get("macro_calendar_path", "config/macro_events_utc.json"))
-        cal_path = Path(cal_rel) if Path(cal_rel).is_absolute() else (ROOT / cal_rel)
+        self.macro_cal_path = Path(cal_rel) if Path(cal_rel).is_absolute() else (ROOT / cal_rel)
+        db_dir = (ROOT / cfg.get("db_path", "data/ai_trader_v2/vika_trades.db")).parent
+        self.macro_runtime_path = db_dir / "macro_events_utc.json"
+        self.macro_refresh_days = float(cfg.get("macro_refresh_interval_days", 7.0))
         self.macro_guard = MacroCalendarGuard(
-            cal_path,
+            self.macro_cal_path,
+            runtime_override_path=self.macro_runtime_path,
             pre_minutes=int(cfg.get("macro_pre_minutes", 60)),
             post_minutes=int(cfg.get("macro_post_minutes", 45)),
             horizon_warn_days=float(cfg.get("macro_horizon_warn_days", 3.0)),
         )
+        self._macro_refresh_lock = threading.Lock()
+        self._macro_refresh_running = False
+        self._last_macro_attempt_mono = 0.0
 
         self.client = BybitClient(
             mode=self.mode,
@@ -182,6 +191,73 @@ class VikaRunner:
 
     def get_macro_status(self) -> MacroCalendarStatus:
         return self.macro_guard.evaluate()
+
+    def _run_macro_refresh_worker(self) -> None:
+        """Background weekly refresh of macro_events_utc.json via Claude API (zero disruption on failure)."""
+        try:
+            api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+            if not api_key or "your_anthropic" in api_key.lower():
+                logger.info("Macro calendar auto-refresh skipped: ANTHROPIC_API_KEY not configured in .env.")
+                return
+            model = (os.getenv("ANTHROPIC_MODEL", "") or "claude-sonnet-4-5").strip()
+            now_utc = datetime.now(timezone.utc)
+            existing: Optional[Dict[str, Any]] = None
+            for fp in (self.macro_runtime_path, self.macro_cal_path):
+                if fp.exists():
+                    try:
+                        existing = json.loads(fp.read_text(encoding="utf-8"))
+                        break
+                    except Exception:
+                        continue
+            raw_fresh = update_macro_calendar.fetch_events_from_claude(
+                api_key=api_key, model=model, now_utc=now_utc, horizon_days=60,
+            )
+            fresh_valid = update_macro_calendar.validate_calendar_payload(raw_fresh, now_utc=now_utc, min_future_events=1)
+            final_payload = update_macro_calendar.merge_and_prune_events(existing, fresh_valid, now_utc)
+
+            # Persist in volume-backed runtime path (survives Docker redeploys) + update config/ if writable
+            update_macro_calendar.atomic_write_json(self.macro_runtime_path, final_payload)
+            try:
+                update_macro_calendar.atomic_write_json(self.macro_cal_path, final_payload)
+            except OSError as exc:
+                logger.debug("Config macro path not writable (%s); runtime volume updated cleanly.", exc)
+
+            self.journal.set_kv("macro_cal_last_refresh_ms", str(int(now_utc.timestamp() * 1000)))
+            self.macro_guard.evaluate(now_utc)
+            logger.info(
+                "In-bot weekly macro calendar refresh succeeded: %d events (latest=%s).",
+                len(final_payload["events"]), final_payload["events"][-1]["utc"],
+            )
+        except Exception as exc:
+            logger.warning("In-bot macro calendar refresh failed (%s) — keeping existing calendar untouched.", exc)
+        finally:
+            with self._macro_refresh_lock:
+                self._macro_refresh_running = False
+
+    def maybe_refresh_macro_calendar(self, now_ms: Optional[int] = None) -> bool:
+        """Trigger non-blocking weekly (7d) or low-horizon (<14d) macro calendar refresh inside the bot loop."""
+        cur_ms = int(now_ms if now_ms is not None else time.time() * 1000)
+        now_mono = time.monotonic()
+        # Rate-limit failed/retry attempts to at most once every 12h
+        if self._last_macro_attempt_mono > 0 and (now_mono - self._last_macro_attempt_mono) < 12 * 3600:
+            return False
+
+        last_ok_ms = int(self.journal.get_kv("macro_cal_last_refresh_ms", "0") or "0")
+        due_weekly = (cur_ms - last_ok_ms) >= int(self.macro_refresh_days * 86_400_000)
+        st = self.macro_guard.evaluate()
+        due_horizon = st.horizon_days < 14.0
+        if not (due_weekly or due_horizon):
+            return False
+
+        with self._macro_refresh_lock:
+            if self._macro_refresh_running:
+                return False
+            self._macro_refresh_running = True
+            self._last_macro_attempt_mono = now_mono
+
+        t = threading.Thread(target=self._run_macro_refresh_worker, name="macro-cal-refresh", daemon=True)
+        t.start()
+        return True
 
     def scan_all_coins(self) -> Tuple[BtcL2Regime, Dict[str, LongCoinEvaluation], Dict[str, CoinEvaluation]]:
         """
@@ -382,6 +458,7 @@ class VikaRunner:
                 try:
                     self.executor.sync_with_exchange()
                     self.executor.check_macro_calendar(notify_events=True)
+                    self.maybe_refresh_macro_calendar(now_ms)
                 except Exception as exc:
                     logger.error("Sync loop exception: %s", exc)
                 last_sync_ts = time.monotonic()

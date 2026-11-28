@@ -1,8 +1,7 @@
 services:
-  vika-hybrid:
+  ai-trader-v2:
     build: .
     image: krupa-bot:latest
-    container_name: vika-hybrid
     restart: unless-stopped
     init: true
     stop_grace_period: 30s
@@ -11,7 +10,6 @@ services:
     volumes:
       - krupa-data:/app/data
       - krupa-logs:/app/logs
-      - ./config:/app/config
       # Read-only, only so the bot can report which commit is running
       - ./.git:/app/.git:ro
     logging:
