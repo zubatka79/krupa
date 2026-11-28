@@ -23,9 +23,12 @@ data/rnd_scout.lock
 data/blacklist.json.lock
 data/rnd_scout_latest.json
 data/ai_trader_v2/
+data/ai_trader_v2_long/
 ai_trader_v2/data/
 ai_trader_v2/logs/
 logs/
+research_long_v3/
+audit_vika_silence/
 
 # Python environment & bytecode
 .venv/

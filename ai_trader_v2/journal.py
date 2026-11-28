@@ -1,4 +1,4 @@
-"""Thread-safe SQLite trade & state journal for VIKA_N2_N7 (`data/ai_trader_v2/vika_trades.db`)."""
+"""Thread-safe SQLite trade & state journal for L2_news (`data/ai_trader_v2/vika_trades.db`)."""
 
 from __future__ import annotations
 
@@ -9,7 +9,7 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 
 class VikaJournal:
@@ -43,6 +43,7 @@ class VikaJournal:
                     entry_price REAL NOT NULL,
                     qty REAL NOT NULL,
                     margin_usd REAL NOT NULL,
+                    reserved_margin_usd REAL NOT NULL DEFAULT 0.0,
                     leverage INTEGER NOT NULL,
                     tp_price REAL NOT NULL,
                     sl_price REAL NOT NULL,
@@ -57,7 +58,14 @@ class VikaJournal:
                     exit_reason TEXT,
                     pnl_usd REAL,
                     pnl_pct REAL,
-                    filters_json TEXT
+                    filters_json TEXT,
+                    dca_order_id TEXT DEFAULT '',
+                    dca_price REAL NOT NULL DEFAULT 0.0,
+                    dca_qty REAL NOT NULL DEFAULT 0.0,
+                    dca_margin_usd REAL NOT NULL DEFAULT 0.0,
+                    dca_status TEXT NOT NULL DEFAULT 'NONE',
+                    in_storm INTEGER NOT NULL DEFAULT 0,
+                    tp_pct REAL NOT NULL DEFAULT 1.5
                 );
                 CREATE TABLE IF NOT EXISTS daily_state (
                     day_utc TEXT PRIMARY KEY,
@@ -71,8 +79,27 @@ class VikaJournal:
                 );
                 """
             )
+            # Safe forward-compatible migration for existing pre-L2_news SQLite databases
+            existing_cols = {r["name"] for r in conn.execute("PRAGMA table_info(positions)").fetchall()}
+            migrations: List[Tuple[str, str]] = [
+                ("reserved_margin_usd", "REAL NOT NULL DEFAULT 0.0"),
+                ("dca_order_id", "TEXT DEFAULT ''"),
+                ("dca_price", "REAL NOT NULL DEFAULT 0.0"),
+                ("dca_qty", "REAL NOT NULL DEFAULT 0.0"),
+                ("dca_margin_usd", "REAL NOT NULL DEFAULT 0.0"),
+                ("dca_status", "TEXT NOT NULL DEFAULT 'NONE'"),
+                ("in_storm", "INTEGER NOT NULL DEFAULT 0"),
+                ("tp_pct", "REAL NOT NULL DEFAULT 1.5"),
+            ]
+            for col_name, col_def in migrations:
+                if col_name not in existing_cols:
+                    conn.execute(f"ALTER TABLE positions ADD COLUMN {col_name} {col_def}")
+            # Backfill reserved_margin_usd for legacy active rows
+            conn.execute(
+                "UPDATE positions SET reserved_margin_usd = margin_usd WHERE reserved_margin_usd <= 0 AND margin_usd > 0"
+            )
 
-    # --- KV state (pause, cooldowns, last processed bar) ---
+    # --- KV state (pause, cooldowns, AC 6h, Coin Probation, last processed bar) ---
     def get_kv(self, key: str, default: Optional[str] = None) -> Optional[str]:
         with self._lock, self._connect() as conn:
             row = conn.execute("SELECT v FROM kv_state WHERE k = ?", (key,)).fetchone()
@@ -88,19 +115,89 @@ class VikaJournal:
     def set_paused(self, paused: bool) -> None:
         self.set_kv("paused", "1" if paused else "0")
 
-    def get_cooldown_until_ms(self, symbol: str) -> int:
+    def get_cooldown_until_ms(self, symbol: str, side: Optional[str] = None) -> int:
+        if side:
+            v = self.get_kv(f"cd_{symbol}_{side.upper()}", "")
+            if v:
+                return int(v)
         v = self.get_kv(f"cd_{symbol}", "0")
         return int(v or "0")
 
-    def set_cooldown_until_ms(self, symbol: str, ts_ms: int) -> None:
-        self.set_kv(f"cd_{symbol}", str(int(ts_ms)))
+    def set_cooldown_until_ms(self, symbol: str, ts_ms: int, side: Optional[str] = None) -> None:
+        if side:
+            self.set_kv(f"cd_{symbol}_{side.upper()}", str(int(ts_ms)))
+        else:
+            self.set_kv(f"cd_{symbol}", str(int(ts_ms)))
 
-    def get_last_signal_bar_ts(self, symbol: str) -> int:
+    def get_last_signal_bar_ts(self, symbol: str, side: Optional[str] = None) -> int:
+        if side:
+            v = self.get_kv(f"sigbar_{symbol}_{side.upper()}", "0")
+            return int(v or "0")
         v = self.get_kv(f"sigbar_{symbol}", "0")
         return int(v or "0")
 
-    def set_last_signal_bar_ts(self, symbol: str, bar_ts: int) -> None:
-        self.set_kv(f"sigbar_{symbol}", str(int(bar_ts)))
+    def set_last_signal_bar_ts(self, symbol: str, bar_ts: int, side: Optional[str] = None) -> None:
+        if side:
+            self.set_kv(f"sigbar_{symbol}_{side.upper()}", str(int(bar_ts)))
+        else:
+            self.set_kv(f"sigbar_{symbol}", str(int(bar_ts)))
+
+    # --- Anti-Cascade 6h Pause (Hard SL ONLY, separated by LONG / SHORT) ---
+    def get_ac_pause_until_ms(self, side: str) -> int:
+        v = self.get_kv(f"ac_pause_{side.upper()}", "0")
+        return int(v or "0")
+
+    def set_ac_pause_until_ms(self, side: str, ts_ms: int) -> None:
+        cur = self.get_ac_pause_until_ms(side)
+        self.set_kv(f"ac_pause_{side.upper()}", str(max(cur, int(ts_ms))))
+
+    # --- Coin Probation (2 Hard SLs within 10d -> 5d quarantine; Hard SL ONLY) ---
+    def get_coin_probation_until_ms(self, symbol: str) -> int:
+        v = self.get_kv(f"prob_until_{symbol}", "0")
+        return int(v or "0")
+
+    def record_coin_hard_sl(
+        self,
+        symbol: str,
+        now_ms: int,
+        *,
+        window_days: int = 10,
+        threshold: int = 2,
+        pause_days: int = 5,
+    ) -> Tuple[bool, int, int]:
+        """
+        Record a Hard SL for `symbol`. Returns (triggered_probation, sl_count_in_window, pause_until_ms).
+        NEVER called on BE exits!
+        """
+        window_ms = int(window_days * 86_400_000)
+        raw = self.get_kv(f"sl_hist_{symbol}", "[]") or "[]"
+        try:
+            hist = [int(x) for x in json.loads(raw) if (now_ms - int(x)) <= window_ms]
+        except Exception:
+            hist = []
+        hist.append(int(now_ms))
+        if len(hist) >= threshold:
+            until_ms = max(self.get_coin_probation_until_ms(symbol), int(now_ms + pause_days * 86_400_000))
+            self.set_kv(f"prob_until_{symbol}", str(until_ms))
+            self.set_kv(f"sl_hist_{symbol}", "[]")
+            return True, len(hist), until_ms
+        self.set_kv(f"sl_hist_{symbol}", json.dumps(hist))
+        return False, len(hist), 0
+
+    def get_all_active_probations(self, now_ms: Optional[int] = None) -> List[Tuple[str, int]]:
+        cur = int(now_ms if now_ms is not None else time.time() * 1000)
+        out: List[Tuple[str, int]] = []
+        with self._lock, self._connect() as conn:
+            rows = conn.execute("SELECT k, v FROM kv_state WHERE k LIKE 'prob_until_%'").fetchall()
+            for r in rows:
+                try:
+                    until_ms = int(r["v"])
+                    if until_ms > cur:
+                        out.append((r["k"].replace("prob_until_", "", 1), until_ms))
+                except Exception:
+                    continue
+        out.sort(key=lambda x: x[1])
+        return out
 
     # --- Daily UTC Risk State (-6.0%) ---
     @staticmethod
@@ -152,23 +249,35 @@ class VikaJournal:
         entry_bar_ts: int,
         expire_ts: int,
         filters: Dict[str, Any],
+        reserved_margin_usd: Optional[float] = None,
+        dca_order_id: str = "",
+        dca_price: float = 0.0,
+        dca_qty: float = 0.0,
+        dca_margin_usd: float = 0.0,
+        dca_status: str = "NONE",
+        in_storm: bool = False,
+        tp_pct: float = 1.5,
     ) -> int:
         now_ms = int(time.time() * 1000)
+        res_m = float(reserved_margin_usd if reserved_margin_usd is not None else margin_usd)
         with self._lock, self._connect() as conn:
             cur = conn.execute(
                 """
                 INSERT INTO positions (
                     symbol, side, key_name, status, order_id,
-                    entry_price, qty, margin_usd, leverage,
+                    entry_price, qty, margin_usd, reserved_margin_usd, leverage,
                     tp_price, sl_price, be_trigger_price, be_lock_price, be_active,
-                    entry_bar_ts, expire_ts, opened_at, filters_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)
+                    entry_bar_ts, expire_ts, opened_at, filters_json,
+                    dca_order_id, dca_price, dca_qty, dca_margin_usd, dca_status, in_storm, tp_pct
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     symbol, side, key_name, status, order_id,
-                    float(entry_price), float(qty), float(margin_usd), int(leverage),
+                    float(entry_price), float(qty), float(margin_usd), res_m, int(leverage),
                     float(tp_price), float(sl_price), float(be_trigger_price), float(be_lock_price),
                     int(entry_bar_ts), int(expire_ts), now_ms, json.dumps(filters, ensure_ascii=False),
+                    str(dca_order_id), float(dca_price), float(dca_qty), float(dca_margin_usd),
+                    str(dca_status), 1 if in_storm else 0, float(tp_pct),
                 ),
             )
             return int(cur.lastrowid)
@@ -213,18 +322,75 @@ class VikaJournal:
                     (float(fill_price), float(fill_qty), float(margin_usd), int(pos_id)),
                 )
 
-    def mark_be_active(self, pos_id: int, new_sl: float) -> None:
+    def update_dca_filled(
+        self,
+        pos_id: int,
+        *,
+        new_entry_price: float,
+        new_qty: float,
+        new_margin_usd: float,
+        new_tp_price: float,
+        new_be_trigger_price: float,
+        new_be_lock_price: float,
+    ) -> None:
         with self._lock, self._connect() as conn:
             conn.execute(
-                "UPDATE positions SET be_active = 1, sl_price = ? WHERE id = ?",
-                (float(new_sl), int(pos_id)),
+                """
+                UPDATE positions
+                SET entry_price = ?, qty = ?, margin_usd = ?, reserved_margin_usd = ?,
+                    tp_price = ?, be_trigger_price = ?, be_lock_price = ?,
+                    dca_order_id = '', dca_status = 'FILLED'
+                WHERE id = ?
+                """,
+                (
+                    float(new_entry_price), float(new_qty), float(new_margin_usd), float(new_margin_usd),
+                    float(new_tp_price), float(new_be_trigger_price), float(new_be_lock_price),
+                    int(pos_id),
+                ),
             )
+
+    def mark_dca_cancelled(self, pos_id: int, status: str, new_reserved_margin_usd: float) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE positions SET dca_order_id = '', dca_status = ?, reserved_margin_usd = ? WHERE id = ?",
+                (str(status), float(new_reserved_margin_usd), int(pos_id)),
+            )
+
+    def mark_be_active(
+        self,
+        pos_id: int,
+        new_sl: float,
+        *,
+        cancel_dca: bool = False,
+        new_reserved_margin_usd: Optional[float] = None,
+    ) -> None:
+        with self._lock, self._connect() as conn:
+            if cancel_dca:
+                if new_reserved_margin_usd is not None:
+                    conn.execute(
+                        """
+                        UPDATE positions
+                        SET be_active = 1, sl_price = ?, dca_order_id = '', dca_status = 'CANCELLED_BE', reserved_margin_usd = ?
+                        WHERE id = ?
+                        """,
+                        (float(new_sl), float(new_reserved_margin_usd), int(pos_id)),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE positions SET be_active = 1, sl_price = ?, dca_order_id = '', dca_status = 'CANCELLED_BE' WHERE id = ?",
+                        (float(new_sl), int(pos_id)),
+                    )
+            else:
+                conn.execute(
+                    "UPDATE positions SET be_active = 1, sl_price = ? WHERE id = ?",
+                    (float(new_sl), int(pos_id)),
+                )
 
     def mark_cancelled(self, pos_id: int, reason: str = "TTL_EXPIRED") -> None:
         now_ms = int(time.time() * 1000)
         with self._lock, self._connect() as conn:
             conn.execute(
-                "UPDATE positions SET status = 'CANCELLED', closed_at = ?, exit_reason = ? WHERE id = ?",
+                "UPDATE positions SET status = 'CANCELLED', closed_at = ?, exit_reason = ?, dca_order_id = '' WHERE id = ?",
                 (now_ms, reason, int(pos_id)),
             )
 
@@ -236,7 +402,7 @@ class VikaJournal:
             conn.execute(
                 """
                 UPDATE positions
-                SET status = 'CLOSED', closed_at = ?, exit_price = ?, exit_reason = ?, pnl_usd = ?, pnl_pct = ?
+                SET status = 'CLOSED', closed_at = ?, exit_price = ?, exit_reason = ?, pnl_usd = ?, pnl_pct = ?, dca_order_id = ''
                 WHERE id = ?
                 """,
                 (now_ms, float(exit_price), exit_reason, float(pnl_usd), float(pnl_pct), int(pos_id)),
@@ -256,10 +422,13 @@ class VikaJournal:
             n = len(rows)
             pnl = sum(float(r["pnl_usd"] or 0.0) for r in rows)
             wins = sum(1 for r in rows if float(r["pnl_usd"] or 0.0) > 0)
-            sl_n = sum(1 for r in rows if r["exit_reason"] == "SL")
+            sl_n = sum(1 for r in rows if r["exit_reason"] in ("SL", "HARD_SL"))
+            be_n = sum(1 for r in rows if r["exit_reason"] == "BE")
             return {
                 "trades": n,
+                "total": n,
                 "pnl_usd": round(pnl, 2),
                 "wr": round(wins / n * 100.0, 1) if n else 0.0,
                 "sl": sl_n,
+                "be": be_n,
             }

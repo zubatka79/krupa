@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "updated_at_utc": "2026-11-28T02:45:00Z",
+  "source": "Official Federal Reserve (federalreserve.gov) & US BLS (bls.gov) schedules",
+  "blackout_window": {
+    "pre_minutes": 60,
+    "post_minutes": 45
+  },
+  "events": [
+    {
+      "type": "NFP",
+      "title": "US Non-Farm Payrolls (Nov 2026 data)",
+      "utc": "2026-12-04T13:30:00Z"
+    },
+    {
+      "type": "FOMC",
+      "title": "FOMC Rate Decision & Statement",
+      "utc": "2026-12-09T19:00:00Z"
+    },
+    {
+      "type": "CPI",
+      "title": "US Consumer Price Index (Nov 2026 data)",
+      "utc": "2026-12-10T13:30:00Z"
+    },
+    {
+      "type": "NFP",
+      "title": "US Non-Farm Payrolls (Dec 2026 data)",
+      "utc": "2027-01-08T13:30:00Z"
+    },
+    {
+      "type": "CPI",
+      "title": "US Consumer Price Index (Dec 2026 data)",
+      "utc": "2027-01-13T13:30:00Z"
+    },
+    {
+      "type": "FOMC",
+      "title": "FOMC Rate Decision & Statement",
+      "utc": "2027-01-27T19:00:00Z"
+    }
+  ]
+}

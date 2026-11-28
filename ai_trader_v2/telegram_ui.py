@@ -1,24 +1,22 @@
 """
-Telegram Bot Interface strictly designed for Vika N2N7 (dynamic N-coin portfolio, Variant B).
-Zero legacy menus, zero hardcoded coin counts, zero deprecated filters.
+Telegram Control & Live Monitoring Interface rebuilt exclusively for L2_news
+(15x Isolated, 5x12%, Cap $5,000 / $2,500 storm, All-Thick-18: 18L + 18S,
+2-Step DCA 35/65, BE +0.30% with DCA cancel, Hard-SL-only AC 6h & Probation,
+Retail L/S |z| < 1.0, US Macro Blackout [T-60m..T+45m]).
 
 ReplyKeyboard Buttons:
-  1. 📊 Статус и Баланс
-  2. 📈 Открытые позиции
-  3. 🪙 Портфель (18 монет)  [dynamic from config]
-  4. 📜 История сделок
-  5. ⏸ Пауза / ▶️ Старт
-  6. 🛑 Закрыть всё (Panic Close)  [with inline confirmation]
+  1. 📊 Статус L2_news          | 📈 Позиции и DCA
+  2. 🌐 Макро и Паузы            | 🪙 Портфель (18L+18S)
+  3. 📜 История сделок           | ⏸ Пауза / ▶️ Старт
+  4. 🛑 Panic Close (inline confirmation)
 """
 
 from __future__ import annotations
 
-import json
 import logging
 import os
 import threading
 import time
-from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 
@@ -26,23 +24,44 @@ import requests
 
 from ai_trader_v2.executor import VikaExecutor
 from ai_trader_v2.journal import VikaJournal
+from ai_trader_v2.l2_market_data import BtcL2Regime
+from ai_trader_v2.macro_calendar import MacroCalendarStatus
 from ai_trader_v2.vika_engine import CoinEvaluation, KEY_SHORT_NAMES
+from ai_trader_v2_long.long_engine import LONG_KEY_SHORT_NAMES, LongCoinEvaluation
 
 logger = logging.getLogger("vika.telegram")
 
-BTN_STATUS = "📊 Статус и Баланс"
-BTN_POSITIONS = "📈 Открытые позиции"
+BTN_STATUS = "📊 Статус L2_news"
+BTN_POSITIONS = "📈 Позиции и DCA"
+BTN_MACRO = "🌐 Макро и Паузы"
 BTN_PORTFOLIO_PREFIX = "🪙 Портфель"
 BTN_HISTORY = "📜 История сделок"
 BTN_TOGGLE_PAUSE = "⏸ Пауза / ▶️ Старт"
-BTN_PANIC = "🛑 Закрыть всё (Panic Close)"
+BTN_PANIC = "🛑 Panic Close"
 
-DIR_LABELS: Dict[str, str] = {
-    "only_short": "🔴 ONLY SHORT",
-    "only_long": "🟢 ONLY LONG",
-    "long_short": "🟢🔴 LONG + SHORT",
-    "paused": "⏸ PAUSED",
-}
+
+def _fmt_until(ts_ms: int, now_ms: int) -> str:
+    if ts_ms <= now_ms:
+        return "🟢 нет"
+    rem_min = max(1, int((ts_ms - now_ms) // 60_000))
+    hrs, mins = divmod(rem_min, 60)
+    dt_s = datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%d.%m %H:%M UTC")
+    return f"🧊 до {dt_s} ({hrs}ч {mins:02d}м)"
+
+
+def _dca_status_badge(pos: Dict[str, Any]) -> str:
+    st = str(pos.get("dca_status") or "NONE")
+    px = float(pos.get("dca_price") or 0.0)
+    qty = float(pos.get("dca_qty") or 0.0)
+    if st == "PENDING":
+        return f"⏳ 2-я нога Limit @ <code>{px}</code> (qty <code>{qty}</code>)"
+    if st == "FILLED":
+        return "✅ 2-я нога DCA залита (полный слот)"
+    if st == "CANCELLED_BE":
+        return "🧹 2-я нога снята при BE +0.30%"
+    if st.startswith("CANCELLED"):
+        return f"⚪ 2-я нога отменена ({st})"
+    return "⚪ без DCA"
 
 
 class VikaTelegramUI:
@@ -52,29 +71,42 @@ class VikaTelegramUI:
         executor: VikaExecutor,
         journal: VikaJournal,
         get_latest_evals: Callable[[], Dict[str, CoinEvaluation]],
+        get_latest_long_evals: Optional[Callable[[], Dict[str, LongCoinEvaluation]]] = None,
+        get_btc_regime: Optional[Callable[[], Optional[BtcL2Regime]]] = None,
+        get_macro_status: Optional[Callable[[], MacroCalendarStatus]] = None,
     ) -> None:
         self.cfg = cfg
         self.executor = executor
         self.journal = journal
         self.get_latest_evals = get_latest_evals
-        self.n_coins = len(cfg.get("coins", []))
-        self.btn_portfolio = f"{BTN_PORTFOLIO_PREFIX} ({self.n_coins} монет)"
+        self.get_latest_long_evals = get_latest_long_evals or (lambda: {})
+        self.get_btc_regime = get_btc_regime or (lambda: executor.last_btc_regime)
+        self.get_macro_status = get_macro_status or (
+            lambda: executor.macro_guard.evaluate() if executor.macro_guard else None
+        )
+
+        self.n_long = len(cfg.get("long_coins", []))
+        self.n_short = len(cfg.get("short_coins", cfg.get("coins", [])))
+        self.btn_portfolio = f"{BTN_PORTFOLIO_PREFIX} ({self.n_long}L+{self.n_short}S)"
+
         self.main_keyboard: Dict[str, Any] = {
             "keyboard": [
                 [{"text": BTN_STATUS}, {"text": BTN_POSITIONS}],
-                [{"text": self.btn_portfolio}, {"text": BTN_HISTORY}],
-                [{"text": BTN_TOGGLE_PAUSE}, {"text": BTN_PANIC}],
+                [{"text": BTN_MACRO}, {"text": self.btn_portfolio}],
+                [{"text": BTN_HISTORY}, {"text": BTN_TOGGLE_PAUSE}],
+                [{"text": BTN_PANIC}],
             ],
             "resize_keyboard": True,
             "is_persistent": True,
         }
         self.bot_commands: List[Dict[str, str]] = [
-            {"command": "status", "description": f"Vika N2N7 ({self.n_coins} монет) — статус, баланс и лимиты"},
-            {"command": "positions", "description": "Открытые позиции, TP/SL и статус BE"},
-            {"command": "portfolio", "description": f"Портфель {self.n_coins} монет и фильтры (4H/N2/N7/T4/K7)"},
-            {"command": "history", "description": "Последние 10 закрытых сделок"},
+            {"command": "status", "description": "L2_news — баланс, 15x, 5×12%, резерв <=85%, BTC и макро"},
+            {"command": "positions", "description": "Открытые позиции, статус 2-й ноги DCA и BE +0.30%"},
+            {"command": "macro", "description": "Макроокно FOMC/CPI/NFP, паузы AC 6ч и Probation"},
+            {"command": "portfolio", "description": f"Пул All-Thick-18 ({self.n_long}L+{self.n_short}S) и Retail L/S"},
+            {"command": "history", "description": "Последние 10 сделок (TP / BE+0.30% / Hard SL)"},
             {"command": "pause", "description": "Пауза / Возобновление торговли"},
-            {"command": "panic", "description": "Panic Close — закрыть всё по рынку"},
+            {"command": "panic", "description": "Panic Close — закрыть всё и отменить DCA/TP"},
         ]
 
         self.token = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
@@ -94,19 +126,6 @@ class VikaTelegramUI:
         self._thread: Optional[threading.Thread] = None
         self._offset = 0
 
-    def _dir_label(self) -> str:
-        raw = getattr(self.executor, "allowed_directions", str(self.cfg.get("allowed_directions", "long_short"))).lower()
-        return DIR_LABELS.get(raw, "🟢🔴 LONG + SHORT")
-
-    def _keys_summary(self) -> str:
-        cnt = Counter(c["key"].split("_")[0] for c in self.cfg.get("coins", []))
-        order = ["K1", "K7", "K6", "K8", "K3"]
-        parts = [f"{k}:{cnt[k]}" for k in order if cnt.get(k)]
-        for k, v in sorted(cnt.items()):
-            if k not in order:
-                parts.append(f"{k}:{v}")
-        return " ".join(parts)
-
     def is_authorized(self, chat: Dict[str, Any], user: Dict[str, Any]) -> bool:
         cid = str(chat.get("id", ""))
         uid = str(user.get("id", ""))
@@ -117,7 +136,6 @@ class VikaTelegramUI:
         return False
 
     def register_commands(self) -> bool:
-        """Overwrite Telegram bot slash-command menu via setMyCommands strictly for Vika N2N7."""
         if not self.enabled:
             return False
         try:
@@ -130,8 +148,6 @@ class VikaTelegramUI:
             ok = bool(data.get("ok"))
             if not ok:
                 logger.warning("Telegram setMyCommands failed: %s", data)
-            else:
-                logger.info("Telegram setMyCommands updated for Vika N2N7 (%d coins): %d commands", self.n_coins, len(self.bot_commands))
             return ok
         except Exception as exc:
             logger.warning("Telegram setMyCommands exception: %s", exc)
@@ -152,7 +168,7 @@ class VikaTelegramUI:
             return False
         payload: Dict[str, Any] = {
             "chat_id": target_chat,
-            "text": text,
+            "text": text[:4090],
             "parse_mode": parse_mode,
             "disable_web_page_preview": True,
             "reply_markup": reply_markup if reply_markup is not None else self.main_keyboard,
@@ -181,7 +197,7 @@ class VikaTelegramUI:
             pass
 
     # ------------------------------------------------------------------
-    # View Formatters
+    # L2_news View Formatters
     # ------------------------------------------------------------------
     def format_status(self) -> str:
         try:
@@ -190,168 +206,219 @@ class VikaTelegramUI:
             logger.warning("format_status balance refresh fallback: %s", exc)
             eq = self.executor.last_equity
             ds = self.journal.ensure_daily_state(eq)
-            start_eq = ds["start_equity"]
-            pnl = eq - start_eq
+            pnl = eq - ds["start_equity"]
             ds["current_equity"] = eq
             ds["daily_pnl_usd"] = round(pnl, 2)
-            ds["daily_pnl_pct"] = round((pnl / start_eq * 100.0) if start_eq > 0 else 0.0, 2)
-        stats = self.journal.get_total_realized_stats()
-        active = self.journal.get_active_positions()
-        paused = self.journal.is_paused()
-        mode_str = self.executor.mode.upper()
-        run_state = "⏸ Пауза" if paused else "▶️ Активен"
-        daily_state = "🚨 СТОП -6% (до 00:00 UTC)" if ds["halted"] else "✅ В норме"
+            ds["daily_pnl_pct"] = round((pnl / ds["start_equity"] * 100.0) if ds["start_equity"] > 0 else 0.0, 2)
 
-        exec_mode_str = (
-            "Market IOC + Limit Maker TP (0.02%) + Market SL/BE"
-            if getattr(self.executor, "entry_order_type", "Market") == "Market"
-            else f"Limit вход (TTL {self.executor.ttl_sec // 60}m) + Market SL/BE"
-        )
-        dir_str = self._dir_label()
-        k7_tag = " | <code>K7 color</code>" if self.cfg.get("filters", {}).get("k7_require_candle_dir", True) else ""
+        now_ms = int(time.time() * 1000)
+        stats = self.journal.get_total_realized_stats()
+        snap = self.executor.get_margin_reserve_snapshot()
+        paused = self.journal.is_paused()
+        btc = self.get_btc_regime()
+        macro_st = self.get_macro_status()
+
+        run_state = "⏸ ПАУЗА" if paused else ("🚨 СТОП -6% UTC" if ds["halted"] else "▶️ В РАБОТЕ")
+        btc_line = btc.mode_label if btc else "⏳ BTC 4H+1D сканируется..."
+        macro_line = macro_st.short_label if macro_st else "⚪ календарь не подключён"
+
+        ac_l = _fmt_until(self.journal.get_ac_pause_until_ms("LONG"), now_ms)
+        ac_s = _fmt_until(self.journal.get_ac_pause_until_ms("SHORT"), now_ms)
+        probs = self.journal.get_all_active_probations(now_ms)
+        prob_txt = ", ".join(s.replace("USDT", "") for s, _ in probs) if probs else "нет"
+
+        cap_tag = f"${snap['effective_cap_usd']:,.0f}" + (" ⚡ШТОРМ" if snap["in_storm"] else " (шторм $2,500)")
+        res_icon = "🔴" if snap["reserve_pct"] >= 78.0 else ("🟡" if snap["reserve_pct"] >= 60.0 else "🟢")
+
         lines = [
-            f"📊 <b>СТАТУС И БАЛАНС | Vika N2N7 ({self.n_coins} монет)</b>",
-            f"Режим биржи: <code>Bybit {mode_str} | 10x Cross</code>",
-            f"Направление: <b>{dir_str}</b> | Статус: <b>{run_state}</b>",
-            f"",
-            f"💰 Текущий депозит: <b>${ds['current_equity']:,.2f}</b> (свободно <code>${self.executor.last_available:,.2f}</code>)",
-            f"📅 PnL за день (UTC): <b>{ds['daily_pnl_usd']:+,.2f} USDT ({ds['daily_pnl_pct']:+.2f}%)</b>",
-            f"🏆 PnL всего (закрытых): <b>{stats['pnl_usd']:+,.2f} USDT</b> (сделок: {stats['trades']}, WR: {stats['wr']:.1f}%, SL: {stats['sl']})",
-            f"",
-            f"🧩 Слоты: <b>{len(active)}/{self.executor.max_open}</b> (10% × 10x, макс. 80% маржи | R3: макс. {self.executor.max_same_key}/ключ)",
-            f"🪙 Монеты ({self.n_coins}): <code>{self._keys_summary()}</code>",
-            f"⚡ Ордера: <code>{exec_mode_str}</code>",
-            f"🛡 Дневной лимит -6%: <b>{daily_state}</b>",
-            f"🔎 Фильтры: <code>4H STRONG Div</code> | <code>N2</code> | <code>N7 FR&lt;1.5bps</code> | <code>T4 4H Slope&gt;0.15%</code>{k7_tag}",
+            f"📊 <b>СТАТУС L2_news | Bybit {self.executor.mode.upper()}</b>",
+            f"Состояние: <b>{run_state}</b> | Плечо: <code>{self.executor.leverage}x {self.executor.margin_mode}</code>",
+            f"Режим BTC: {btc_line}",
+            f"Макроокно [-60m..+45m]: {macro_line}",
+            "",
+            f"💰 Баланс: <b>${ds['current_equity']:,.2f}</b> (uPnL: <code>{snap['unr_open']:+,.2f}$</code>)",
+            f"📅 День (UTC): <b>{ds['daily_pnl_usd']:+,.2f}$ ({ds['daily_pnl_pct']:+.2f}%)</b> | Лимит: <code>-{self.executor.daily_loss_limit_pct:.0f}%</code>",
+            f"🏆 Итого: <b>{stats['pnl_usd']:+,.2f}$</b> | Сделок: <code>{stats['trades']}</code> (WR <code>{stats['wr']:.1f}%</code> | HardSL <code>{stats['sl']}</code> | BE <code>{stats['be']}</code>)",
+            "",
+            f"🧩 Слоты <b>5×12%</b>: 🟢L <b>{snap['open_long']}/{self.executor.max_same_dir}</b> | 🔴S <b>{snap['open_short']}/{self.executor.max_same_dir}</b> | Всего <b>{snap['open_total']}/{self.executor.max_open}</b>",
+            f"🛡 AntiSalvo: <code>≤{self.executor.max_entries_per_bar_l}L / ≤{self.executor.max_entries_per_bar_s}S за бар, ≤{self.executor.max_same_key}/ключ</code>",
+            f"💼 Кап слота: <code>{cap_tag}</code> | {res_icon} Резерв Bybit: <b>{snap['reserve_pct']:.1f}% / {snap['limit_pct']:.0f}%</b> (<code>${snap['reserved_usd']:,.1f}</code>)",
+            f"🪜 DCA (35/65): <code>{snap['dca_pending']}</code> в стакане | <code>{snap['dca_filled']}</code> залито | BE <code>+1.0% → +0.30%</code> + отмена DCA",
+            "",
+            f"🧊 Паузы (только Hard SL):",
+            f"  • AC {self.executor.ac_pause_hours}ч LONG: {ac_l}",
+            f"  • AC {self.executor.ac_pause_hours}ч SHORT: {ac_s}",
+            f"  • Probation (5д): <code>{prob_txt}</code>",
         ]
         if self.executor.stale_warnings:
-            lines.append("")
-            lines.append("⚠️ <b>Обнаружены внешние позиции/ордера:</b>")
-            for w in self.executor.stale_warnings[:5]:
+            lines.append("\n⚠️ <b>Внешние позиции/ордера на бирже:</b>")
+            for w in self.executor.stale_warnings[:4]:
                 lines.append(f"  • <code>{w}</code>")
         return "\n".join(lines)
 
     def format_open_positions(self) -> str:
         active = self.journal.get_active_positions()
+        snap = self.executor.get_margin_reserve_snapshot()
+        header = (
+            f"📈 <b>ПОЗИЦИИ И DCA | L2_news</b>\n"
+            f"🟢 LONG: <b>{snap['open_long']}/{self.executor.max_same_dir}</b> | 🔴 SHORT: <b>{snap['open_short']}/{self.executor.max_same_dir}</b> | "
+            f"Резерв: <b>{snap['reserve_pct']:.1f}% / {snap['limit_pct']:.0f}%</b>"
+        )
         if not active:
-            return "📈 <b>ОТКРЫТЫЕ ПОЗИЦИИ (0/8) | Vika N2N7</b>\nСейчас активных сделок нет."
+            return header + "\n\nСейчас открытых позиций нет."
 
         ex_map = self.executor.last_exchange_positions
-        lines = [f"📈 <b>ОТКРЫТЫЕ ПОЗИЦИИ ({len(active)}/{self.executor.max_open}) | Vika N2N7</b>"]
+        lines = [header]
         for p in active:
             sym = p["symbol"]
             badge = "🟢 LONG" if p["side"] == "LONG" else "🔴 SHORT"
-            k_short = KEY_SHORT_NAMES.get(p["key_name"], p["key_name"])
-            be_txt = "✅ BE активен" if p["be_active"] else f"⏳ BE при {p['be_trigger_price']}"
-            st_txt = "⏳ Лимитный ордер" if p["status"] == "PENDING" else "⚡ В позиции"
+            k_short = KEY_SHORT_NAMES.get(p["key_name"], LONG_KEY_SHORT_NAMES.get(p["key_name"], p["key_name"]))
+            be_txt = "🛡 <b>BE +0.30% активен</b>" if p["be_active"] else f"⏳ BE при <code>{p['be_trigger_price']}</code>"
+            storm_tag = " ⚡ШТОРМ" if p.get("in_storm") else ""
 
             upnl_txt = "—"
             if sym in ex_map:
-                ep_ex = ex_map[sym]
-                upnl = float(ep_ex.get("unrealisedPnl") or 0.0)
+                upnl = float(ex_map[sym].get("unrealisedPnl") or 0.0)
                 margin = max(float(p["margin_usd"]), 1.0)
-                upnl_pct = upnl / margin * 100.0
-                upnl_txt = f"<b>{upnl:+,.2f}$ ({upnl_pct:+.2f}%)</b>"
+                upnl_txt = f"<b>{upnl:+,.2f}$ ({upnl / margin * 100.0:+.1f}%)</b>"
 
+            res_m = float(p.get("reserved_margin_usd") or p["margin_usd"])
             lines.append(
-                f"\n<b>{sym}</b> {badge} | {st_txt}\n"
-                f"  Ключ: <code>{k_short}</code>\n"
-                f"  Вход: <code>{p['entry_price']}</code> | PnL: {upnl_txt}\n"
-                f"  TP: <code>{p['tp_price']}</code> | SL: <code>{p['sl_price']}</code> | {be_txt}"
+                f"\n<b>{sym}</b> {badge} <code>{p['leverage']}x</code>{storm_tag} | <code>{k_short}</code>\n"
+                f"  Средняя: <code>{p['entry_price']}</code> | PnL: {upnl_txt}\n"
+                f"  TP: <code>{p['tp_price']}</code> | SL: <code>{p['sl_price']}</code> | {be_txt}\n"
+                f"  {_dca_status_badge(p)}\n"
+                f"  Маржа живая/резерв: <code>${float(p['margin_usd']):,.1f} / ${res_m:,.1f}</code>"
             )
         return "\n".join(lines)
 
-    def format_portfolio(self) -> str:
-        evals = self.get_latest_evals()
-        n_coins = self.n_coins
-        allowed = getattr(self.executor, "allowed_directions", "long_short")
-        lines = [f"🪙 <b>ПОРТФЕЛЬ Vika N2N7 — {n_coins} МОНЕТ ({self._dir_label()})</b>"]
-        for idx, c in enumerate(self.cfg["coins"], 1):
-            sym = c["symbol"]
-            k_short = c["key"].split("_")[0]
-            tp_sl = f"{c['tp_pct']}/{c['sl_pct']}%"
-            ev = evals.get(sym)
-            if ev is None:
-                lines.append(f"{idx}. <b>{sym}</b> | <code>{k_short}</code> ({tp_sl}) | загрузка...")
+    def format_macro_and_pauses(self) -> str:
+        now_ms = int(time.time() * 1000)
+        macro_st = self.get_macro_status()
+        lines = ["🌐 <b>МАКРОКАЛЕНДАРЬ И ПАУЗЫ | L2_news</b>"]
+        if macro_st is None:
+            lines.append("Календарь: <code>отключён</code>")
+        else:
+            lines.append(f"Статус окна <code>[-{macro_st.pre_minutes}m .. +{macro_st.post_minutes}m]</code>: {macro_st.short_label}")
+            hz_warn = " ⚠️ <b>&lt; 3 дн. — обнови!</b>" if macro_st.horizon_warning else " ✅"
+            lines.append(f"Горизонт календаря: <code>{macro_st.horizon_days:.1f} дн.</code>{hz_warn}")
+            if macro_st.upcoming_events:
+                lines.append("\n📅 <b>Ближайшие FOMC / CPI / NFP (UTC):</b>")
+                for ev in macro_st.upcoming_events[:6]:
+                    dt_s = ev.dt_utc.strftime("%Y-%m-%d %H:%M UTC")
+                    lines.append(f"  • <b>{ev.event_type:<4}</b> <code>{dt_s}</code> — {ev.title}")
             else:
-                d4 = "🟢" if (not ev.div4h_bear_strong and not ev.div4h_bull_strong) else ("🔴L" if ev.div4h_bear_strong else "🔴S")
-                n2 = "🟢" if not ev.n2_blocked else "🔴"
-                n7 = "🟢" if (not ev.n7_blocked_long and not ev.n7_blocked_short) else ("🔴L" if ev.n7_blocked_long else "🔴S")
-                if not ev.t4_blocked_short:
-                    t4 = "🟢S" if allowed in ("long_short", "only_short") else "⚪S"
-                elif not ev.t4_blocked_long:
-                    t4 = "🟢L" if allowed in ("long_short", "only_long") else "⚪L"
+                lines.append("\n⚠️ Будущих событий в <code>config/macro_events_utc.json</code> нет!")
+
+        ac_l = _fmt_until(self.journal.get_ac_pause_until_ms("LONG"), now_ms)
+        ac_s = _fmt_until(self.journal.get_ac_pause_until_ms("SHORT"), now_ms)
+        probs = self.journal.get_all_active_probations(now_ms)
+        lines.append(f"\n🧊 <b>AC {self.executor.ac_pause_hours}ч (Anti-Cascade, только Hard SL):</b>")
+        lines.append(f"  • 🟢 LONG: {ac_l}")
+        lines.append(f"  • 🔴 SHORT: {ac_s}")
+        lines.append(f"\n⛔ <b>Coin Probation ({self.executor.probation_sl_count} Hard SL / {self.executor.probation_window_days}д → {self.executor.probation_pause_days}д):</b>")
+        if probs:
+            for sym, until_ms in probs:
+                lines.append(f"  • <b>{sym}</b>: {_fmt_until(until_ms, now_ms)}")
+        else:
+            lines.append("  • Активных карантинов нет 🟢")
+        return "\n".join(lines)
+
+    def format_portfolio(self) -> str:
+        l_evals = self.get_latest_long_evals()
+        s_evals = self.get_latest_evals()
+        btc = self.get_btc_regime()
+        lines = [f"🪙 <b>ПОРТФЕЛЬ All-Thick-18 ({self.n_long}L + {self.n_short}S)</b>"]
+        if btc:
+            lines.append(btc.mode_label)
+        lines.append("<i>Фильтр Retail L/S: |z| &lt; 1.0 (1h, Bybit V5)</i>")
+
+        if self.n_long > 0:
+            lines.append(f"\n🟢 <b>LONG ({self.n_long}):</b>")
+            for c in self.cfg.get("long_coins", []):
+                sym = c["symbol"]
+                ks = c["key"].split("_")[0]
+                ev = l_evals.get(sym)
+                if ev is None:
+                    lines.append(f"• <code>{sym[:-4]:<9}</code> {ks} | ⏳")
                 else:
-                    t4 = "🔴"
-                lines.append(
-                    f"{idx}. <b>{sym}</b> | <code>{k_short}</code> ({tp_sl}) | "
-                    f"4H:{d4} N2:{n2} FR:{n7} T4:{t4}(<code>{ev.slope4h_pct:+.2f}%</code>)"
-                )
-        lines.append("\n<i>Легенда: 🟢 свободно | ⚪ выкл. направлением | 🔴 блок | T4: наклон 4H EMA50 &gt;0.15%</i>")
+                    ls_s = f"z={ev.retail_ls_z:+.1f}" if ev.retail_ls_available else "z=n/a"
+                    ico = "🔴" if ev.retail_ls_blocked else ("🟢" if ev.h1_up and ev.h4_up else "⚪")
+                    lines.append(f"{ico} <code>{sym[:-4]:<9}</code> {ks:<3} | {ls_s}")
+
+        if self.n_short > 0:
+            lines.append(f"\n🔴 <b>SHORT ({self.n_short}):</b>")
+            for c in self.cfg.get("short_coins", self.cfg.get("coins", [])):
+                sym = c["symbol"]
+                ks = c["key"].split("_")[0]
+                ev = s_evals.get(sym)
+                if ev is None:
+                    lines.append(f"• <code>{sym[:-4]:<9}</code> {ks} | ⏳")
+                else:
+                    ls_s = f"z={ev.retail_ls_z:+.1f}" if ev.retail_ls_available else "z=n/a"
+                    ico = "🔴" if (ev.retail_ls_blocked or ev.n2_blocked or ev.div4h_bull_strong) else "🟢"
+                    lines.append(f"{ico} <code>{sym[:-4]:<9}</code> {ks:<3} | {ls_s} | 4H:{ev.slope4h_pct:+.1f}%")
+
         return "\n".join(lines)
 
     def format_history(self) -> str:
         closed = self.journal.get_recent_closed(limit=10)
         if not closed:
-            return "📜 <b>ИСТОРИЯ СДЕЛОК | Vika N2N7</b>\nЗакрытых сделок пока нет."
-        lines = ["📜 <b>ПОСЛЕДНИЕ 10 ЗАКРЫТЫХ СДЕЛОК | Vika N2N7</b>"]
+            return "📜 <b>ИСТОРИЯ СДЕЛОК | L2_news</b>\nЗакрытых сделок пока нет."
+        lines = ["📜 <b>ПОСЛЕДНИЕ 10 СДЕЛОК | L2_news</b>"]
         for r in closed:
             pnl = float(r.get("pnl_usd") or 0.0)
             pct = float(r.get("pnl_pct") or 0.0)
-            icon = "✅" if pnl >= 0 else "❌"
+            reason = str(r.get("exit_reason") or "CLOSED")
+            icon = "❌" if reason in ("SL", "HARD_SL") else ("🛡" if reason == "BE" else "✅")
             dt = datetime.fromtimestamp(int(r["closed_at"]) / 1000, tz=timezone.utc).strftime("%m-%d %H:%M")
             side_s = "L" if r["side"] == "LONG" else "S"
+            dca_s = "+DCA" if r.get("dca_status") == "FILLED" else ""
             lines.append(
-                f"{icon} <code>{dt}</code> <b>{r['symbol']}</b> ({side_s}) [{r['exit_reason']}] "
+                f"{icon} <code>{dt}</code> <b>{r['symbol'][:-4]}</b>({side_s}{dca_s}) [{reason}] "
                 f"<b>{pnl:+,.2f}$ ({pct:+.1f}%)</b>"
             )
         return "\n".join(lines)
 
     def format_startup_welcome(self, lev_status: Dict[str, str]) -> str:
         ds = self.executor.check_daily_stop()
-        n_coins = len(self.cfg["coins"])
+        snap = self.executor.get_margin_reserve_snapshot()
+        btc = self.get_btc_regime()
+        macro_st = self.get_macro_status()
+        n_uniq = len(lev_status)
         ok_cnt = sum(1 for v in lev_status.values() if v.startswith("OK") or v.startswith("DRY_RUN"))
-        exec_mode_str = (
-            "Market IOC + Limit Maker TP (0.02%) + Market SL/BE"
-            if getattr(self.executor, "entry_order_type", "Market") == "Market"
-            else f"Limit вход (TTL {self.executor.ttl_sec // 60}m)"
-        )
-        dir_str = self._dir_label()
-        k7_tag = " + K7 color" if self.cfg.get("filters", {}).get("k7_require_candle_dir", True) else ""
-        header = (
-            f"🤖 <b>ЗАПУСК: Vika N2N7 ({n_coins} CLEAN + R3 + T4)</b>\n"
-            f"Биржа: <code>Bybit {self.executor.mode.upper()} | 10x Cross ({ok_cnt}/{n_coins} монет)</code>\n"
-            f"Направление: <b>{dir_str}</b> | Ключи: <code>{self._keys_summary()}</code>\n"
-            f"Баланс: <b>${ds['current_equity']:,.2f}</b> | Риск: <code>10% × 10x | слоты 8/8 (R3: макс.{self.executor.max_same_key}/ключ) | стоп -6%</code>\n"
-            f"Ордера: <code>{exec_mode_str}</code>\n"
-            f"Фильтры: <code>4H Div + N2 + N7 + T4(4H slope&gt;0.15%){k7_tag}</code>\n"
-        )
-        if getattr(self.executor, "startup_cancelled_orders", None):
-            header += "\n🧹 <b>Отменены зависшие лимитные ордера при старте:</b>\n"
-            for item in self.executor.startup_cancelled_orders:
-                header += f"  • <code>{item}</code>\n"
+
+        lines = [
+            f"🤖 <b>ЗАПУСК: L2_news Hybrid (All-Thick-18)</b>",
+            f"Биржа: <code>Bybit {self.executor.mode.upper()} | {self.executor.leverage}x {self.executor.margin_mode} ({ok_cnt}/{n_uniq})</code>",
+            f"Пул: <b>{self.n_long} LONG + {self.n_short} SHORT</b> | Retail L/S: <code>|z| &lt; 1.0</code>",
+            f"Риск: <b>5×12%</b> | Кап <code>${self.executor.max_margin_usd:,.0f}</code> (шторм <code>${self.executor.storm_max_margin_usd:,.0f}</code>) | Резерв <code>≤{self.executor.max_total_margin_pct*100:.0f}%</code>",
+            f"DCA: <code>35/65 (-1.5% / SL -4% / TP +1.5%)</code> | Шторм: <code>30/70 (-2% / SL -5% / TP +1.6%)</code>",
+            f"BE: <code>+1.0% → +0.30%</code> + авто-снятие DCA | AC 6ч &amp; Probation: <code>только Hard SL</code>",
+            f"Баланс: <b>${ds['current_equity']:,.2f}</b> | Резерв: <code>{snap['reserve_pct']:.1f}%</code>",
+            f"BTC: {btc.mode_label if btc else '⏳ сканируется'}",
+            f"Макро: {macro_st.short_label if macro_st else '⚪ выкл'}",
+        ]
         if self.executor.stale_warnings:
-            header += "\n⚠️ <b>ВНИМАНИЕ — найдены старые позиции/ордера (не закрыты):</b>\n"
-            for w in self.executor.stale_warnings:
-                header += f"  • <code>{w}</code>\n"
-        return header + "\n" + self.format_portfolio()
+            lines.append("\n⚠️ <b>Внешние позиции/ордера (не закрыты):</b>")
+            for w in self.executor.stale_warnings[:4]:
+                lines.append(f"  • <code>{w}</code>")
+        return "\n".join(lines)
 
     # ------------------------------------------------------------------
-    # Polling Loop
+    # Polling Loop & Command Router
     # ------------------------------------------------------------------
     def start_polling(self) -> None:
         if not self.enabled:
             return
-        # Flush old queued updates on startup so we don't replay stale panic clicks
         try:
             r = self._poll_session.get(f"{self.api_base}/getUpdates", params={"timeout": 1, "offset": -1}, timeout=10).json()
             if r.get("ok") and r.get("result"):
                 self._offset = int(r["result"][-1]["update_id"]) + 1
         except Exception as exc:
             logger.warning("Telegram initial offset flush note: %s", exc)
-        self._thread = threading.Thread(target=self._poll_loop, name="vika-tg-poll", daemon=True)
+        self._thread = threading.Thread(target=self._poll_loop, name="l2-tg-poll", daemon=True)
         self._thread.start()
-        logger.info("Telegram polling started (chat_id=%s, allowed_users=%d)", bool(self.chat_id), len(self.allowed_users))
 
     def stop(self) -> None:
         self._stop_evt.set()
@@ -366,7 +433,6 @@ class VikaTelegramUI:
                 )
                 data = r.json()
                 if not data.get("ok"):
-                    logger.warning("Telegram getUpdates non-ok: %s", data.get("description") or data)
                     time.sleep(3)
                     continue
                 for upd in data.get("result", []):
@@ -390,17 +456,11 @@ class VikaTelegramUI:
             cdata = cq.get("data", "")
             self._answer_callback(cq["id"])
             if cdata == "panic_confirm":
-                res = self.executor.panic_close_all()
-                self.send_message(res, chat_id=cid)
+                self.send_message(self.executor.panic_close_all(), chat_id=cid)
             elif cdata == "panic_cancel":
-                self.send_message("❌ Panic Close отменён. Vika N2N7 продолжает работу в штатном режиме.", chat_id=cid)
+                self.send_message("❌ Panic Close отменён. L2_news продолжает работу.", chat_id=cid)
             else:
-                # Legacy inline button clicked -> send fresh Vika N2N7 status & updated ReplyKeyboard
-                self.send_message(
-                    f"🔄 Интерфейс обновлён до <b>Vika N2N7</b> ({self.n_coins} монет, {self._dir_label()}).\n\n"
-                    + self.format_status(),
-                    chat_id=cid,
-                )
+                self.send_message("🔄 Интерфейс обновлён до <b>L2_news</b>.\n\n" + self.format_status(), chat_id=cid)
             return
 
         msg = upd.get("message")
@@ -409,7 +469,6 @@ class VikaTelegramUI:
         chat = msg.get("chat", {}) or {}
         user = msg.get("from", {}) or {}
         if not self.is_authorized(chat, user):
-            logger.info("Ignored unauthorized Telegram message from chat=%s user=%s", chat.get("id"), user.get("id"))
             return
         cid = str(chat.get("id", ""))
         text = (msg.get("text") or "").strip()
@@ -418,35 +477,36 @@ class VikaTelegramUI:
         cmd = text.split()[0].split("@")[0].lower()
         low = text.lower()
 
-        if text == BTN_STATUS or cmd in ("/start", "/status", "/menu") or ("статус" in low and "баланс" in low):
+        if text == BTN_STATUS or cmd in ("/start", "/status", "/menu") or "статус" in low:
             self.send_message(self.format_status(), chat_id=cid)
-        elif text == BTN_POSITIONS or cmd == "/positions" or "открытые позиции" in low:
+        elif text == BTN_POSITIONS or cmd == "/positions" or "позиции" in low:
             self.send_message(self.format_open_positions(), chat_id=cid)
+        elif text == BTN_MACRO or cmd == "/macro" or "макро" in low or "паузы" in low:
+            self.send_message(self.format_macro_and_pauses(), chat_id=cid)
         elif text == self.btn_portfolio or cmd == "/portfolio" or "портфель" in low:
             self.send_message(self.format_portfolio(), chat_id=cid)
-        elif text == BTN_HISTORY or cmd == "/history" or "история сделок" in low:
+        elif text == BTN_HISTORY or cmd == "/history" or "история" in low:
             self.send_message(self.format_history(), chat_id=cid)
         elif text == BTN_TOGGLE_PAUSE or cmd in ("/pause", "/resume") or ("пауза" in low and "старт" in low):
             new_state = not self.journal.is_paused()
             self.journal.set_paused(new_state)
             if new_state:
                 self.send_message(
-                    "⏸ <b>Vika N2N7 ПОСТАВЛЕН НА ПАУЗУ</b>\n"
-                    "Новые сделки открываться не будут. Защитные SL/TP на открытых позициях сохранены.",
+                    "⏸ <b>L2_news ПОСТАВЛЕН НА ПАУЗУ</b>\nНовые входы отключены. Защитные SL/TP и BE на открытых позициях работают.",
                     chat_id=cid,
                 )
             else:
-                self.send_message("▶️ <b>Vika N2N7 ВОЗОБНОВИЛ РАБОТУ</b>\nПоиск новых входов активен.", chat_id=cid)
-        elif text == BTN_PANIC or cmd == "/panic" or "panic close" in low or "закрыть всё" in low:
+                self.send_message("▶️ <b>L2_news ВОЗОБНОВИЛ РАБОТУ</b>\nПоиск входов активен.", chat_id=cid)
+        elif text == BTN_PANIC or cmd == "/panic" or "panic" in low or "закрыть всё" in low:
             confirm_kb = {
                 "inline_keyboard": [[
-                    {"text": "✅ Да, закрыть всё по рынку", "callback_data": "panic_confirm"},
+                    {"text": "✅ Да, закрыть всё и отменить DCA/TP", "callback_data": "panic_confirm"},
                     {"text": "❌ Отмена", "callback_data": "panic_cancel"},
                 ]]
             }
             self.send_message(
-                "🛑 <b>ПОДТВЕРЖДЕНИЕ PANIC CLOSE | Vika N2N7</b>\n"
-                "Закрыть ВСЕ открытые позиции по рынку, отменить активные ордера и поставить бота на паузу?",
+                "🛑 <b>ПОДТВЕРЖДЕНИЕ PANIC CLOSE | L2_news</b>\n"
+                "Закрыть ВСЕ позиции по рынку, отменить все DCA/TP ордера и поставить бота на паузу?",
                 reply_markup=confirm_kb,
                 chat_id=cid,
             )

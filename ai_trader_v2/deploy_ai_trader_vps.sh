@@ -50,10 +50,10 @@ if [ "${APP_USER}" != "root" ]; then
     chown -R "${APP_USER}:" "${APP_DIR}/data/ai_trader_v2" "${APP_DIR}/logs"
 fi
 
-echo "=== [3/4] Installing ${SERVICE_NAME}.service (Vika N2N7, Bybit DEMO) ==="
+echo "=== [3/4] Installing ${SERVICE_NAME}.service (L2_news Hybrid 15x, 5x12%, All-Thick-18, Bybit DEMO) ==="
 cat >/etc/systemd/system/${SERVICE_NAME}.service <<EOF
 [Unit]
-Description=Vika N2N7 (VIKA_N2_N7) Bybit Autonomous Trader (10 coins, 10x Cross, DEMO)
+Description=L2_news Hybrid Bybit Autonomous Trader (All-Thick-18, 15x Isolated, 5x12%, DEMO)
 After=network-online.target
 Wants=network-online.target
 StartLimitIntervalSec=600
@@ -76,9 +76,36 @@ ProtectSystem=full
 WantedBy=multi-user.target
 EOF
 
-echo "=== [4/4] Starting ${SERVICE_NAME}.service ==="
+# Weekly systemd timer to refresh config/macro_events_utc.json via Claude API (Mondays 03:00 UTC)
+cat >/etc/systemd/system/krupa-macro-calendar.service <<EOF
+[Unit]
+Description=Update US Macro Calendar (FOMC/CPI/NFP) via Claude API
+After=network-online.target
+
+[Service]
+Type=oneshot
+User=${APP_USER}
+WorkingDirectory=${APP_DIR}
+EnvironmentFile=${APP_DIR}/.env
+ExecStart="${PYTHON_BIN}" "${APP_DIR}/update_macro_calendar.py"
+EOF
+
+cat >/etc/systemd/system/krupa-macro-calendar.timer <<EOF
+[Unit]
+Description=Weekly US Macro Calendar refresh (Mondays 03:00 UTC)
+
+[Timer]
+OnCalendar=Mon *-*-* 03:00:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+echo "=== [4/4] Starting ${SERVICE_NAME}.service & macro calendar timer ==="
 systemctl daemon-reload
 systemctl enable "${SERVICE_NAME}.service"
+systemctl enable --now krupa-macro-calendar.timer || true
 systemctl restart "${SERVICE_NAME}.service"
 sleep 3
 systemctl status "${SERVICE_NAME}.service" --no-pager -l || true

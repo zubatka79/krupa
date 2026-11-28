@@ -29,6 +29,9 @@ KEY_SHORT_NAMES: Dict[str, str] = {
     "K6_VWAP_RECLAIM": "K6 (VWAP Reclaim)",
     "K7_SFP_LIQ_SWEEP": "K7 (SFP Sweep)",
     "K8_SUPERTREND_BO": "K8 (Supertrend BO)",
+    "S1_BB_REJECT": "S1 (BB Reject)",
+    "S2_KELTNER_REJECT": "S2 (Keltner Rej)",
+    "S3_RSI7_OVERBOUGHT": "S3 (RSI7 OB)",
 }
 
 
@@ -53,6 +56,10 @@ class CoinEvaluation:
     slope4h_pct: float = 0.0
     t4_blocked_long: bool = False
     t4_blocked_short: bool = False
+    retail_ls_z: float = 0.0
+    retail_ls_available: bool = False
+    retail_ls_blocked: bool = False
+    btc_regime_blocked: bool = False
     raw_signal: Optional[str] = None     # "LONG" | "SHORT" | None (before filters)
     final_signal: Optional[str] = None   # "LONG" | "SHORT" | None (after ALL filters)
     block_reason: Optional[str] = None   # why raw_signal was blocked, if any
@@ -308,6 +315,10 @@ def evaluate_coin(
     funding_rate: float,
     now_ms: int,
     filters_cfg: Dict[str, Any],
+    *,
+    retail_ls_z: Optional[float] = None,
+    btc_allow_short: Optional[bool] = None,
+    btc_allow_long: Optional[bool] = None,
 ) -> CoinEvaluation:
     """
     Evaluate the latest CLOSED 15m candle for `symbol` using its assigned VIKA key
@@ -359,18 +370,22 @@ def evaluate_coin(
     div4h_bull_strong = bool(bull4_str_arr[i4]) if i4 >= 35 else False
 
     # 15m Indicators (exact backtest formulas)
-    e9, e21, e50 = ema_arr(cl, 9), ema_arr(cl, 21), ema_arr(cl, 50)
+    e9, e20, e21, e50 = ema_arr(cl, 9), ema_arr(cl, 20), ema_arr(cl, 21), ema_arr(cl, 50)
     atr15 = atr_arr(hi, lo, cl, 14)
     atr15_pct_arr = np.where(cl > 0, atr15 / np.maximum(cl, 1e-12) * 100.0, 99.0)
     rsi = rsi_arr(cl, 14)
+    rsi7 = rsi_arr(cl, 7)
     _, _, mh = macd_arr(cl)
     st_k, st_d = stoch_arr(hi, lo, cl, 14, 3, 3)
     rvol_arr = (
         pd.Series(vol) / pd.Series(vol).rolling(20, min_periods=10).mean().replace(0.0, np.nan)
     ).fillna(0.0).to_numpy(float)
     adx15_arr = adx_arr(hi, lo, cl, 14)
+    sma20 = pd.Series(cl).rolling(20, min_periods=20).mean().fillna(cl[0]).to_numpy(float)
     sd20 = pd.Series(cl).rolling(20, min_periods=20).std().fillna(0.0).to_numpy(float)
     bbw15_arr = 4.0 * sd20 / np.maximum(cl, 1e-12) * 100.0
+    bb_hi = sma20 + 2.0 * sd20
+    kc_hi = e20 + 1.5 * atr15
 
     vwap, pdh, pdl, asia_hi, asia_lo = compute_session_levels(ts, hi, lo, cl, vol)
     hi20 = pd.Series(hi).shift(1).rolling(20, min_periods=20).max().fillna(0.0).to_numpy(float)
@@ -459,6 +474,24 @@ def evaluate_coin(
             and (((st_d10[i] == -1) and (st_d10[i - 1] == 1)) or ((lo16[i] > 0) and (c_cl < lo16[i]) and (c_cl_p >= lo16[i])))
             and (c_rvol >= 1.25) and (c_cl < c_op)
         )
+    elif key == "S1_BB_REJECT":
+        sig_s = (
+            h1_dn and h4_dn and ok_vol
+            and ((c_hi >= bb_hi[i]) or (hi[i - 1] >= bb_hi[i - 1]))
+            and (c_cl < c_op) and (c_cl < bb_hi[i]) and (c_cl < c_cl_p)
+        )
+    elif key == "S2_KELTNER_REJECT":
+        sig_s = (
+            h1_dn and ok_vol
+            and ((c_hi >= kc_hi[i]) or (hi[i - 1] >= kc_hi[i - 1]))
+            and (c_cl < c_op) and (c_cl < kc_hi[i]) and (c_cl < c_cl_p)
+        )
+    elif key == "S3_RSI7_OVERBOUGHT":
+        sig_s = (
+            h1_dn and h4_dn and ok_vol
+            and (rsi7[i - 1] >= 68.0) and (c_cl < c_op)
+            and (c_cl < c_cl_p) and (c_cl < e50[i] * 1.008)
+        )
     else:
         raise ValueError(f"Unsupported VIKA key: {key}")
 
@@ -489,14 +522,29 @@ def evaluate_coin(
     t4_blocked_long = is_trend_key and (c_slope4h <= min_slope4)
     t4_blocked_short = is_trend_key and ((-c_slope4h) <= min_slope4)
 
-    # Apply all mandatory filters (Direction Mode, 4H STRONG Div, N2, N7, T4)
+    # Apply all mandatory filters (Direction Mode, BTC 4H+1D Gate, Retail L/S, 4H STRONG Div, N2, N7, T4)
     allowed_dir = str(filters_cfg.get("allowed_directions", "long_short")).strip().lower()
+    ls_enabled = bool(filters_cfg.get("retail_ls_enabled", False))
+    ls_max_z = float(filters_cfg.get("retail_ls_max_abs_z", 1.0))
+    ls_avail = retail_ls_z is not None
+    ls_z_val = float(retail_ls_z) if ls_avail else 0.0
+    ls_blocked = False
+    btc_blocked = False
+
     final_signal = raw_signal
     block_reason: Optional[str] = None
     if raw_signal == "LONG":
         if allowed_dir not in ("long_short", "only_long"):
             final_signal = None
             block_reason = f"Direction Mode ({allowed_dir})"
+        elif btc_allow_long is False:
+            final_signal = None
+            btc_blocked = True
+            block_reason = "BTC 4H+1D Regime (LONG off)"
+        elif ls_enabled and ls_avail and ls_z_val > ls_max_z:
+            final_signal = None
+            ls_blocked = True
+            block_reason = f"Retail L/S crowded (z={ls_z_val:+.2f} > +{ls_max_z:g})"
         elif filters_cfg.get("div_4h_strong", True) and div4h_bear_strong:
             final_signal = None
             block_reason = "4H STRONG Bearish Divergence"
@@ -513,6 +561,14 @@ def evaluate_coin(
         if allowed_dir not in ("long_short", "only_short"):
             final_signal = None
             block_reason = f"Direction Mode ({allowed_dir})"
+        elif btc_allow_short is False:
+            final_signal = None
+            btc_blocked = True
+            block_reason = "BTC 4H+1D Regime (SHORT off)"
+        elif ls_enabled and ls_avail and ls_z_val < -ls_max_z:
+            final_signal = None
+            ls_blocked = True
+            block_reason = f"Retail L/S crowded (z={ls_z_val:+.2f} < -{ls_max_z:g})"
         elif filters_cfg.get("div_4h_strong", True) and div4h_bull_strong:
             final_signal = None
             block_reason = "4H STRONG Bullish Divergence"
@@ -546,6 +602,10 @@ def evaluate_coin(
         slope4h_pct=round(c_slope4h, 2),
         t4_blocked_long=t4_blocked_long,
         t4_blocked_short=t4_blocked_short,
+        retail_ls_z=round(ls_z_val, 3),
+        retail_ls_available=ls_avail,
+        retail_ls_blocked=ls_blocked,
+        btc_regime_blocked=btc_blocked,
         raw_signal=raw_signal,
         final_signal=final_signal,
         block_reason=block_reason,
