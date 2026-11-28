@@ -27,8 +27,8 @@
   "cooldown_bars_after_close": 4,
   "ac_pause_hours": 6,
   "probation_sl_count": 2,
-  "probation_window_days": 10,
-  "probation_pause_days": 5,
+  "probation_window_days": 21,
+  "probation_pause_days": 14,
   "dca": {
     "enabled": true,
     "leg1_pct": 35.0,

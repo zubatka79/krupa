@@ -256,7 +256,7 @@ class VikaTelegramUI:
             f"🧊 Паузы (только Hard SL):",
             f"  • AC {self.executor.ac_pause_hours}ч LONG: {ac_l}",
             f"  • AC {self.executor.ac_pause_hours}ч SHORT: {ac_s}",
-            f"  • Probation (5д): <code>{prob_txt}</code>",
+            f"  • Probation ({self.executor.probation_pause_days}д): <code>{prob_txt}</code>",
         ]
         if self.executor.stale_warnings:
             lines.append("\n⚠️ <b>Внешние позиции/ордера на бирже:</b>")

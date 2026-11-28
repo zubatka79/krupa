@@ -151,7 +151,7 @@ class VikaJournal:
         cur = self.get_ac_pause_until_ms(side)
         self.set_kv(f"ac_pause_{side.upper()}", str(max(cur, int(ts_ms))))
 
-    # --- Coin Probation (2 Hard SLs within 10d -> 5d quarantine; Hard SL ONLY) ---
+    # --- Coin Probation (2 Hard SLs within 21d -> 14d quarantine; Hard SL ONLY) ---
     def get_coin_probation_until_ms(self, symbol: str) -> int:
         v = self.get_kv(f"prob_until_{symbol}", "0")
         return int(v or "0")
@@ -161,9 +161,9 @@ class VikaJournal:
         symbol: str,
         now_ms: int,
         *,
-        window_days: int = 10,
+        window_days: int = 21,
         threshold: int = 2,
-        pause_days: int = 5,
+        pause_days: int = 14,
     ) -> Tuple[bool, int, int]:
         """
         Record a Hard SL for `symbol`. Returns (triggered_probation, sl_count_in_window, pause_until_ms).

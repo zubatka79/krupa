@@ -9,7 +9,7 @@ Features:
   - Atomic server-side SL attached directly in Leg 1 Market IOC entry + resting Leg 2 Limit GTC DCA + Limit Maker TP
   - Closed-candle BE +0.30% (trigger +1.00%): moves SL to +0.30%, synchronously cancels pending Leg 2 DCA limit,
     and frees its reserved margin.
-  - Strict Hard SL vs BE separation: AC 6h pause (per side) & Coin Probation (2 Hard SL / 10d -> 5d) trigger
+  - Strict Hard SL vs BE separation: AC 6h pause (per side) & Coin Probation (2 Hard SL / 21d -> 14d) trigger
     ONLY on real Hard SL (be_active=0), NEVER on BE exits!
   - US Macro Calendar Guard [T-60m .. T+45m] blocking ONLY new entries.
 """
@@ -115,8 +115,8 @@ class VikaExecutor:
         self.cooldown_bars = self.cooldown_bars_short
         self.ac_pause_hours = int(cfg.get("ac_pause_hours", 6))
         self.probation_sl_count = int(cfg.get("probation_sl_count", 2))
-        self.probation_window_days = int(cfg.get("probation_window_days", 10))
-        self.probation_pause_days = int(cfg.get("probation_pause_days", 5))
+        self.probation_window_days = int(cfg.get("probation_window_days", 21))
+        self.probation_pause_days = int(cfg.get("probation_pause_days", 14))
         self.ttl_bars = int(cfg.get("limit_entry_ttl_bars", 3))
         self.ttl_sec = int(cfg.get("limit_entry_ttl_sec", 2700))
 
@@ -524,7 +524,7 @@ class VikaExecutor:
             logger.info("Skip %s %s: AC %dh pause active for %s", sym, side, self.ac_pause_hours, side)
             return None
         if now_ms < self.journal.get_coin_probation_until_ms(sym):
-            logger.info("Skip %s %s: symbol in Coin Probation (5d quarantine)", sym, side)
+            logger.info("Skip %s %s: symbol in Coin Probation (%dd quarantine)", sym, side, self.probation_pause_days)
             return None
         if now_ms < self.journal.get_cooldown_until_ms(sym, side):
             logger.info("Skip %s %s: symbol in post-close cooldown", sym, side)

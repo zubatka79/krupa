@@ -169,6 +169,9 @@ def test_1_configs_and_macro_calendar() -> None:
         assert c["storm_max_margin_usd"] == 2500.0
         assert c["max_same_direction"] == 5
         assert c["max_total_margin_pct"] == 85.0
+        assert c["probation_sl_count"] == 2
+        assert c["probation_window_days"] == 21
+        assert c["probation_pause_days"] == 14
         assert c["dca"]["be_lock_pct"] == 0.30
         assert c["dca"]["leg1_pct"] == 35.0 and c["dca"]["leg2_pct"] == 65.0
         assert c["dca"]["storm_leg1_pct"] == 30.0 and c["dca"]["storm_leg2_pct"] == 70.0
@@ -350,7 +353,9 @@ def test_3_executor_dca_be_hard_sl_antisalvo_and_telegram() -> None:
 
         assert "Vika Hybrid" in welcome and "Vika Hybrid" in status
         assert "15x ISOLATED" in status and "5×12%" in status and "Резерв Bybit" in status and "DCA (35/65)" in status
+        assert "Probation (14д)" in status
         assert "FOMC" in macro_v and "CPI" in macro_v and "NFP" in macro_v and "AC 6ч" in macro_v
+        assert "2 Hard SL / 21д → 14д" in macro_v
         assert "All-Thick-18 (18L + 18S)" in portfolio
         assert "SHORT (18 | допущено: 1)" in portfolio and "⚪ <b>LONG (18 | откл. BTC)" in portfolio
         assert "⛔ <code>LTC" in portfolio and "🟢 <code>DOT" in portfolio and "⚪ <code>HBAR" in portfolio
