@@ -24,6 +24,8 @@ class VikaJournal:
         conn = sqlite3.connect(str(self.db_path), timeout=30.0)
         conn.row_factory = sqlite3.Row
         try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA busy_timeout=30000")
             with conn:
                 yield conn
         finally:
@@ -62,6 +64,7 @@ class VikaJournal:
                     dca_order_id TEXT DEFAULT '',
                     dca_price REAL NOT NULL DEFAULT 0.0,
                     dca_qty REAL NOT NULL DEFAULT 0.0,
+                    dca_filled_qty REAL NOT NULL DEFAULT 0.0,
                     dca_margin_usd REAL NOT NULL DEFAULT 0.0,
                     dca_status TEXT NOT NULL DEFAULT 'NONE',
                     in_storm INTEGER NOT NULL DEFAULT 0,
@@ -86,6 +89,7 @@ class VikaJournal:
                 ("dca_order_id", "TEXT DEFAULT ''"),
                 ("dca_price", "REAL NOT NULL DEFAULT 0.0"),
                 ("dca_qty", "REAL NOT NULL DEFAULT 0.0"),
+                ("dca_filled_qty", "REAL NOT NULL DEFAULT 0.0"),
                 ("dca_margin_usd", "REAL NOT NULL DEFAULT 0.0"),
                 ("dca_status", "TEXT NOT NULL DEFAULT 'NONE'"),
                 ("in_storm", "INTEGER NOT NULL DEFAULT 0"),
@@ -253,6 +257,7 @@ class VikaJournal:
         dca_order_id: str = "",
         dca_price: float = 0.0,
         dca_qty: float = 0.0,
+        dca_filled_qty: float = 0.0,
         dca_margin_usd: float = 0.0,
         dca_status: str = "NONE",
         in_storm: bool = False,
@@ -268,27 +273,71 @@ class VikaJournal:
                     entry_price, qty, margin_usd, reserved_margin_usd, leverage,
                     tp_price, sl_price, be_trigger_price, be_lock_price, be_active,
                     entry_bar_ts, expire_ts, opened_at, filters_json,
-                    dca_order_id, dca_price, dca_qty, dca_margin_usd, dca_status, in_storm, tp_pct
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    dca_order_id, dca_price, dca_qty, dca_filled_qty, dca_margin_usd, dca_status, in_storm, tp_pct
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     symbol, side, key_name, status, order_id,
                     float(entry_price), float(qty), float(margin_usd), res_m, int(leverage),
                     float(tp_price), float(sl_price), float(be_trigger_price), float(be_lock_price),
                     int(entry_bar_ts), int(expire_ts), now_ms, json.dumps(filters, ensure_ascii=False),
-                    str(dca_order_id), float(dca_price), float(dca_qty), float(dca_margin_usd),
+                    str(dca_order_id), float(dca_price), float(dca_qty), float(dca_filled_qty), float(dca_margin_usd),
                     str(dca_status), 1 if in_storm else 0, float(tp_pct),
                 ),
             )
             return int(cur.lastrowid)
 
     def get_active_positions(self) -> List[Dict[str, Any]]:
-        """Return all PENDING or OPEN positions."""
+        """Return all PENDING_OPEN, PENDING, or OPEN positions."""
         with self._lock, self._connect() as conn:
             rows = conn.execute(
-                "SELECT * FROM positions WHERE status IN ('PENDING', 'OPEN') ORDER BY id ASC"
+                "SELECT * FROM positions WHERE status IN ('PENDING_OPEN', 'PENDING', 'OPEN') ORDER BY id ASC"
             ).fetchall()
             return [dict(r) for r in rows]
+
+    def get_pending_open_positions(self) -> List[Dict[str, Any]]:
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT * FROM positions WHERE status = 'PENDING_OPEN' ORDER BY id ASC"
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def finalize_pending_open(
+        self,
+        pos_id: int,
+        *,
+        order_id: str,
+        entry_price: float,
+        qty: float,
+        margin_usd: float,
+        reserved_margin_usd: float,
+        tp_price: float,
+        sl_price: float,
+        be_trigger_price: float,
+        be_lock_price: float,
+        dca_order_id: str,
+        dca_price: float,
+        dca_qty: float,
+        dca_margin_usd: float,
+        dca_status: str,
+        dca_filled_qty: float = 0.0,
+    ) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE positions
+                SET status = 'OPEN', order_id = ?, entry_price = ?, qty = ?, margin_usd = ?, reserved_margin_usd = ?,
+                    tp_price = ?, sl_price = ?, be_trigger_price = ?, be_lock_price = ?,
+                    dca_order_id = ?, dca_price = ?, dca_qty = ?, dca_margin_usd = ?, dca_status = ?, dca_filled_qty = ?
+                WHERE id = ?
+                """,
+                (
+                    str(order_id), float(entry_price), float(qty), float(margin_usd), float(reserved_margin_usd),
+                    float(tp_price), float(sl_price), float(be_trigger_price), float(be_lock_price),
+                    str(dca_order_id), float(dca_price), float(dca_qty), float(dca_margin_usd), str(dca_status),
+                    float(dca_filled_qty), int(pos_id),
+                ),
+            )
 
     def get_open_positions(self) -> List[Dict[str, Any]]:
         with self._lock, self._connect() as conn:
@@ -322,6 +371,36 @@ class VikaJournal:
                     (float(fill_price), float(fill_qty), float(margin_usd), int(pos_id)),
                 )
 
+    def update_dca_partial(
+        self,
+        pos_id: int,
+        *,
+        new_entry_price: float,
+        new_qty: float,
+        new_margin_usd: float,
+        new_reserved_margin_usd: float,
+        new_tp_price: float,
+        new_be_trigger_price: float,
+        new_be_lock_price: float,
+        dca_filled_qty: float,
+    ) -> None:
+        """Record a partial Leg-2 DCA fill while the remaining DCA limit is still resting in the book."""
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE positions
+                SET entry_price = ?, qty = ?, margin_usd = ?, reserved_margin_usd = ?,
+                    tp_price = ?, be_trigger_price = ?, be_lock_price = ?,
+                    dca_filled_qty = ?
+                WHERE id = ?
+                """,
+                (
+                    float(new_entry_price), float(new_qty), float(new_margin_usd), float(new_reserved_margin_usd),
+                    float(new_tp_price), float(new_be_trigger_price), float(new_be_lock_price),
+                    float(dca_filled_qty), int(pos_id),
+                ),
+            )
+
     def update_dca_filled(
         self,
         pos_id: int,
@@ -332,22 +411,75 @@ class VikaJournal:
         new_tp_price: float,
         new_be_trigger_price: float,
         new_be_lock_price: float,
+        dca_status: str = "FILLED",
+        dca_filled_qty: Optional[float] = None,
     ) -> None:
         with self._lock, self._connect() as conn:
-            conn.execute(
-                """
-                UPDATE positions
-                SET entry_price = ?, qty = ?, margin_usd = ?, reserved_margin_usd = ?,
-                    tp_price = ?, be_trigger_price = ?, be_lock_price = ?,
-                    dca_order_id = '', dca_status = 'FILLED'
-                WHERE id = ?
-                """,
-                (
-                    float(new_entry_price), float(new_qty), float(new_margin_usd), float(new_margin_usd),
-                    float(new_tp_price), float(new_be_trigger_price), float(new_be_lock_price),
-                    int(pos_id),
-                ),
-            )
+            if dca_filled_qty is not None:
+                conn.execute(
+                    """
+                    UPDATE positions
+                    SET entry_price = ?, qty = ?, margin_usd = ?, reserved_margin_usd = ?,
+                        tp_price = ?, be_trigger_price = ?, be_lock_price = ?,
+                        dca_order_id = '', dca_status = ?, dca_filled_qty = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        float(new_entry_price), float(new_qty), float(new_margin_usd), float(new_margin_usd),
+                        float(new_tp_price), float(new_be_trigger_price), float(new_be_lock_price),
+                        str(dca_status), float(dca_filled_qty), int(pos_id),
+                    ),
+                )
+            else:
+                conn.execute(
+                    """
+                    UPDATE positions
+                    SET entry_price = ?, qty = ?, margin_usd = ?, reserved_margin_usd = ?,
+                        tp_price = ?, be_trigger_price = ?, be_lock_price = ?,
+                        dca_order_id = '', dca_status = ?
+                    WHERE id = ?
+                    """,
+                    (
+                        float(new_entry_price), float(new_qty), float(new_margin_usd), float(new_margin_usd),
+                        float(new_tp_price), float(new_be_trigger_price), float(new_be_lock_price),
+                        str(dca_status), int(pos_id),
+                    ),
+                )
+
+    def update_partial_tp_reduce(
+        self,
+        pos_id: int,
+        *,
+        new_qty: float,
+        new_margin_usd: float,
+        cancel_dca: bool = True,
+    ) -> None:
+        """Update remaining size/margin after a partial Limit TP fill and optionally retire pending DCA."""
+        with self._lock, self._connect() as conn:
+            if cancel_dca:
+                conn.execute(
+                    """
+                    UPDATE positions
+                    SET qty = ?, margin_usd = ?, reserved_margin_usd = ?,
+                        dca_order_id = '',
+                        dca_status = CASE WHEN dca_status = 'PENDING' THEN 'CANCELLED_TP_PARTIAL' ELSE dca_status END
+                    WHERE id = ?
+                    """,
+                    (float(new_qty), float(new_margin_usd), float(new_margin_usd), int(pos_id)),
+                )
+            else:
+                conn.execute(
+                    "UPDATE positions SET qty = ?, margin_usd = ?, reserved_margin_usd = ? WHERE id = ?",
+                    (float(new_qty), float(new_margin_usd), float(new_margin_usd), int(pos_id)),
+                )
+
+    def get_last_closed_at_ms(self, symbol: str) -> int:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT MAX(closed_at) AS max_ts FROM positions WHERE symbol = ? AND status = 'CLOSED'",
+                (symbol,),
+            ).fetchone()
+            return int(row["max_ts"]) if (row and row["max_ts"] is not None) else 0
 
     def mark_dca_cancelled(self, pos_id: int, status: str, new_reserved_margin_usd: float) -> None:
         with self._lock, self._connect() as conn:
@@ -407,6 +539,72 @@ class VikaJournal:
                 """,
                 (now_ms, float(exit_price), exit_reason, float(pnl_usd), float(pnl_pct), int(pos_id)),
             )
+
+    def record_position_exit_atomic(
+        self,
+        *,
+        pos_id: int,
+        symbol: str,
+        side: str,
+        now_ms: int,
+        exit_price: float,
+        exit_reason: str,
+        pnl_usd: float,
+        pnl_pct: float,
+        cooldown_until_ms: int,
+        is_hard_sl: bool = False,
+        ac_pause_until_ms: int = 0,
+        probation_window_days: int = 21,
+        probation_threshold: int = 2,
+        probation_pause_days: int = 14,
+    ) -> Tuple[bool, int, int]:
+        """Atomically persist position close + cooldown + AC 6h + Coin Probation in ONE SQLite transaction."""
+        side_u = side.upper()
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE positions
+                SET status = 'CLOSED', closed_at = ?, exit_price = ?, exit_reason = ?, pnl_usd = ?, pnl_pct = ?, dca_order_id = ''
+                WHERE id = ?
+                """,
+                (int(now_ms), float(exit_price), str(exit_reason), float(pnl_usd), float(pnl_pct), int(pos_id)),
+            )
+            conn.execute(
+                "INSERT OR REPLACE INTO kv_state (k, v) VALUES (?, ?)",
+                (f"cd_{symbol}_{side_u}", str(int(cooldown_until_ms))),
+            )
+            if not is_hard_sl:
+                return False, 0, 0
+
+            ac_key = f"ac_pause_{side_u}"
+            ac_row = conn.execute("SELECT v FROM kv_state WHERE k = ?", (ac_key,)).fetchone()
+            cur_ac = int(ac_row["v"] or "0") if ac_row else 0
+            conn.execute(
+                "INSERT OR REPLACE INTO kv_state (k, v) VALUES (?, ?)",
+                (ac_key, str(max(cur_ac, int(ac_pause_until_ms)))),
+            )
+
+            window_ms = int(probation_window_days * 86_400_000)
+            sl_key = f"sl_hist_{symbol}"
+            prob_key = f"prob_until_{symbol}"
+            sl_row = conn.execute("SELECT v FROM kv_state WHERE k = ?", (sl_key,)).fetchone()
+            raw_hist = sl_row["v"] if sl_row else "[]"
+            try:
+                hist = [int(x) for x in json.loads(raw_hist or "[]") if (now_ms - int(x)) <= window_ms]
+            except Exception:
+                hist = []
+            hist.append(int(now_ms))
+
+            if len(hist) >= probation_threshold:
+                prob_row = conn.execute("SELECT v FROM kv_state WHERE k = ?", (prob_key,)).fetchone()
+                cur_prob = int(prob_row["v"] or "0") if prob_row else 0
+                until_ms = max(cur_prob, int(now_ms + probation_pause_days * 86_400_000))
+                conn.execute("INSERT OR REPLACE INTO kv_state (k, v) VALUES (?, ?)", (prob_key, str(until_ms)))
+                conn.execute("INSERT OR REPLACE INTO kv_state (k, v) VALUES (?, ?)", (sl_key, "[]"))
+                return True, len(hist), until_ms
+
+            conn.execute("INSERT OR REPLACE INTO kv_state (k, v) VALUES (?, ?)", (sl_key, json.dumps(hist)))
+            return False, len(hist), 0
 
     def get_recent_closed(self, limit: int = 10) -> List[Dict[str, Any]]:
         with self._lock, self._connect() as conn:

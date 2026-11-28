@@ -2,7 +2,7 @@
 Telegram Control & Live Monitoring Interface rebuilt exclusively for L2_news
 (15x Isolated, 5x12%, Cap $5,000 / $2,500 storm, All-Thick-18: 18L + 18S,
 2-Step DCA 35/65, BE +0.30% with DCA cancel, Hard-SL-only AC 6h & Probation,
-Retail L/S |z| < 1.0, US Macro Blackout [T-60m..T+45m]).
+Retail L/S z > +1.0 LONG / z < -1.0 SHORT, US Macro Blackout [T-60m..T+45m]).
 
 ReplyKeyboard Buttons:
   1. 📊 Статус L2_news          | 📈 Позиции и DCA
@@ -57,6 +57,8 @@ def _dca_status_badge(pos: Dict[str, Any]) -> str:
         return f"⏳ 2-я нога Limit @ <code>{px}</code> (qty <code>{qty}</code>)"
     if st == "FILLED":
         return "✅ 2-я нога DCA залита (полный слот)"
+    if st == "PARTIAL_FILLED":
+        return "✅ 2-я нога DCA частично залита"
     if st == "CANCELLED_BE":
         return "🧹 2-я нога снята при BE +0.30%"
     if st.startswith("CANCELLED"):
@@ -121,6 +123,7 @@ class VikaTelegramUI:
         self.api_base = f"https://api.telegram.org/bot{self.token}" if self.enabled else ""
 
         self._send_session = requests.Session()
+        self._send_lock = threading.Lock()
         self._poll_session = requests.Session()
         self._stop_evt = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -139,11 +142,12 @@ class VikaTelegramUI:
         if not self.enabled:
             return False
         try:
-            r = self._send_session.post(
-                f"{self.api_base}/setMyCommands",
-                json={"commands": self.bot_commands},
-                timeout=15,
-            )
+            with self._send_lock:
+                r = self._send_session.post(
+                    f"{self.api_base}/setMyCommands",
+                    json={"commands": self.bot_commands},
+                    timeout=15,
+                )
             data = r.json()
             ok = bool(data.get("ok"))
             if not ok:
@@ -174,7 +178,8 @@ class VikaTelegramUI:
             "reply_markup": reply_markup if reply_markup is not None else self.main_keyboard,
         }
         try:
-            r = self._send_session.post(f"{self.api_base}/sendMessage", json=payload, timeout=15)
+            with self._send_lock:
+                r = self._send_session.post(f"{self.api_base}/sendMessage", json=payload, timeout=15)
             data = r.json()
             if not data.get("ok"):
                 logger.warning("Telegram sendMessage failed (chat=%s): %s", target_chat, data)
@@ -182,7 +187,8 @@ class VikaTelegramUI:
                     # Fallback to plain text if any dynamic string had unexpected HTML characters
                     plain_payload = dict(payload)
                     plain_payload.pop("parse_mode", None)
-                    r2 = self._send_session.post(f"{self.api_base}/sendMessage", json=plain_payload, timeout=15)
+                    with self._send_lock:
+                        r2 = self._send_session.post(f"{self.api_base}/sendMessage", json=plain_payload, timeout=15)
                     if r2.json().get("ok"):
                         return True
                 return False
@@ -195,11 +201,12 @@ class VikaTelegramUI:
         if not self.enabled:
             return
         try:
-            self._send_session.post(
-                f"{self.api_base}/answerCallbackQuery",
-                json={"callback_query_id": callback_id, "text": text},
-                timeout=10,
-            )
+            with self._send_lock:
+                self._send_session.post(
+                    f"{self.api_base}/answerCallbackQuery",
+                    json={"callback_query_id": callback_id, "text": text},
+                    timeout=10,
+                )
         except Exception:
             pass
 
@@ -345,7 +352,9 @@ class VikaTelegramUI:
         lines = [f"🪙 <b>ПОРТФЕЛЬ All-Thick-18 ({self.n_long}L + {self.n_short}S)</b>"]
         if btc:
             lines.append(btc.mode_label)
-        lines.append("<i>🟢 допущена | ⛔ блок |z|≥1.0 / Probation | ⚪ откл. BTC</i>")
+        lines.append(
+            f"<i>🟢 допущена | ⛔ блок z &gt; +{ls_max_z:.1f} (LONG), z &lt; -{ls_max_z:.1f} (SHORT) / Probation | ⚪ откл. BTC</i>"
+        )
 
         if self.n_long > 0:
             l_rows: List[str] = []
@@ -435,11 +444,12 @@ class VikaTelegramUI:
         macro_st = self.get_macro_status()
         n_uniq = len(lev_status)
         ok_cnt = sum(1 for v in lev_status.values() if v.startswith("OK") or v.startswith("DRY_RUN"))
+        ls_max_z = float(self.cfg.get("filters", {}).get("retail_ls_max_abs_z", 1.0))
 
         lines = [
             f"🤖 <b>ЗАПУСК: Vika Hybrid (All-Thick-18)</b>",
             f"Биржа: <code>Bybit {self.executor.mode.upper()} | {self.executor.leverage}x {self.executor.margin_mode} ({ok_cnt}/{n_uniq})</code>",
-            f"Пул: <b>{self.n_long} LONG + {self.n_short} SHORT</b> | Retail L/S: <code>|z| &lt; 1.0</code>",
+            f"Пул: <b>{self.n_long} LONG + {self.n_short} SHORT</b> | Retail L/S: <code>z &gt; +{ls_max_z:.1f}</code> (LONG), <code>z &lt; -{ls_max_z:.1f}</code> (SHORT)",
             f"Риск: <b>5×12%</b> | Кап <code>${self.executor.max_margin_usd:,.0f}</code> (шторм <code>${self.executor.storm_max_margin_usd:,.0f}</code>) | Резерв <code>≤{self.executor.max_total_margin_pct*100:.0f}%</code>",
             f"DCA: <code>35/65 (-1.5% / SL -4% / TP +1.5%)</code> | Шторм: <code>30/70 (-2% / SL -5% / TP +1.6%)</code>",
             f"BE: <code>+1.0% → +0.30%</code> + авто-снятие DCA | AC 6ч &amp; Probation: <code>только Hard SL</code>",
@@ -472,6 +482,15 @@ class VikaTelegramUI:
         self._stop_evt.set()
 
     def _poll_loop(self) -> None:
+        if (
+            not self.executor.dry_run
+            and getattr(self.executor.client, "has_credentials", False)
+            and hasattr(self.executor.client, "ensure_thread_private_client")
+        ):
+            try:
+                self.executor.client.ensure_thread_private_client()
+            except Exception as exc:
+                logger.warning("Telegram thread private client init warning: %s", exc)
         while not self._stop_evt.is_set():
             try:
                 r = self._poll_session.get(

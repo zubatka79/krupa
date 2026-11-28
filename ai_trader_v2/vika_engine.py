@@ -23,6 +23,13 @@ H1_MS = 60 * 60 * 1000
 H4_MS = 4 * 60 * 60 * 1000
 DAY_MS = 24 * 60 * 60 * 1000
 
+DEFAULT_FUNDING_INTERVAL_HOURS: Dict[str, float] = {
+    "ENAUSDT": 4.0,
+    "PENGUUSDT": 4.0,
+    "PUMPFUNUSDT": 4.0,
+    "TAOUSDT": 4.0,
+}
+
 KEY_SHORT_NAMES: Dict[str, str] = {
     "K1_EMA_TREND_PB": "K1 (EMA Pullback)",
     "K3_MACD_STOCH": "K3 (MACD+Stoch)",
@@ -70,6 +77,8 @@ class CoinEvaluation:
     raw_signal: Optional[str] = None     # "LONG" | "SHORT" | None (before filters)
     final_signal: Optional[str] = None   # "LONG" | "SHORT" | None (after ALL filters)
     block_reason: Optional[str] = None   # why raw_signal was blocked, if any
+    funding_interval_hours: float = 8.0
+    funding_bps_8h: float = 0.0
 
     @property
     def div4h_label(self) -> str:
@@ -326,6 +335,7 @@ def evaluate_coin(
     retail_ls_z: Optional[float] = None,
     btc_allow_short: Optional[bool] = None,
     btc_allow_long: Optional[bool] = None,
+    funding_interval_hours: Optional[float] = None,
 ) -> CoinEvaluation:
     """
     Evaluate the latest CLOSED 15m candle for `symbol` using its assigned VIKA key
@@ -540,11 +550,23 @@ def evaluate_coin(
         n2_reasons.append(f"ATR15={c_atr15_pct:.2f}%>={atr_max:g}%")
     n2_blocked = len(n2_reasons) > 0
 
-    # Filter N7: Funding Rate crowding
+    # Filter N7: Funding Rate crowding (normalized to 8h equivalent)
+    eff_fi_hours = (
+        float(funding_interval_hours)
+        if (funding_interval_hours is not None and float(funding_interval_hours) > 0)
+        else float(
+            (filters_cfg.get("funding_interval_hours_map") or {}).get(
+                symbol, DEFAULT_FUNDING_INTERVAL_HOURS.get(symbol, 8.0)
+            )
+        )
+    )
+    if eff_fi_hours <= 0:
+        eff_fi_hours = 8.0
     fr_bps = float(funding_rate) * 10000.0
+    fr_bps_8h = fr_bps * (8.0 / eff_fi_hours)
     max_pay_bps = float(filters_cfg.get("n7_max_pay_funding_bps", 1.5))
-    n7_blocked_long = fr_bps >= max_pay_bps
-    n7_blocked_short = (-fr_bps) >= max_pay_bps
+    n7_blocked_long = fr_bps_8h >= max_pay_bps
+    n7_blocked_short = (-fr_bps_8h) >= max_pay_bps
 
     # Filter T4: 4H EMA50 aligned slope > +0.15% for trend keys
     min_slope4 = float(filters_cfg.get("t4_min_4h_ema50_slope_pct", 0.15))
@@ -583,7 +605,7 @@ def evaluate_coin(
             block_reason = f"N2 Anti-Climax ({', '.join(n2_reasons)})"
         elif n7_blocked_long:
             final_signal = None
-            block_reason = f"N7 Funding ({fr_bps:+.2f} bps >= +{max_pay_bps:g})"
+            block_reason = f"N7 Funding ({fr_bps_8h:+.2f} bps/8h >= +{max_pay_bps:g})"
         elif t4_blocked_long:
             final_signal = None
             block_reason = f"T4 4H Slope ({c_slope4h:+.2f}% <= +{min_slope4:g}%)"
@@ -607,7 +629,7 @@ def evaluate_coin(
             block_reason = f"N2 Anti-Climax ({', '.join(n2_reasons)})"
         elif n7_blocked_short:
             final_signal = None
-            block_reason = f"N7 Funding ({fr_bps:+.2f} bps <= -{max_pay_bps:g})"
+            block_reason = f"N7 Funding ({fr_bps_8h:+.2f} bps/8h <= -{max_pay_bps:g})"
         elif t4_blocked_short:
             final_signal = None
             block_reason = f"T4 4H Slope ({c_slope4h:+.2f}%, aligned {-c_slope4h:+.2f}% <= +{min_slope4:g}%)"
@@ -639,4 +661,6 @@ def evaluate_coin(
         raw_signal=raw_signal,
         final_signal=final_signal,
         block_reason=block_reason,
+        funding_interval_hours=eff_fi_hours,
+        funding_bps_8h=round(fr_bps_8h, 2),
     )

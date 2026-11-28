@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -77,6 +78,7 @@ class InstrumentSpec:
     volume_24h: float = 0.0
     funding_rate: float = 0.0
     open_interest: float = 0.0
+    funding_interval_hours: float = 8.0
 
     @property
     def min_order_usdt(self) -> float:
@@ -151,6 +153,11 @@ class BybitClient:
 
         self._session = requests.Session()
         self._session.headers.update({"User-Agent": "bybit-autonomous-engine/1.0"})
+        self._owner_tid = threading.get_ident()
+        self._session_lock = threading.RLock()
+        self._thread_public_sessions: Dict[int, requests.Session] = {}
+        self._thread_private_clients: Dict[int, Any] = {}
+        self._auto_private_client = False
 
         if api_key is not None:
             self.api_key = api_key
@@ -169,35 +176,61 @@ class BybitClient:
         self._private_client: Any = None
         self._init_private_client()
 
+    def _build_private_http(self) -> Any:
+        return PybitHTTP(
+            demo=self.is_demo,
+            testnet=self.testnet,
+            api_key=self.api_key,
+            api_secret=self.api_secret,
+            recv_window=10000,
+            timeout=self.timeout,
+            max_retries=2,
+            retry_delay=1,
+        )
+
     def _init_private_client(self) -> None:
         if self.has_credentials and PybitHTTP is not None:
-            self._private_client = PybitHTTP(
-                demo=self.is_demo,
-                testnet=self.testnet,
-                api_key=self.api_key,
-                api_secret=self.api_secret,
-                recv_window=10000,
-                timeout=self.timeout,
-                max_retries=2,
-                retry_delay=1,
-            )
+            self._private_client = self._build_private_http()
+            self._auto_private_client = True
+
+    def _get_public_session(self) -> requests.Session:
+        tid = threading.get_ident()
+        if tid == self._owner_tid:
+            return self._session
+        with self._session_lock:
+            sess = self._thread_public_sessions.get(tid)
+            if sess is None:
+                sess = requests.Session()
+                sess.headers.update({"User-Agent": "bybit-autonomous-engine/1.0"})
+                self._thread_public_sessions[tid] = sess
+            return sess
 
     def reset_sessions(self) -> None:
         """Close and recreate public and private HTTP sessions after network/socket timeout or sleep wake-up."""
-        try:
-            self._session.close()
-        except Exception:
-            pass
-        self._session = requests.Session()
-        self._session.headers.update({"User-Agent": "bybit-autonomous-engine/1.0"})
-        if self._private_client is not None:
+        with self._session_lock:
             try:
-                inner = getattr(self._private_client, "client", None)
-                if inner is not None:
-                    inner.close()
+                self._session.close()
             except Exception:
                 pass
-        self._init_private_client()
+            for sess in self._thread_public_sessions.values():
+                try:
+                    sess.close()
+                except Exception:
+                    pass
+            self._thread_public_sessions.clear()
+            self._session = requests.Session()
+            self._session.headers.update({"User-Agent": "bybit-autonomous-engine/1.0"})
+
+            for cli in ([self._private_client] + list(self._thread_private_clients.values())):
+                if cli is not None:
+                    try:
+                        inner = getattr(cli, "client", None)
+                        if inner is not None:
+                            inner.close()
+                    except Exception:
+                        pass
+            self._thread_private_clients.clear()
+            self._init_private_client()
 
     @property
     def has_credentials(self) -> bool:
@@ -216,9 +249,11 @@ class BybitClient:
         backoff = 0.6
         last_err: Optional[Exception] = None
         req_timeout = (10, self.timeout)
+        tid = threading.get_ident()
         for attempt in range(retries):
             try:
-                resp = self._session.get(url, params=params, timeout=req_timeout)
+                sess = self._get_public_session()
+                resp = sess.get(url, params=params, timeout=req_timeout)
                 if resp.status_code == 429:
                     time.sleep(backoff)
                     backoff = min(backoff * 2.0, 8.0)
@@ -236,12 +271,19 @@ class BybitClient:
             except (requests.RequestException, ValueError, RuntimeError) as exc:
                 last_err = exc
                 if isinstance(exc, requests.RequestException):
-                    try:
-                        self._session.close()
-                    except Exception:
-                        pass
-                    self._session = requests.Session()
-                    self._session.headers.update({"User-Agent": "bybit-autonomous-engine/1.0"})
+                    with self._session_lock:
+                        old_sess = self._session if tid == self._owner_tid else self._thread_public_sessions.get(tid)
+                        if old_sess is not None:
+                            try:
+                                old_sess.close()
+                            except Exception:
+                                pass
+                        fresh = requests.Session()
+                        fresh.headers.update({"User-Agent": "bybit-autonomous-engine/1.0"})
+                        if tid == self._owner_tid:
+                            self._session = fresh
+                        else:
+                            self._thread_public_sessions[tid] = fresh
                 if attempt < retries - 1:
                     time.sleep(backoff)
                     backoff = min(backoff * 1.8, 6.0)
@@ -270,6 +312,8 @@ class BybitClient:
                 price_f = item.get("priceFilter", {})
                 lev_f = item.get("leverageFilter", {})
                 symbol = item["symbol"]
+                raw_fi_min = float(item.get("fundingInterval") or 480.0)
+                fi_hours = (raw_fi_min / 60.0) if raw_fi_min > 0 else 8.0
                 specs[symbol] = InstrumentSpec(
                     symbol=symbol,
                     base_coin=item.get("baseCoin", ""),
@@ -282,6 +326,7 @@ class BybitClient:
                     min_leverage=float(lev_f.get("minLeverage", 1.0) or 1.0),
                     max_leverage=float(lev_f.get("maxLeverage", 50.0) or 50.0),
                     symbol_type=str(item.get("symbolType", "") or ""),
+                    funding_interval_hours=fi_hours,
                 )
             cursor = result.get("nextPageCursor", "")
             if not cursor:
@@ -296,6 +341,7 @@ class BybitClient:
             sym = item.get("symbol", "")
             if not sym:
                 continue
+            raw_fih = float(item.get("fundingIntervalHour") or 0.0)
             tickers[sym] = {
                 "last_price": float(item.get("lastPrice") or 0.0),
                 "price_24h_pcnt": float(item.get("price24hPcnt") or 0.0),
@@ -304,6 +350,7 @@ class BybitClient:
                 "funding_rate": float(item.get("fundingRate") or 0.0),
                 "open_interest": float(item.get("openInterest") or 0.0),
                 "open_interest_value": float(item.get("openInterestValue") or 0.0),
+                "funding_interval_hours": raw_fih if raw_fih > 0 else 0.0,
             }
         return tickers
 
@@ -332,6 +379,8 @@ class BybitClient:
             spec.volume_24h = t["volume_24h"]
             spec.funding_rate = t["funding_rate"]
             spec.open_interest = t["open_interest"]
+            if t.get("funding_interval_hours", 0.0) > 0:
+                spec.funding_interval_hours = t["funding_interval_hours"]
             if spec.min_order_usdt <= max_min_order_usdt:
                 eligible.append(spec)
 
@@ -352,6 +401,8 @@ class BybitClient:
                 spec.volume_24h = t.get("volume_24h", 0.0)
                 spec.funding_rate = t.get("funding_rate", 0.0)
                 spec.open_interest = t.get("open_interest", 0.0)
+                if t.get("funding_interval_hours", 0.0) > 0:
+                    spec.funding_interval_hours = t["funding_interval_hours"]
                 out[sym] = spec
         return out
 
@@ -608,7 +659,21 @@ class BybitClient:
             raise RuntimeError(
                 "Private Bybit client unavailable. Configure BYBIT_API_KEY and BYBIT_API_SECRET in .env."
             )
+        tid = threading.get_ident()
+        if tid == self._owner_tid:
+            return self._private_client
+        if self._auto_private_client and self.has_credentials and PybitHTTP is not None:
+            with self._session_lock:
+                cli = self._thread_private_clients.get(tid)
+                if cli is None:
+                    cli = self._build_private_http()
+                    self._thread_private_clients[tid] = cli
+                return cli
         return self._private_client
+
+    def ensure_thread_private_client(self) -> Any:
+        """Ensure the calling thread owns an initialized private pybit.HTTP session."""
+        return self._require_private()
 
     def get_wallet_balance(self, coin: str = "USDT") -> Dict[str, float]:
         client = self._require_private()
@@ -616,17 +681,25 @@ class BybitClient:
         if resp.get("retCode") != 0:
             raise RuntimeError(f"get_wallet_balance error: {resp}")
         acct = resp["result"]["list"][0]
-        equity = float(acct.get("totalEquity") or 0.0)
+        total_equity = float(acct.get("totalEquity") or 0.0)
+        wallet_balance = float(acct.get("totalWalletBalance") or total_equity)
         avail = float(acct.get("totalAvailableBalance") or 0.0)
         for c in acct.get("coin", []):
             if c.get("coin") == coin:
-                equity = float(c.get("equity") or c.get("walletBalance") or equity)
-                wb = float(c.get("walletBalance") or equity)
+                wb = float(c.get("walletBalance") or wallet_balance)
+                eq_coin = float(c.get("equity") or wb or total_equity)
+                wallet_balance = wb
+                total_equity = eq_coin
                 locked = float(c.get("totalOrderIM") or 0.0) + float(c.get("totalPositionIM") or 0.0)
                 c_avail = float(c.get("availableToWithdraw") or 0.0)
                 avail = c_avail if c_avail > 0 else (avail if avail > 0 else max(0.0, wb - locked))
                 break
-        return {"equity": equity, "available": avail}
+        return {
+            "wallet_balance": wallet_balance,
+            "total_equity": total_equity,
+            "equity": total_equity,
+            "available": avail,
+        }
 
     def set_leverage(self, symbol: str, leverage: int) -> None:
         client = self._require_private()
@@ -779,23 +852,49 @@ class BybitClient:
 
     def get_positions(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         client = self._require_private()
-        params: Dict[str, Any] = {"category": "linear", "settleCoin": "USDT", "limit": 50}
-        if symbol:
-            params["symbol"] = symbol
-        resp = client.get_positions(**params)
-        if resp.get("retCode") != 0:
-            raise RuntimeError(f"get_positions error: {resp}")
-        return [p for p in resp["result"].get("list", []) if float(p.get("size") or 0) > 0]
+        items: List[Dict[str, Any]] = []
+        cursor = ""
+        seen_cursors: set[str] = set()
+        for _ in range(50):
+            params: Dict[str, Any] = {"category": "linear", "settleCoin": "USDT", "limit": 50}
+            if symbol:
+                params["symbol"] = symbol
+            if cursor:
+                params["cursor"] = cursor
+            resp = client.get_positions(**params)
+            if resp.get("retCode") != 0:
+                raise RuntimeError(f"get_positions error: {resp}")
+            result = resp.get("result") or {}
+            items.extend(p for p in result.get("list", []) if float(p.get("size") or 0) > 0)
+            next_cursor = str(result.get("nextPageCursor") or "").strip()
+            if not next_cursor or next_cursor in seen_cursors:
+                break
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        return items
 
     def get_open_orders(self, symbol: Optional[str] = None) -> List[Dict[str, Any]]:
         client = self._require_private()
-        params: Dict[str, Any] = {"category": "linear", "settleCoin": "USDT", "limit": 50}
-        if symbol:
-            params["symbol"] = symbol
-        resp = client.get_open_orders(**params)
-        if resp.get("retCode") != 0:
-            raise RuntimeError(f"get_open_orders error: {resp}")
-        return resp["result"].get("list", [])
+        items: List[Dict[str, Any]] = []
+        cursor = ""
+        seen_cursors: set[str] = set()
+        for _ in range(50):
+            params: Dict[str, Any] = {"category": "linear", "settleCoin": "USDT", "limit": 50}
+            if symbol:
+                params["symbol"] = symbol
+            if cursor:
+                params["cursor"] = cursor
+            resp = client.get_open_orders(**params)
+            if resp.get("retCode") != 0:
+                raise RuntimeError(f"get_open_orders error: {resp}")
+            result = resp.get("result") or {}
+            items.extend(result.get("list", []))
+            next_cursor = str(result.get("nextPageCursor") or "").strip()
+            if not next_cursor or next_cursor in seen_cursors:
+                break
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        return items
 
     def get_order_status(self, symbol: str, order_id: str) -> Optional[Dict[str, Any]]:
         client = self._require_private()
@@ -809,18 +908,48 @@ class BybitClient:
 
     def get_closed_pnl(self, symbol: str, start_ms: int, limit: int = 50) -> List[Dict[str, Any]]:
         client = self._require_private()
-        resp = client.get_closed_pnl(category="linear", symbol=symbol, startTime=int(start_ms), limit=limit)
-        if resp.get("retCode") != 0:
-            raise RuntimeError(f"get_closed_pnl error: {resp}")
-        return resp["result"].get("list", [])
+        page_limit = min(max(int(limit), 1), 50)
+        items: List[Dict[str, Any]] = []
+        cursor = ""
+        seen_cursors: set[str] = set()
+        for _ in range(20):
+            params: Dict[str, Any] = {
+                "category": "linear",
+                "symbol": symbol,
+                "startTime": int(start_ms),
+                "limit": page_limit,
+            }
+            if cursor:
+                params["cursor"] = cursor
+            resp = client.get_closed_pnl(**params)
+            if resp.get("retCode") != 0:
+                raise RuntimeError(f"get_closed_pnl error: {resp}")
+            result = resp.get("result") or {}
+            items.extend(result.get("list", []))
+            next_cursor = str(result.get("nextPageCursor") or "").strip()
+            if not next_cursor or next_cursor in seen_cursors:
+                break
+            seen_cursors.add(next_cursor)
+            cursor = next_cursor
+        return items
 
-    def cancel_order(self, symbol: str, order_id: str) -> None:
+    def cancel_order(self, symbol: str, order_id: str) -> bool:
+        """Cancel an order; returns False only on Bybit 110001 (already filled/cancelled) and raises on other errors."""
         client = self._require_private()
         try:
-            client.cancel_order(category="linear", symbol=symbol, orderId=order_id)
+            resp = client.cancel_order(category="linear", symbol=symbol, orderId=order_id)
+            if isinstance(resp, dict) and resp.get("retCode", 0) != 0:
+                if int(resp.get("retCode", 0)) == 110001:
+                    logger.warning("cancel_order 110001 (order already filled/cancelled) for %s (%s)", symbol, order_id)
+                    return False
+                raise RuntimeError(f"cancel_order error for {symbol} ({order_id}): {resp}")
+            return True
         except Exception as exc:
-            if "110001" not in str(exc):  # 110001 = order not exists / already filled
-                logger.warning("cancel_order failed for %s (%s): %s", symbol, order_id, exc)
+            if "110001" in str(exc):  # 110001 = order not exists / already filled
+                logger.warning("cancel_order 110001 (order already filled/cancelled) for %s (%s): %s", symbol, order_id, exc)
+                return False
+            logger.warning("cancel_order failed for %s (%s): %s", symbol, order_id, exc)
+            raise
 
     def cancel_all_orders(self, symbol: str) -> None:
         client = self._require_private()

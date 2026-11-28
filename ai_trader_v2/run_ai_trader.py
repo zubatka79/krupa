@@ -23,8 +23,10 @@ import concurrent.futures
 import json
 import logging
 import os
+import shutil
 import signal
 import sys
+import tempfile
 import threading
 import time
 from datetime import datetime, timezone
@@ -82,7 +84,7 @@ def _get_thread_session() -> requests.Session:
     return sess
 
 
-def fetch_recent_klines(client: BybitClient, symbol: str, interval: str, limit: int = 300) -> pd.DataFrame:
+def fetch_recent_klines(client: BybitClient, symbol: str, interval: str, limit: int = 600) -> pd.DataFrame:
     """Thread-safe single-request fetch of the latest `limit` klines (forming bar stripped downstream)."""
     url = f"{client.public_base_url}/v5/market/kline"
     params = {"category": "linear", "symbol": symbol, "interval": str(interval), "limit": int(limit)}
@@ -145,7 +147,16 @@ class VikaRunner:
             cache_dir=ROOT / cfg.get("cache_dir", "data/ai_trader_v2/cache"),
             public_mainnet=True,
         )
-        self.journal = VikaJournal(ROOT / cfg.get("db_path", "data/ai_trader_v2/vika_trades.db"))
+        live_db_path = ROOT / cfg.get("db_path", "data/ai_trader_v2/vika_trades.db")
+        self._dry_tmp_dir: Optional[tempfile.TemporaryDirectory[str]] = None
+        if dry_run_override:
+            self._dry_tmp_dir = tempfile.TemporaryDirectory(prefix="vika_drycheck_")
+            db_for_run = Path(self._dry_tmp_dir.name) / "vika_drycheck.db"
+            if live_db_path.exists():
+                shutil.copy2(live_db_path, db_for_run)
+            self.journal = VikaJournal(db_for_run)
+        else:
+            self.journal = VikaJournal(live_db_path)
 
         self._evals_lock = threading.Lock()
         self._latest_long_evals: Dict[str, LongCoinEvaluation] = {}
@@ -268,9 +279,10 @@ class VikaRunner:
         now_ms = int(time.time() * 1000)
 
         # 1. BTC 4H V1 + strictly closed previous-UTC-day 1D EMA20 & 1D ATR(14)
-        df_btc_4h = fetch_recent_klines(self.client, "BTCUSDT", "240", limit=240)
+        df_btc_4h = fetch_recent_klines(self.client, "BTCUSDT", "240", limit=600)
         btc_regime = evaluate_btc_l2_regime(df_btc_4h, now_ms, storm_atr_pct=self.storm_atr_thresh)
-        self.executor.last_btc_regime = btc_regime
+        with self.executor._lock:
+            self.executor.last_btc_regime = btc_regime
         btc_4h_compat = BtcRegimeState(
             bar_ts_4h=btc_regime.bar_ts_4h,
             close_4h=btc_regime.close_4h,
@@ -303,10 +315,15 @@ class VikaRunner:
 
         def _eval_symbol(sym: str) -> Tuple[str, Optional[Any], Optional[CoinEvaluation]]:
             try:
-                df15 = fetch_recent_klines(self.client, sym, "15", limit=320)
+                df15 = fetch_recent_klines(self.client, sym, "15", limit=600)
                 df1h = fetch_recent_klines(self.client, sym, "60", limit=240)
-                df4h = fetch_recent_klines(self.client, sym, "240", limit=240)
-                fr = float(tickers.get(sym, {}).get("funding_rate", 0.0))
+                df4h = fetch_recent_klines(self.client, sym, "240", limit=600)
+                t_info = tickers.get(sym, {})
+                fr = float(t_info.get("funding_rate", 0.0))
+                fi_h_raw = float(t_info.get("funding_interval_hours") or 0.0)
+                if fi_h_raw <= 0 and sym in self.executor.specs:
+                    fi_h_raw = float(getattr(self.executor.specs[sym], "funding_interval_hours", 0.0) or 0.0)
+                fi_hours: Optional[float] = fi_h_raw if fi_h_raw > 0 else None
                 ls_snap = fetch_retail_ls_snapshot(self.client, sym, now_ms) if ls_enabled else None
                 ls_z = ls_snap.z_score if (ls_snap is not None and ls_snap.available) else None
 
@@ -327,6 +344,7 @@ class VikaRunner:
                             retail_ls_z=ls_z,
                             btc_allow_long=btc_regime.allow_long,
                             btc_allow_short=False,
+                            funding_interval_hours=fi_hours,
                         )
                     else:
                         ev_l = evaluate_long_coin(
@@ -355,6 +373,7 @@ class VikaRunner:
                         retail_ls_z=ls_z,
                         btc_allow_short=btc_regime.allow_short,
                         btc_allow_long=False,
+                        funding_interval_hours=fi_hours,
                     )
                 return sym, ev_l, ev_s
             except Exception as exc:
@@ -384,53 +403,59 @@ class VikaRunner:
     # --dry-run-check Mode
     # ------------------------------------------------------------------
     def run_dry_run_check(self) -> int:
-        logger.info("=== VIKA HYBRID DRY-RUN CHECK (mode=%s, dry_run=%s) ===", self.mode, self.executor.dry_run)
-        n_total = len(self.executor.coin_cfg_map)
-        specs = self.executor.load_instruments()
-        lev_status = self.executor.ensure_margin_and_leverage()
-        eq, avail = self.executor.refresh_balance()
-        macro_st = self.executor.check_macro_calendar(notify_events=False)
-        btc_regime, long_evals, short_evals = self.scan_all_coins()
+        try:
+            logger.info("=== VIKA HYBRID DRY-RUN CHECK (mode=%s, dry_run=%s) ===", self.mode, self.executor.dry_run)
+            n_total = len(self.executor.coin_cfg_map)
+            specs = self.executor.load_instruments()
+            lev_status = self.executor.ensure_margin_and_leverage()
+            eq, avail = self.executor.refresh_balance()
+            macro_st = self.executor.check_macro_calendar(notify_events=False)
+            btc_regime, long_evals, short_evals = self.scan_all_coins()
 
-        print("\n" + "=" * 124)
-        print(
-            f"VIKA HYBRID | {btc_regime.mode_label} | Wallet=${eq:,.2f} (avail=${avail:,.2f}) | "
-            f"15x Isolated 5x12% Cap=${self.executor.max_margin_usd:,.0f}/${self.executor.storm_max_margin_usd:,.0f}"
-        )
-        print(f"Macro Calendar: {macro_st.short_label if macro_st else 'disabled'} (horizon={macro_st.horizon_days if macro_st else 0:.1f}d)")
-        print("-" * 124)
-        print(f"{'SIDE':<6} {'SYMBOL':<13} {'KEY':<20} {'CLOSE':>10} {'LEG1_QTY':>12} {'LS_Z':>7} {'RAW':<6} {'FINAL':<6} {'BLOCK'}")
-        print("-" * 124)
+            print("\n" + "=" * 124)
+            print(
+                f"VIKA HYBRID | {btc_regime.mode_label} | Wallet=${eq:,.2f} (avail=${avail:,.2f}) | "
+                f"15x Isolated 5x12% Cap=${self.executor.max_margin_usd:,.0f}/${self.executor.storm_max_margin_usd:,.0f}"
+            )
+            print(f"Macro Calendar: {macro_st.short_label if macro_st else 'disabled'} (horizon={macro_st.horizon_days if macro_st else 0:.1f}d)")
+            print("-" * 124)
+            print(f"{'SIDE':<6} {'SYMBOL':<13} {'KEY':<20} {'CLOSE':>10} {'LEG1_QTY':>12} {'LS_Z':>7} {'RAW':<6} {'FINAL':<6} {'BLOCK'}")
+            print("-" * 124)
 
-        all_ok = (len(long_evals) == len(self.long_coins)) and (len(short_evals) == len(self.short_coins))
-        eff_cap = self.executor.storm_max_margin_usd if btc_regime.in_storm else self.executor.max_margin_usd
-        s_mult = self.executor.storm_size_mult if btc_regime.in_storm else 1.0
-        leg1_frac = self.executor.storm_leg1_pct if btc_regime.in_storm else self.executor.dca_leg1_pct
-        m1 = min(eq * self.executor.margin_pct * s_mult, eff_cap) * leg1_frac
+            all_ok = (len(long_evals) == len(self.long_coins)) and (len(short_evals) == len(self.short_coins))
+            eff_cap = self.executor.storm_max_margin_usd if btc_regime.in_storm else self.executor.max_margin_usd
+            s_mult = self.executor.storm_size_mult if btc_regime.in_storm else 1.0
+            leg1_frac = self.executor.storm_leg1_pct if btc_regime.in_storm else self.executor.dca_leg1_pct
+            wb_size = self.executor.last_wallet_balance
+            m1 = min(wb_size * self.executor.margin_pct * s_mult, eff_cap) * leg1_frac
 
-        for side_lbl, clist, evmap in (("LONG", self.long_coins, long_evals), ("SHORT", self.short_coins, short_evals)):
-            for c in clist:
-                sym = c["symbol"]
-                ev = evmap.get(sym)
-                if ev is None:
-                    print(f"{side_lbl:<6} {sym:<13} ERROR")
-                    all_ok = False
-                    continue
-                spec = specs[sym]
-                px = round_tick(float(ev.close_price), spec.tick_size)
-                qty1 = round_step_down((m1 * self.executor.leverage) / px, spec.qty_step)
-                ls_s = f"{ev.retail_ls_z:+.2f}" if ev.retail_ls_available else "n/a"
-                print(
-                    f"{side_lbl:<6} {sym:<13} {ev.key:<20} {px:>10.5g} {qty1:>12.6g} {ls_s:>7} "
-                    f"{(ev.raw_signal or '-'):<6} {(ev.final_signal or '-'):<6} {ev.block_reason or '-'}"
-                )
-        print("=" * 124)
-        ok_lev = sum(1 for v in lev_status.values() if v.startswith("OK") or v.startswith("DRY_RUN"))
-        print(
-            f"Summary: instruments={len(specs)}/{n_total} | lev_15x={ok_lev}/{n_total} | "
-            f"LONG={len(long_evals)}/{len(self.long_coins)} | SHORT={len(short_evals)}/{len(self.short_coins)}"
-        )
-        return 0 if (all_ok and ok_lev == n_total) else 1
+            for side_lbl, clist, evmap in (("LONG", self.long_coins, long_evals), ("SHORT", self.short_coins, short_evals)):
+                for c in clist:
+                    sym = c["symbol"]
+                    ev = evmap.get(sym)
+                    if ev is None:
+                        print(f"{side_lbl:<6} {sym:<13} ERROR")
+                        all_ok = False
+                        continue
+                    spec = specs[sym]
+                    px = round_tick(float(ev.close_price), spec.tick_size)
+                    qty1 = round_step_down((m1 * self.executor.leverage) / px, spec.qty_step)
+                    ls_s = f"{ev.retail_ls_z:+.2f}" if ev.retail_ls_available else "n/a"
+                    print(
+                        f"{side_lbl:<6} {sym:<13} {ev.key:<20} {px:>10.5g} {qty1:>12.6g} {ls_s:>7} "
+                        f"{(ev.raw_signal or '-'):<6} {(ev.final_signal or '-'):<6} {ev.block_reason or '-'}"
+                    )
+            print("=" * 124)
+            ok_lev = sum(1 for v in lev_status.values() if v.startswith("OK") or v.startswith("DRY_RUN"))
+            print(
+                f"Summary: instruments={len(specs)}/{n_total} | lev_15x={ok_lev}/{n_total} | "
+                f"LONG={len(long_evals)}/{len(self.long_coins)} | SHORT={len(short_evals)}/{len(self.short_coins)}"
+            )
+            return 0 if (all_ok and ok_lev == n_total) else 1
+        finally:
+            if self._dry_tmp_dir is not None:
+                self._dry_tmp_dir.cleanup()
+                self._dry_tmp_dir = None
 
     # ------------------------------------------------------------------
     # Main Production Loop
@@ -528,6 +553,11 @@ class VikaRunner:
 
     def stop(self) -> None:
         self._stop_evt.set()
+
+    def close(self) -> None:
+        if getattr(self, "_dry_tmp_dir", None) is not None:
+            self._dry_tmp_dir.cleanup()
+            self._dry_tmp_dir = None
 
 
 def parse_args() -> argparse.Namespace:
