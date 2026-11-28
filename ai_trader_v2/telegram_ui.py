@@ -31,7 +31,7 @@ from ai_trader_v2_long.long_engine import LONG_KEY_SHORT_NAMES, LongCoinEvaluati
 
 logger = logging.getLogger("vika.telegram")
 
-BTN_STATUS = "📊 Статус L2_news"
+BTN_STATUS = "📊 Статус Vika Hybrid"
 BTN_POSITIONS = "📈 Позиции и DCA"
 BTN_MACRO = "🌐 Макро и Паузы"
 BTN_PORTFOLIO_PREFIX = "🪙 Портфель"
@@ -100,7 +100,7 @@ class VikaTelegramUI:
             "is_persistent": True,
         }
         self.bot_commands: List[Dict[str, str]] = [
-            {"command": "status", "description": "L2_news — баланс, 15x, 5×12%, резерв <=85%, BTC и макро"},
+            {"command": "status", "description": "Vika Hybrid — баланс, 15x, 5×12%, резерв <=85%, BTC и макро"},
             {"command": "positions", "description": "Открытые позиции, статус 2-й ноги DCA и BE +0.30%"},
             {"command": "macro", "description": "Макроокно FOMC/CPI/NFP, паузы AC 6ч и Probation"},
             {"command": "portfolio", "description": f"Пул All-Thick-18 ({self.n_long}L+{self.n_short}S) и Retail L/S"},
@@ -231,7 +231,7 @@ class VikaTelegramUI:
         res_icon = "🔴" if snap["reserve_pct"] >= 78.0 else ("🟡" if snap["reserve_pct"] >= 60.0 else "🟢")
 
         lines = [
-            f"📊 <b>СТАТУС L2_news | Bybit {self.executor.mode.upper()}</b>",
+            f"📊 <b>СТАТУС Vika Hybrid | Bybit {self.executor.mode.upper()}</b>",
             f"Состояние: <b>{run_state}</b> | Плечо: <code>{self.executor.leverage}x {self.executor.margin_mode}</code>",
             f"Режим BTC: {btc_line}",
             f"Макроокно [-60m..+45m]: {macro_line}",
@@ -260,7 +260,7 @@ class VikaTelegramUI:
         active = self.journal.get_active_positions()
         snap = self.executor.get_margin_reserve_snapshot()
         header = (
-            f"📈 <b>ПОЗИЦИИ И DCA | L2_news</b>\n"
+            f"📈 <b>ПОЗИЦИИ И DCA | Vika Hybrid</b>\n"
             f"🟢 LONG: <b>{snap['open_long']}/{self.executor.max_same_dir}</b> | 🔴 SHORT: <b>{snap['open_short']}/{self.executor.max_same_dir}</b> | "
             f"Резерв: <b>{snap['reserve_pct']:.1f}% / {snap['limit_pct']:.0f}%</b>"
         )
@@ -295,7 +295,7 @@ class VikaTelegramUI:
     def format_macro_and_pauses(self) -> str:
         now_ms = int(time.time() * 1000)
         macro_st = self.get_macro_status()
-        lines = ["🌐 <b>МАКРОКАЛЕНДАРЬ И ПАУЗЫ | L2_news</b>"]
+        lines = ["🌐 <b>МАКРОКАЛЕНДАРЬ И ПАУЗЫ | Vika Hybrid</b>"]
         if macro_st is None:
             lines.append("Календарь: <code>отключён</code>")
         else:
@@ -364,8 +364,8 @@ class VikaTelegramUI:
     def format_history(self) -> str:
         closed = self.journal.get_recent_closed(limit=10)
         if not closed:
-            return "📜 <b>ИСТОРИЯ СДЕЛОК | L2_news</b>\nЗакрытых сделок пока нет."
-        lines = ["📜 <b>ПОСЛЕДНИЕ 10 СДЕЛОК | L2_news</b>"]
+            return "📜 <b>ИСТОРИЯ СДЕЛОК | Vika Hybrid</b>\nЗакрытых сделок пока нет."
+        lines = ["📜 <b>ПОСЛЕДНИЕ 10 СДЕЛОК | Vika Hybrid</b>"]
         for r in closed:
             pnl = float(r.get("pnl_usd") or 0.0)
             pct = float(r.get("pnl_pct") or 0.0)
@@ -389,7 +389,7 @@ class VikaTelegramUI:
         ok_cnt = sum(1 for v in lev_status.values() if v.startswith("OK") or v.startswith("DRY_RUN"))
 
         lines = [
-            f"🤖 <b>ЗАПУСК: L2_news Hybrid (All-Thick-18)</b>",
+            f"🤖 <b>ЗАПУСК: Vika Hybrid (All-Thick-18)</b>",
             f"Биржа: <code>Bybit {self.executor.mode.upper()} | {self.executor.leverage}x {self.executor.margin_mode} ({ok_cnt}/{n_uniq})</code>",
             f"Пул: <b>{self.n_long} LONG + {self.n_short} SHORT</b> | Retail L/S: <code>|z| &lt; 1.0</code>",
             f"Риск: <b>5×12%</b> | Кап <code>${self.executor.max_margin_usd:,.0f}</code> (шторм <code>${self.executor.storm_max_margin_usd:,.0f}</code>) | Резерв <code>≤{self.executor.max_total_margin_pct*100:.0f}%</code>",
@@ -458,9 +458,9 @@ class VikaTelegramUI:
             if cdata == "panic_confirm":
                 self.send_message(self.executor.panic_close_all(), chat_id=cid)
             elif cdata == "panic_cancel":
-                self.send_message("❌ Panic Close отменён. L2_news продолжает работу.", chat_id=cid)
+                self.send_message("❌ Panic Close отменён. Vika Hybrid продолжает работу.", chat_id=cid)
             else:
-                self.send_message("🔄 Интерфейс обновлён до <b>L2_news</b>.\n\n" + self.format_status(), chat_id=cid)
+                self.send_message("🔄 Интерфейс обновлён до <b>Vika Hybrid</b>.\n\n" + self.format_status(), chat_id=cid)
             return
 
         msg = upd.get("message")
@@ -492,11 +492,11 @@ class VikaTelegramUI:
             self.journal.set_paused(new_state)
             if new_state:
                 self.send_message(
-                    "⏸ <b>L2_news ПОСТАВЛЕН НА ПАУЗУ</b>\nНовые входы отключены. Защитные SL/TP и BE на открытых позициях работают.",
+                    "⏸ <b>Vika Hybrid ПОСТАВЛЕН НА ПАУЗУ</b>\nНовые входы отключены. Защитные SL/TP и BE на открытых позициях работают.",
                     chat_id=cid,
                 )
             else:
-                self.send_message("▶️ <b>L2_news ВОЗОБНОВИЛ РАБОТУ</b>\nПоиск входов активен.", chat_id=cid)
+                self.send_message("▶️ <b>Vika Hybrid ВОЗОБНОВИЛ РАБОТУ</b>\nПоиск входов активен.", chat_id=cid)
         elif text == BTN_PANIC or cmd == "/panic" or "panic" in low or "закрыть всё" in low:
             confirm_kb = {
                 "inline_keyboard": [[
@@ -505,7 +505,7 @@ class VikaTelegramUI:
                 ]]
             }
             self.send_message(
-                "🛑 <b>ПОДТВЕРЖДЕНИЕ PANIC CLOSE | L2_news</b>\n"
+                "🛑 <b>ПОДТВЕРЖДЕНИЕ PANIC CLOSE | Vika Hybrid</b>\n"
                 "Закрыть ВСЕ позиции по рынку, отменить все DCA/TP ордера и поставить бота на паузу?",
                 reply_markup=confirm_kb,
                 chat_id=cid,

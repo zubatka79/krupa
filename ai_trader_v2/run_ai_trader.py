@@ -277,7 +277,7 @@ class VikaRunner:
                     short_evals[sym] = ev_s
 
         logger.info(
-            "Scanned L2_news pool (%dL / %dS, %d unique) in %.2fs | %s",
+            "Scanned Vika Hybrid pool (%dL / %dS, %d unique) in %.2fs | %s",
             len(long_evals), len(short_evals), len(unique_syms), time.monotonic() - t0, btc_regime.mode_label,
         )
         with self._evals_lock:
@@ -290,7 +290,7 @@ class VikaRunner:
     # --dry-run-check Mode
     # ------------------------------------------------------------------
     def run_dry_run_check(self) -> int:
-        logger.info("=== L2_NEWS DRY-RUN CHECK (mode=%s, dry_run=%s) ===", self.mode, self.executor.dry_run)
+        logger.info("=== VIKA HYBRID DRY-RUN CHECK (mode=%s, dry_run=%s) ===", self.mode, self.executor.dry_run)
         n_total = len(self.executor.coin_cfg_map)
         specs = self.executor.load_instruments()
         lev_status = self.executor.ensure_margin_and_leverage()
@@ -300,7 +300,7 @@ class VikaRunner:
 
         print("\n" + "=" * 124)
         print(
-            f"L2_NEWS HYBRID | {btc_regime.mode_label} | Wallet=${eq:,.2f} (avail=${avail:,.2f}) | "
+            f"VIKA HYBRID | {btc_regime.mode_label} | Wallet=${eq:,.2f} (avail=${avail:,.2f}) | "
             f"15x Isolated 5x12% Cap=${self.executor.max_margin_usd:,.0f}/${self.executor.storm_max_margin_usd:,.0f}"
         )
         print(f"Macro Calendar: {macro_st.short_label if macro_st else 'disabled'} (horizon={macro_st.horizon_days if macro_st else 0:.1f}d)")
@@ -342,7 +342,7 @@ class VikaRunner:
     # Main Production Loop
     # ------------------------------------------------------------------
     def run_forever(self) -> None:
-        logger.info("Starting L2_NEWS runner (mode=%s, dry_run=%s, version=%s)", self.mode, self.executor.dry_run, self.version)
+        logger.info("Starting Vika Hybrid runner (mode=%s, dry_run=%s, version=%s)", self.mode, self.executor.dry_run, self.version)
         self.executor.load_instruments()
         lev_status = self.executor.ensure_margin_and_leverage()
         self.executor.cleanup_stale_entry_orders()
@@ -351,7 +351,7 @@ class VikaRunner:
 
         btc_regime, l_evals, s_evals = self.scan_all_coins()
         self.executor.check_macro_calendar(notify_events=False)
-        logger.info("Initial L2_news scan complete: %dL/%dS | %s", len(l_evals), len(s_evals), btc_regime.mode_label)
+        logger.info("Initial Vika Hybrid scan complete: %dL/%dS | %s", len(l_evals), len(s_evals), btc_regime.mode_label)
 
         if self.tg is not None:
             self.tg.register_commands()
@@ -368,7 +368,7 @@ class VikaRunner:
         stall_guard = StallGuard(
             float(self.cfg.get("stall_restart_sec", 600)),
             on_stall=lambda age: send_telegram_plain(
-                f"🚨 L2_news завис: цикл стоит {age / 60:.0f} мин. Перезапускаю (версия {self.version})."
+                f"🚨 Vika Hybrid завис: цикл стоит {age / 60:.0f} мин. Перезапускаю (версия {self.version})."
             ),
         )
         stall_guard.start()
@@ -391,7 +391,7 @@ class VikaRunner:
             if cur_bucket > last_scanned_bucket and ms_into_bar >= 2500:
                 last_scanned_bucket = cur_bucket
                 bar_dt = datetime.fromtimestamp((cur_bucket * M15_MS) / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-                logger.info("--- Closed 15m L2_news scan @ %s ---", bar_dt)
+                logger.info("--- Closed 15m Vika Hybrid scan @ %s ---", bar_dt)
                 try:
                     self.executor.sync_with_exchange()
                     btc_regime, long_evals, short_evals = self.scan_all_coins()
@@ -421,7 +421,7 @@ class VikaRunner:
                         except Exception as exc:
                             logger.error("Failed opening %s %s: %s", ev.symbol, ev.final_signal, exc)
                 except Exception as exc:
-                    logger.error("15m L2_news scan error: %s", exc)
+                    logger.error("15m Vika Hybrid scan error: %s", exc)
                     self.client.reset_sessions()
 
             self._stop_evt.wait(timeout=1.0)
@@ -429,14 +429,14 @@ class VikaRunner:
         stall_guard.stop()
         if self.tg is not None:
             self.tg.stop()
-        logger.info("L2_NEWS runner stopped cleanly.")
+        logger.info("Vika Hybrid runner stopped cleanly.")
 
     def stop(self) -> None:
         self._stop_evt.set()
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="L2_news Hybrid Bybit Autonomous Trader (15x, 5x12%, All-Thick-18)")
+    p = argparse.ArgumentParser(description="Vika Hybrid Bybit Autonomous Trader (15x, 5x12%, All-Thick-18)")
     p.add_argument("--config", default="ai_trader_v2/config_ai_trader.json", help="Path to JSON config")
     mode_grp = p.add_mutually_exclusive_group()
     mode_grp.add_argument("--demo", action="store_true", help="Run on Bybit Demo Trading")
@@ -479,7 +479,7 @@ def main() -> int:
     runner.run_state = run_state
 
     def _sig_handler(signum: int, frame: Any) -> None:
-        logger.info("Received signal %s, stopping L2_news...", signum)
+        logger.info("Received signal %s, stopping Vika Hybrid...", signum)
         runner.stop()
 
     signal.signal(signal.SIGINT, _sig_handler)

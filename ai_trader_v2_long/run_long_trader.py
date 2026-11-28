@@ -188,7 +188,7 @@ class VikaLongRunner:
                 if ev is not None:
                     evals[sym] = ev
 
-        logger.info("Scanned %d/%d L2_NEWS_LONG coins in %.2fs | %s", len(evals), len(self.cfg["coins"]), time.monotonic() - t0, btc_regime.mode_label)
+        logger.info("Scanned %d/%d Vika Hybrid LONG coins in %.2fs | %s", len(evals), len(self.cfg["coins"]), time.monotonic() - t0, btc_regime.mode_label)
         with self._lock:
             self._latest_btc = btc_regime
             self._latest_evals = evals
@@ -202,11 +202,11 @@ class VikaLongRunner:
         btc_regime, evals = self.scan_all_coins()
         all_ok = len(evals) == n_coins
         ok_lev = sum(1 for v in lev_status.values() if v.startswith("OK") or v.startswith("DRY_RUN"))
-        print(f"L2_NEWS_LONG | {btc_regime.mode_label} | Wallet=${eq:,.2f} (avail=${avail:,.2f}) | specs={len(specs)}/{n_coins} lev15x={ok_lev}/{n_coins}")
+        print(f"Vika Hybrid LONG | {btc_regime.mode_label} | Wallet=${eq:,.2f} (avail=${avail:,.2f}) | specs={len(specs)}/{n_coins} lev15x={ok_lev}/{n_coins}")
         return 0 if (all_ok and ok_lev == n_coins) else 1
 
     def run_forever(self) -> None:
-        logger.info("Starting L2_NEWS_LONG runner (mode=%s, dry_run=%s, version=%s)", self.mode, self.executor.dry_run, self.version)
+        logger.info("Starting Vika Hybrid LONG runner (mode=%s, dry_run=%s, version=%s)", self.mode, self.executor.dry_run, self.version)
         self.executor.load_instruments()
         lev_status = self.executor.ensure_margin_and_leverage()
         self.executor.cleanup_stale_entry_orders()

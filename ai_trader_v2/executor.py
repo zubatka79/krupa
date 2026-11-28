@@ -89,7 +89,7 @@ class VikaExecutor:
         self.notify = notifier or (lambda msg: None)
         self.macro_guard = macro_guard
 
-        self.strategy_name = str(cfg.get("strategy_name", "L2_NEWS_HYBRID"))
+        self.strategy_name = str(cfg.get("strategy_name", "Vika Hybrid"))
         self.mode = str(cfg.get("mode", "demo")).lower()
         self.dry_run = bool(cfg.get("dry_run", False)) or (self.mode == "paper")
         self.allowed_directions = str(cfg.get("allowed_directions", "long_short")).strip().lower()
@@ -728,7 +728,7 @@ class VikaExecutor:
         )
         ls_txt = f"{getattr(ev, 'retail_ls_z', 0.0):+.2f}" if getattr(ev, "retail_ls_available", False) else "n/a"
         msg = (
-            f"🚀 <b>ВХОД L2_news{mode_tag}{storm_tag} | {sym} {badge}</b>\n"
+            f"🚀 <b>ВХОД Vika Hybrid{mode_tag}{storm_tag} | {sym} {badge}</b>\n"
             f"Ключ: <code>{ev.key}</code> | {side}: <b>{same_dir_cnt + 1}/{self.max_same_dir}</b> | Всего: <b>{len(active) + 1}/{self.max_open}</b>\n"
             f"1-я нога ({int(round(leg1_frac*100))}% Market): <code>{entry_price}</code> (qty <code>{fill_qty}</code>)\n"
             f"{dca_line}\n"
@@ -739,7 +739,7 @@ class VikaExecutor:
             f"Фильтры: Retail L/S z=<code>{ls_txt}</code> | RVOL=<code>{getattr(ev, 'rvol', 0.0):.2f}</code> | FR=<code>{getattr(ev, 'funding_bps', 0.0):+.2f}bps</code>"
         )
         logger.info(
-            "Opened L2_news %s %s (%s) id=%s leg1=%s@%s dca=%s@%s sl=%s tp=%s res=$%.1f (%.1f%%)",
+            "Opened Vika Hybrid %s %s (%s) id=%s leg1=%s@%s dca=%s@%s sl=%s tp=%s res=$%.1f (%.1f%%)",
             sym, side, ev.key, pos_id, fill_qty, entry_price, dca_qty, dca_px, sl_price, tp_price,
             reserved_total, snap_after["reserve_pct"],
         )

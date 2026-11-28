@@ -315,8 +315,9 @@ def test_3_executor_dca_be_hard_sl_antisalvo_and_telegram() -> None:
 
         for txt in (welcome, status, positions, macro_v, portfolio, history):
             assert len(txt) < 4096, f"Telegram message > 4096 chars: {len(txt)}"
-            assert "10x Cross" not in txt and "Vika N2N7" not in txt, f"Legacy text leaked: {txt[:120]}"
+            assert "10x Cross" not in txt and "Vika N2N7" not in txt and "L2_news" not in txt, f"Legacy/old text leaked: {txt[:120]}"
 
+        assert "Vika Hybrid" in welcome and "Vika Hybrid" in status
         assert "15x ISOLATED" in status and "5×12%" in status and "Резерв Bybit" in status
         assert "FOMC" in macro_v and "CPI" in macro_v and "NFP" in macro_v and "AC 6ч" in macro_v
         assert "All-Thick-18 (18L + 18S)" in portfolio
@@ -329,7 +330,7 @@ def test_3_executor_dca_be_hard_sl_antisalvo_and_telegram() -> None:
         tg.send_message = lambda text, reply_markup=None, parse_mode="HTML", chat_id=None: (routed.append(text) or True)  # type: ignore[method-assign]
         for txt in (BTN_STATUS, BTN_POSITIONS, BTN_MACRO, tg.btn_portfolio, BTN_HISTORY, BTN_TOGGLE_PAUSE, BTN_TOGGLE_PAUSE, BTN_PANIC):
             tg._handle_update({"message": {"chat": {"id": 12345}, "from": {"id": 12345}, "text": txt}})
-        assert len(routed) == 8 and "ПОДТВЕРЖДЕНИЕ PANIC CLOSE" in routed[-1]
+        assert len(routed) == 8 and "ПОДТВЕРЖДЕНИЕ PANIC CLOSE | Vika Hybrid" in routed[-1]
         tg._handle_update({"callback_query": {"id": "cb1", "data": "panic_confirm", "from": {"id": 12345}, "message": {"chat": {"id": 12345}}}})
         assert "PANIC CLOSE ВЫПОЛНЕН" in routed[-1] and journal.is_paused() is True
 
@@ -337,7 +338,7 @@ def test_3_executor_dca_be_hard_sl_antisalvo_and_telegram() -> None:
         cfg_l = json.loads((ROOT / "ai_trader_v2_long" / "config_long_trader.json").read_text(encoding="utf-8"))
         ex_l = VikaLongExecutor(cfg_l, mock, journal, macro_guard=guard)
         tg_l = VikaLongTelegramUI(cfg_l, ex_l, journal, get_latest_evals=lambda: {}, get_btc_regime=lambda: ex.last_btc_regime)
-        assert "L2_news" in tg_l.format_status()
+        assert "Vika Hybrid" in tg_l.format_status()
 
     print("[PASS] 3. Executor L2_news (15x, DCA, BE+0.30%+cancel, HardSL vs BE, AntiSalvo) & Rebuilt Telegram UI")
 

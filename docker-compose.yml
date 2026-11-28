@@ -1,7 +1,8 @@
 services:
-  ai-trader-v2:
+  vika-hybrid:
     build: .
     image: krupa-bot:latest
+    container_name: vika-hybrid
     restart: unless-stopped
     init: true
     stop_grace_period: 30s
