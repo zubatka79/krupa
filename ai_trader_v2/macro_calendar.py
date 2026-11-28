@@ -51,7 +51,7 @@ class MacroCalendarStatus:
             return f"🚫 ПАУЗА [{self.active_event.event_type}] до {end_s}"
         if self.next_event is not None:
             dt_s = self.next_event.dt_utc.strftime("%d.%m %H:%M UTC")
-            warn = " ⚠️ горизонт <3д!" if self.horizon_warning else ""
+            warn = " ⚠️ горизонт &lt;3д!" if self.horizon_warning else ""
             return f"🟢 Открыто | След.: {self.next_event.event_type} {dt_s}{warn}"
         return "⚠️ Нет будущих событий (обнови календарь!)"
 

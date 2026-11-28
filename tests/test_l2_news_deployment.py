@@ -333,6 +333,9 @@ def test_3_executor_dca_be_hard_sl_antisalvo_and_telegram() -> None:
         for txt in (welcome, status, positions, macro_v, portfolio, history):
             assert len(txt) < 4096, f"Telegram message > 4096 chars: {len(txt)}"
             assert "10x Cross" not in txt and "Vika N2N7" not in txt and "L2_news" not in txt, f"Legacy/old text leaked: {txt[:120]}"
+            # Verify NO unescaped '<' outside valid Telegram HTML tags (<b>, <i>, <code>, </b>, </i>, </code>)
+            cleaned_html = re.sub(r"</?(?:b|i|code|pre|u|s)>", "", txt)
+            assert "<" not in cleaned_html and ">" not in cleaned_html, f"Unescaped HTML bracket in Telegram msg: {cleaned_html}"
 
         assert "Vika Hybrid" in welcome and "Vika Hybrid" in status
         assert "15x ISOLATED" in status and "5×12%" in status and "Резерв Bybit" in status

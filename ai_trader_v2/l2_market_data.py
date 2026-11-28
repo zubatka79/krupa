@@ -67,11 +67,11 @@ class BtcL2Regime:
 
     @property
     def mode_label(self) -> str:
-        storm_tag = f" ⚡ ШТОРМ (1D ATR {self.atr1d_pct:.2f}% > 4%)" if self.in_storm else f" (1D ATR {self.atr1d_pct:.2f}%)"
+        storm_tag = f" ⚡ ШТОРМ (1D ATR {self.atr1d_pct:.2f}% &gt; 4%)" if self.in_storm else f" (1D ATR {self.atr1d_pct:.2f}%)"
         if self.allow_long:
-            return f"🟢 LONG-РЕЖИМ (BTC 4H UP + 1D > EMA20){storm_tag}"
+            return f"🟢 LONG-РЕЖИМ (BTC 4H UP + 1D &gt; EMA20){storm_tag}"
         if self.allow_short:
-            return f"🔴 SHORT-РЕЖИМ (BTC 4H DN + 1D < EMA20){storm_tag}"
+            return f"🔴 SHORT-РЕЖИМ (BTC 4H DN + 1D &lt; EMA20){storm_tag}"
         return f"⚪ НЕЙТРАЛ / СПИМ (4H={('UP' if self.v1_long else ('DN' if self.v1_short else 'FLAT'))}, 1D={('UP' if self.d1_dir == 1 else 'DN')}){storm_tag}"
 
 

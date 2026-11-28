@@ -178,6 +178,13 @@ class VikaTelegramUI:
             data = r.json()
             if not data.get("ok"):
                 logger.warning("Telegram sendMessage failed (chat=%s): %s", target_chat, data)
+                if parse_mode == "HTML" and r.status_code == 400:
+                    # Fallback to plain text if any dynamic string had unexpected HTML characters
+                    plain_payload = dict(payload)
+                    plain_payload.pop("parse_mode", None)
+                    r2 = self._send_session.post(f"{self.api_base}/sendMessage", json=plain_payload, timeout=15)
+                    if r2.json().get("ok"):
+                        return True
                 return False
             return True
         except Exception as exc:
