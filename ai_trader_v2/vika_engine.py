@@ -29,9 +29,16 @@ KEY_SHORT_NAMES: Dict[str, str] = {
     "K6_VWAP_RECLAIM": "K6 (VWAP Reclaim)",
     "K7_SFP_LIQ_SWEEP": "K7 (SFP Sweep)",
     "K8_SUPERTREND_BO": "K8 (Supertrend BO)",
+    "K1_EMA_TREND_PB_L": "K1L (EMA Pullback)",
+    "K3_MACD_STOCH_L": "K3L (MACD+Stoch)",
+    "K6_VWAP_RECLAIM_L": "K6L (VWAP Reclaim)",
+    "K7_SFP_LIQ_SWEEP_L": "K7L (SFP Sweep)",
+    "K8_SUPERTREND_BO_L": "K8L (Supertrend BO)",
     "S1_BB_REJECT": "S1 (BB Reject)",
     "S2_KELTNER_REJECT": "S2 (Keltner Rej)",
     "S3_RSI7_OVERBOUGHT": "S3 (RSI7 OB)",
+    "N1_EMA20_RECLAIM_S": "N1 (EMA20 Reclaim)",
+    "N2_BB_SQZ_REJECT_S": "N2 (BB Sqz Reject)",
 }
 
 
@@ -408,9 +415,12 @@ def evaluate_coin(
     ok_vol = (c_atr15_pct > 0.05) and (c_atr15_pct <= 2.2)
 
     # Raw key signal (before N2, N7, 4H STRONG div)
+    c_body_r = (c_cl - c_op) / c_rng
+    mid_p1 = 0.5 * (op[i - 1] + cl[i - 1])
+    base_key = key[:-2] if (key.endswith("_L") and key.startswith("K")) else key
     sig_l = False
     sig_s = False
-    if key == "K1_EMA_TREND_PB":
+    if base_key == "K1_EMA_TREND_PB":
         sig_l = (
             h1_up and h4_up and ok_vol
             and ((c_lo <= e21[i] * 1.002) or (c_lo <= e50[i] * 1.002))
@@ -423,7 +433,7 @@ def evaluate_coin(
             and (c_cl < e21[i]) and (c_cl < c_op)
             and (rsi[i - 1] >= 52.0) and (rsi[i] < rsi[i - 1])
         )
-    elif key == "K3_MACD_STOCH":
+    elif base_key == "K3_MACD_STOCH":
         sig_l = (
             h4_up and ok_vol
             and (mh[i] > mh[i - 1]) and (mh[i - 1] <= mh[i - 2])
@@ -436,7 +446,7 @@ def evaluate_coin(
             and (st_k[i] < st_d[i]) and (st_k[i] >= 35.0)
             and (c_rvol >= 1.1) and (c_cl < c_op)
         )
-    elif key == "K6_VWAP_RECLAIM":
+    elif base_key == "K6_VWAP_RECLAIM":
         sig_l = (
             h1_up and ok_vol
             and ((c_lo < vwap[i]) or (c_cl_p < vwap[i]))
@@ -449,7 +459,7 @@ def evaluate_coin(
             and (c_cl < vwap[i]) and (e9[i] < e21[i])
             and (c_rvol >= 1.2) and (c_cl < c_op)
         )
-    elif key == "K7_SFP_LIQ_SWEEP":
+    elif base_key == "K7_SFP_LIQ_SWEEP":
         sw_l = (
             ((lo20[i] > 0) and (c_lo < lo20[i]) and (c_cl > lo20[i]))
             or (np.isfinite(pdl[i]) and (c_lo < pdl[i]) and (c_cl > pdl[i]))
@@ -463,7 +473,7 @@ def evaluate_coin(
         k7_req_dir = bool(filters_cfg.get("k7_require_candle_dir", True))
         sig_l = h4_up and ok_vol and sw_l and (l_wick >= 0.30) and (c_rvol >= 1.25) and ((c_cl > c_op) if k7_req_dir else True)
         sig_s = h4_dn and ok_vol and sw_s and (u_wick >= 0.30) and (c_rvol >= 1.25) and ((c_cl < c_op) if k7_req_dir else True)
-    elif key == "K8_SUPERTREND_BO":
+    elif base_key == "K8_SUPERTREND_BO":
         sig_l = (
             h1_up and h4_up and ok_vol
             and (((st_d10[i] == 1) and (st_d10[i - 1] == -1)) or ((hi16[i] > 0) and (c_cl > hi16[i]) and (c_cl_p <= hi16[i])))
@@ -474,26 +484,46 @@ def evaluate_coin(
             and (((st_d10[i] == -1) and (st_d10[i - 1] == 1)) or ((lo16[i] > 0) and (c_cl < lo16[i]) and (c_cl_p >= lo16[i])))
             and (c_rvol >= 1.25) and (c_cl < c_op)
         )
-    elif key == "S1_BB_REJECT":
+    elif base_key == "S1_BB_REJECT":
         sig_s = (
             h1_dn and h4_dn and ok_vol
             and ((c_hi >= bb_hi[i]) or (hi[i - 1] >= bb_hi[i - 1]))
             and (c_cl < c_op) and (c_cl < bb_hi[i]) and (c_cl < c_cl_p)
         )
-    elif key == "S2_KELTNER_REJECT":
+    elif base_key == "S2_KELTNER_REJECT":
         sig_s = (
             h1_dn and ok_vol
             and ((c_hi >= kc_hi[i]) or (hi[i - 1] >= kc_hi[i - 1]))
             and (c_cl < c_op) and (c_cl < kc_hi[i]) and (c_cl < c_cl_p)
         )
-    elif key == "S3_RSI7_OVERBOUGHT":
+    elif base_key == "S3_RSI7_OVERBOUGHT":
         sig_s = (
             h1_dn and h4_dn and ok_vol
             and (rsi7[i - 1] >= 68.0) and (c_cl < c_op)
             and (c_cl < c_cl_p) and (c_cl < e50[i] * 1.008)
         )
+    elif base_key == "N1_EMA20_RECLAIM_S":
+        sig_s = (
+            h1_dn and h4_dn and ok_vol
+            and (cl[i - 1] > e20[i - 1]) and (cl[i - 1] < e50[i - 1] * 1.015)
+            and (c_cl < e20[i]) and (c_cl < lo[i - 1])
+            and (c_cl < c_op) and ((-c_body_r) >= 0.45)
+            and (c_rvol >= 1.15) and (rsi[i] > 35.0)
+        )
+    elif base_key == "N2_BB_SQZ_REJECT_S":
+        sig_s = (
+            h4_dn and ok_vol
+            and ((cl[i - 1] >= bb_hi[i - 1]) or (hi[i - 1] > bb_hi[i - 1]))
+            and (bbw15_arr[i - 1] < 4.5)
+            and (c_cl < bb_hi[i]) and (c_cl < mid_p1)
+            and (c_cl < c_op) and ((-c_body_r) >= 0.35)
+            and (c_rvol >= 1.05) and (rsi[i] > 42.0)
+        )
     else:
         raise ValueError(f"Unsupported VIKA key: {key}")
+
+    if key.endswith("_L") and key.startswith("K"):
+        sig_s = False
 
     raw_signal: Optional[str] = "LONG" if sig_l else ("SHORT" if sig_s else None)
 

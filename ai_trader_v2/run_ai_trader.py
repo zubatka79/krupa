@@ -298,8 +298,10 @@ class VikaRunner:
         }
         short_filters = dict(self.filters_cfg)
         short_filters["allowed_directions"] = "only_short"
+        vika_long_filters = dict(self.filters_cfg)
+        vika_long_filters["allowed_directions"] = "only_long"
 
-        def _eval_symbol(sym: str) -> Tuple[str, Optional[LongCoinEvaluation], Optional[CoinEvaluation]]:
+        def _eval_symbol(sym: str) -> Tuple[str, Optional[Any], Optional[CoinEvaluation]]:
             try:
                 df15 = fetch_recent_klines(self.client, sym, "15", limit=320)
                 df1h = fetch_recent_klines(self.client, sym, "60", limit=240)
@@ -308,22 +310,38 @@ class VikaRunner:
                 ls_snap = fetch_retail_ls_snapshot(self.client, sym, now_ms) if ls_enabled else None
                 ls_z = ls_snap.z_score if (ls_snap is not None and ls_snap.available) else None
 
-                ev_l: Optional[LongCoinEvaluation] = None
+                ev_l: Optional[Any] = None
                 ev_s: Optional[CoinEvaluation] = None
                 if sym in long_map:
-                    ev_l = evaluate_long_coin(
-                        symbol=sym,
-                        key=long_map[sym],
-                        df15_raw=df15,
-                        df1h_raw=df1h,
-                        df4h_raw=df4h,
-                        btc_regime=btc_4h_compat,
-                        funding_rate=fr,
-                        now_ms=now_ms,
-                        filters_cfg=long_filters,
-                        retail_ls_z=ls_z,
-                        btc_1d_up=(btc_regime.d1_dir == 1),
-                    )
+                    l_key = long_map[sym]
+                    if l_key.startswith("K") and l_key.endswith("_L"):
+                        ev_l = evaluate_coin(
+                            symbol=sym,
+                            key=l_key,
+                            df15_raw=df15,
+                            df1h_raw=df1h,
+                            df4h_raw=df4h,
+                            funding_rate=fr,
+                            now_ms=now_ms,
+                            filters_cfg=vika_long_filters,
+                            retail_ls_z=ls_z,
+                            btc_allow_long=btc_regime.allow_long,
+                            btc_allow_short=False,
+                        )
+                    else:
+                        ev_l = evaluate_long_coin(
+                            symbol=sym,
+                            key=l_key,
+                            df15_raw=df15,
+                            df1h_raw=df1h,
+                            df4h_raw=df4h,
+                            btc_regime=btc_4h_compat,
+                            funding_rate=fr,
+                            now_ms=now_ms,
+                            filters_cfg=long_filters,
+                            retail_ls_z=ls_z,
+                            btc_1d_up=(btc_regime.d1_dir == 1),
+                        )
                 if sym in short_map:
                     ev_s = evaluate_coin(
                         symbol=sym,

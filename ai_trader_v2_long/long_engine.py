@@ -39,6 +39,13 @@ LONG_KEY_SHORT_NAMES: Dict[str, str] = {
     "T12_COIL_BREAKOUT": "T12 (Coil BO)",
     "T13_MACD_HIST_TURN": "T13 (MACD Turn)",
     "T14_DONCHIAN_BO": "T14 (Donchian BO)",
+    "N1_EMA20_RECLAIM_L": "N1 (EMA20 Reclaim)",
+    "N2_BB_SQZ_REJECT_L": "N2 (BB Sqz Reject)",
+    "K1_EMA_TREND_PB_L": "K1L (EMA Pullback)",
+    "K3_MACD_STOCH_L": "K3L (MACD+Stoch)",
+    "K6_VWAP_RECLAIM_L": "K6L (VWAP Reclaim)",
+    "K7_SFP_LIQ_SWEEP_L": "K7L (SFP Sweep)",
+    "K8_SUPERTREND_BO_L": "K8L (Supertrend BO)",
 }
 
 
@@ -274,6 +281,7 @@ def evaluate_long_coin(
 
     sma20 = pd.Series(cl).rolling(20, min_periods=20).mean().fillna(cl[0]).to_numpy(float)
     sd20 = pd.Series(cl).rolling(20, min_periods=20).std().fillna(0.0).to_numpy(float)
+    bbw15 = 4.0 * sd20 / np.maximum(cl, 1e-12) * 100.0
     bb_lo = sma20 - 2.0 * sd20
     kc_lo = e20 - 1.5 * a14
     lo12 = pd.Series(lo).shift(1).rolling(12, min_periods=12).min().fillna(cl[0]).to_numpy(float)
@@ -283,6 +291,7 @@ def evaluate_long_coin(
     rng = max(hi[idx] - lo[idx], 1e-12)
     body_ratio = (cl[idx] - op[idx]) / rng
     l_wick = (min(op[idx], cl[idx]) - lo[idx]) / rng
+    mid_p1 = 0.5 * (op[idx - 1] + cl[idx - 1])
     green = cl[idx] > op[idx]
     red_p1 = cl[idx - 1] < op[idx - 1]
     red_p2 = cl[idx - 2] < op[idx - 2]
@@ -321,6 +330,21 @@ def evaluate_long_coin(
         fired = up_4h and (mh[idx - 1] < 0.0) and (mh[idx] > mh[idx - 1]) and (mh[idx - 1] <= mh[idx - 2]) and (cl[idx] > e50[idx]) and green and (rvol[idx] >= 1.0)
     elif key == "T14_DONCHIAN_BO":
         fired = up_both and (cl[idx] > hi20[idx]) and (cl[idx - 1] <= hi20[idx]) and green and (r14[idx] < 70.0) and (rvol[idx] >= 1.3)
+    elif key == "N1_EMA20_RECLAIM_L":
+        fired = (
+            up_both
+            and (cl[idx - 1] < e20[idx - 1]) and (cl[idx - 1] > e50[idx - 1] * 0.985)
+            and (cl[idx] > e20[idx]) and (cl[idx] > hi[idx - 1])
+            and green and (body_ratio >= 0.45) and (rvol[idx] >= 1.15) and (r14[idx] < 65.0)
+        )
+    elif key == "N2_BB_SQZ_REJECT_L":
+        fired = (
+            up_4h
+            and ((cl[idx - 1] <= bb_lo[idx - 1]) or (lo[idx - 1] < bb_lo[idx - 1]))
+            and (bbw15[idx - 1] < 4.5)
+            and (cl[idx] > bb_lo[idx]) and (cl[idx] > mid_p1)
+            and green and (body_ratio >= 0.35) and (rvol[idx] >= 1.05) and (r14[idx] < 58.0)
+        )
     else:
         raise ValueError(f"Unknown VIKA_LONG_V1 key: {key}")
 

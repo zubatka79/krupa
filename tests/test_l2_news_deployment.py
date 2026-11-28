@@ -179,6 +179,15 @@ def test_1_configs_and_macro_calendar() -> None:
     assert len(cfg_main["long_coins"]) == 18 and len(cfg_main["short_coins"]) == 18
     assert len(cfg_long["coins"]) == 18
 
+    # Verify Step23 V3 (12M) 9 exact key replacements
+    l_map = {c["symbol"]: c["key"] for c in cfg_main["long_coins"]}
+    s_map = {c["symbol"]: c["key"] for c in cfg_main["short_coins"]}
+    assert l_map["TRXUSDT"] == "K3_MACD_STOCH_L"
+    assert l_map["LTCUSDT"] == "N2_BB_SQZ_REJECT_L" and l_map["PENGUUSDT"] == "N2_BB_SQZ_REJECT_L"
+    assert s_map["HBARUSDT"] == "N2_BB_SQZ_REJECT_S"
+    for sym in ("XRPUSDT", "SUIUSDT", "ETHUSDT", "APTUSDT", "AAVEUSDT"):
+        assert s_map[sym] == "N1_EMA20_RECLAIM_S", f"{sym} expected N1_EMA20_RECLAIM_S"
+
     # Validate calendar payload & blackout boundaries on FOMC 2026-12-09T19:00:00Z
     now_ref = datetime(2026, 11, 28, 12, 0, tzinfo=timezone.utc)
     validated = update_macro_calendar.validate_calendar_payload(cal, now_utc=now_ref, min_future_events=6)
@@ -277,8 +286,12 @@ def test_3_executor_dca_be_hard_sl_antisalvo_and_telegram() -> None:
         # 1) Open 2 SHORTs on same bar -> 3rd SHORT blocked by AntiSalvo (<=2/bar)!
         p1 = ex.open_signal(_mk_s("DOTUSDT", "K1_EMA_TREND_PB"))
         p2 = ex.open_signal(_mk_s("LTCUSDT", "K6_VWAP_RECLAIM"))
-        p3 = ex.open_signal(_mk_s("HBARUSDT", "K3_MACD_STOCH"))
+        p3 = ex.open_signal(_mk_s("HBARUSDT", "N2_BB_SQZ_REJECT_S"))
         assert p1 is not None and p2 is not None and p3 is None, f"AntiSalvo <=2/bar failed: {p1},{p2},{p3}"
+
+        # 1b) Verify restart safety: cleanup_stale_entry_orders NEVER cancels active Leg-2 DCA limits!
+        cancelled_startup = ex.cleanup_stale_entry_orders()
+        assert cancelled_startup == [] and len(mock.cancel_calls) == 0, f"Startup cancelled active DCA: {cancelled_startup}"
 
         act = journal.get_active_positions()
         assert len(act) == 2

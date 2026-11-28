@@ -352,7 +352,7 @@ class VikaTelegramUI:
             allowed_l = 0
             for c in self.cfg.get("long_coins", []):
                 sym = c["symbol"]
-                ks = c["key"].split("_")[0]
+                ks = c["key"].split("_")[0] + ("L" if c["key"].startswith("K") and c["key"].endswith("_L") else "")
                 ev = l_evals.get(sym)
                 if ev is None:
                     l_rows.append(f"• <code>{sym[:-4]:<9}</code> {ks} | ⏳")
